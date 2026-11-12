@@ -13,6 +13,7 @@ import {
 } from "./critic-markup";
 import type { CriticChangeRailItem } from "./DocumentReviewRail";
 import { type MarkdownOptions, splitYamlDocumentMetadata } from "./markdown";
+import { diffRenderedComparison } from "./rendered-comparison-diff";
 
 export interface ComparisonDocumentGroup {
   id: string;
@@ -525,22 +526,54 @@ export function buildComparisonDocument(
       createdAt: UNKNOWN_TIME,
     };
     const anchorTop = position;
-    append(
-      oldNodes,
-      previous && next ? { ...change, kind: "substitution-old" } : change,
-      ids,
-    );
-    append(
-      newNodes,
-      previous && next ? { ...change, kind: "substitution-new" } : change,
-      ids,
-    );
+    const difference = diffRenderedComparison(oldNodes, newNodes, change);
+    for (const highlight of difference.blockHighlights) {
+      blockHighlights.push({
+        ...highlight,
+        from: position + highlight.from,
+        to: position + highlight.to,
+      });
+    }
+    append(difference.content, null, ids);
+    if (!difference.changed) {
+      // Identical rendering can still conceal a real source change, such as
+      // Markdown marker spelling, line endings, or the final newline. Give its
+      // existing native review card a small anchor without painting prose.
+      append(
+        [
+          {
+            type: "paragraph",
+            content: [
+              {
+                type: "text",
+                text: "\u2060",
+                marks: [{ type: "criticChange", attrs: change }],
+              },
+            ],
+          },
+        ],
+        null,
+        ids,
+      );
+    }
+    const oldSummary = difference.changed
+      ? difference.oldText
+      : "Previous Markdown source formatting";
+    const newSummary = difference.changed
+      ? difference.newText
+      : "Updated source formatting (rendered content unchanged)";
+    const suggestionKind =
+      oldSummary && newSummary
+        ? "substitution-old"
+        : oldSummary
+          ? "deletion"
+          : "addition";
     suggestions.push({
       changeId: group.id,
-      change,
-      kind: change.kind,
-      oldText: plainText(oldNodes),
-      newText: plainText(newNodes),
+      change: { ...change, kind: suggestionKind },
+      kind: suggestionKind,
+      oldText: oldSummary,
+      newText: newSummary,
       commentIds: ids,
       anchorTop,
       anchorBottom: position,

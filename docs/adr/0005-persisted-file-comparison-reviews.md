@@ -16,6 +16,8 @@ The server constructs output from the exact source blocks, preserving line endin
 
 The comparison route reuses the native rendered editor and suggestion rail through a controlled, read-only adapter. It builds display documents at complete Markdown block boundaries, explicitly linking source changes when one rendered block contains several. Display choices map back to persisted source IDs; rich-text serialization never participates in a destination write. Native comments and replies live in the review record. Refresh preserves historical feedback even when its source anchor disappears, presenting detached threads as document feedback. Resolved changes show their selected content; showing reviewed changes restores the original highlights and controls.
 
+Within a source group, rendered nodes are aligned so unchanged blocks and inline text appear once. Word-level differences and formatting/attribute changes receive native marks; structural changes receive block highlights. This display refinement does not split or reset persisted source decisions. A sticky header keeps mode, navigation, save/conflict status and the explicit final action available while scrolling; it uses the same write guards as the rest of the review.
+
 ## Consequences
 
 Comparison records must be preserved along with other application data. They contain source text and review comments, so their filesystem access follows the application's local-file trust model. They are not a global document index, collaboration service, or version-control database.
