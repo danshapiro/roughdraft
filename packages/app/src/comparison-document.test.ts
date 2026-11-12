@@ -476,10 +476,10 @@ describe("rendered comparison document", () => {
   });
 
   it.each([
-    "before",
-    "after",
-    "result",
-  ] as const)("renders the %s version independently of review decisions", (version) => {
+    "proposal",
+    "applied",
+    "compare",
+  ] as const)("keeps Before fixed and previews choices in After for %s reviews", (mode) => {
     const input = review([
       {
         before: "# Before title\n\n",
@@ -496,22 +496,27 @@ describe("rendered comparison document", () => {
         after: "New pending paragraph.\n\n",
       },
     ]);
+    input.mode = mode;
     const frozen = JSON.stringify(input);
-    const doc = buildComparisonPreviewDocument(input, {}, version);
-    const rendered = new DOMParser().parseFromString(html(doc), "text/html");
-    expect(rendered.getElementsByTagName("h1").item(0)?.textContent).toBe(
-      version === "after" ? "After title" : "Before title",
-    );
-    expect(rendered.body.textContent).toContain(
-      version === "before"
-        ? "Old accepted paragraph."
-        : "New accepted paragraph.",
-    );
-    expect(rendered.body.textContent).toContain(
-      version === "before"
-        ? "Old pending paragraph."
-        : "New pending paragraph.",
-    );
+    for (const version of ["before", "after"] as const) {
+      const doc = buildComparisonPreviewDocument(input, {}, version);
+      const rendered = new DOMParser().parseFromString(html(doc), "text/html");
+      expect(rendered.getElementsByTagName("h1").item(0)?.textContent).toBe(
+        version === "after" && mode === "compare"
+          ? "After title"
+          : "Before title",
+      );
+      expect(rendered.body.textContent).toContain(
+        version === "before"
+          ? "Old accepted paragraph."
+          : "New accepted paragraph.",
+      );
+      expect(rendered.body.textContent).toContain(
+        version === "before"
+          ? "Old pending paragraph."
+          : "New pending paragraph.",
+      );
+    }
     expect(JSON.stringify(input)).toBe(frozen);
   });
 

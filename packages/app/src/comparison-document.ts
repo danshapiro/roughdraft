@@ -349,13 +349,13 @@ function anchored(nodes: JSONContent[], unit: number): JSONContent[] {
   }));
 }
 
-export type ComparisonPreviewVersion = "before" | "after" | "result";
+export type ComparisonPreviewVersion = "before" | "after";
 
-/** Frozen versions ignore choices; Result uses After for undecided changes. */
+/** Before is frozen; After previews choices, using the new version if pending. */
 export function buildComparisonPreviewDocument(
   review: ComparisonReviewData,
   options: ComparisonDisplayOptions = {},
-  version: ComparisonPreviewVersion = "result",
+  version: ComparisonPreviewVersion = "after",
 ): JSONContent {
   const units = displayUnits(
     review.segments,
@@ -364,7 +364,7 @@ export function buildComparisonPreviewDocument(
   );
   const select = ({ segment, before, after }: UnitPart) =>
     version === "before" ||
-    (version === "result" &&
+    (review.mode !== "compare" &&
       segment.kind === "change" &&
       segment.decision === "before")
       ? before

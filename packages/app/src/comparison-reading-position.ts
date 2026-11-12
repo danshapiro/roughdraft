@@ -48,12 +48,35 @@ export function useComparisonReadingPosition(
   viewKey: string,
 ) {
   const pending = useRef<ReadingPosition | null>(null);
+  const reading = useRef<ReadingPosition | null>(null);
+  const restoredScroll = useRef<number | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
 
   const capture = () => {
     cancelRef.current?.();
     const root = rootRef.current;
     if (!root) return;
+    // Keep the original passage while comparing versions, including versions
+    // where that passage is absent. Actual reader movement starts a new anchor.
+    if (
+      reading.current &&
+      restoredScroll.current !== null &&
+      Math.abs(window.scrollY - restoredScroll.current) < 1
+    ) {
+      pending.current = { ...reading.current, viewKey };
+      return;
+    }
+    if (window.scrollY === 0) {
+      reading.current = {
+        viewKey,
+        unit: "",
+        quote: [],
+        offset: 0,
+        scrollY: 0,
+      };
+      pending.current = reading.current;
+      return;
+    }
     const headerBottom = headerRef.current?.getBoundingClientRect().bottom ?? 0;
     // Anchor the reading passage in the upper quarter of the usable viewport.
     // Text wrapping can change above it when switching to literal Markdown.
@@ -72,6 +95,7 @@ export function useComparisonReadingPosition(
         offset: 0,
         scrollY: window.scrollY,
       };
+      reading.current = pending.current;
       return;
     }
     const unit = first.dataset.comparisonAnchor ?? "";
@@ -99,6 +123,7 @@ export function useComparisonReadingPosition(
         : first.getBoundingClientRect().top,
       scrollY: window.scrollY,
     };
+    reading.current = pending.current;
   };
 
   useLayoutEffect(() => {
@@ -121,6 +146,7 @@ export function useComparisonReadingPosition(
       if (stopped) return;
       if (!position.unit) {
         window.scrollTo({ top: position.scrollY, behavior: "instant" });
+        restoredScroll.current = window.scrollY;
         return;
       }
       const anchors = visibleAnchors(root);
@@ -154,6 +180,7 @@ export function useComparisonReadingPosition(
       const delta = top - position.offset;
       if (Math.abs(delta) > 0.5)
         window.scrollBy({ top: delta, behavior: "instant" });
+      restoredScroll.current = window.scrollY;
     };
     const schedule = () => {
       cancelAnimationFrame(frame);
