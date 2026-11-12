@@ -746,6 +746,23 @@ describe("createApp", () => {
     ).toBe("png bytes");
   });
 
+  it("serves uploaded asset previews from the hidden assets directory", async () => {
+    const { app } = createApp({ homeDir, staticDirPath: projectDir });
+    const bytes = Buffer.from("uploaded image bytes");
+    const uploaded = await request(app)
+      .post("/api/assets")
+      .send({
+        projectPath: projectDir,
+        filename: "Preview.png",
+        mimeType: "image/png",
+        dataBase64: bytes.toString("base64"),
+      });
+    expect(uploaded.status).toBe(201);
+    const preview = await request(app).get(uploaded.body.previewUrl);
+    expect(preview.status).toBe(200);
+    expect(preview.body).toEqual(bytes);
+  });
+
   it("advertises remote-document support in the status capabilities", async () => {
     const { app } = createApp({ homeDir, staticDirPath: projectDir });
     const response = await request(app).get("/api/status");
