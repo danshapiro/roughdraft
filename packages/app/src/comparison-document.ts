@@ -45,6 +45,10 @@ interface Unit {
   parts: UnitPart[];
 }
 
+interface ComparisonDisplayOptions extends MarkdownOptions {
+  formatted?: boolean;
+}
+
 // The prefix prevents an ordinary horizontal rule at the start of a display
 // unit from being mistaken for document frontmatter. It is never displayed.
 const CONTEXT_PREFIX = "\uE000comparison-context\uE001\n\n";
@@ -217,10 +221,24 @@ function parseRange(
   source: string,
   from: number,
   context: Snapshot,
-  options: MarkdownOptions,
+  options: ComparisonDisplayOptions,
   comments: Map<string, CriticComment>,
   showInvisible: boolean,
 ): JSONContent[] {
+  // Literal Markdown uses the same read-only native review surface and marks.
+  // It is a display projection; the server still applies original source bytes.
+  if (options.formatted === false) {
+    // A paragraph boundary already supplies one line break in this projection.
+    const text = source.replace(/\r\n?/g, "\n").replace(/\n$/, "");
+    return source
+      ? [
+          {
+            type: "paragraph",
+            content: text ? [{ type: "text", text }] : [],
+          },
+        ]
+      : [];
+  }
   const result: JSONContent[] = [];
   let consumed = 0;
   for (const metadata of context.metadata) {
@@ -324,10 +342,17 @@ function reviewStatus(
   return decision === "after" ? "Accepted" : "Skipped";
 }
 
+function anchored(nodes: JSONContent[], unit: number): JSONContent[] {
+  return nodes.map((node) => ({
+    ...node,
+    attrs: { ...node.attrs, comparisonAnchor: `unit-${unit}` },
+  }));
+}
+
 /** Read-only preview of the current choices; undecided changes use After. */
 export function buildComparisonPreviewDocument(
   review: ComparisonReviewData,
-  options: MarkdownOptions = {},
+  options: ComparisonDisplayOptions = {},
 ): JSONContent {
   const source = review.segments
     .map((segment) =>
@@ -336,14 +361,28 @@ export function buildComparisonPreviewDocument(
         : segment.after,
     )
     .join("");
-  const content = parseRange(
-    source,
-    0,
-    snapshot(source),
-    options,
-    new Map(),
-    false,
+  const units = displayUnits(
+    review.segments,
+    snapshot(review.beforeText),
+    snapshot(review.afterText),
   );
+  const context = snapshot(source);
+  let offset = 0;
+  const content = units.flatMap((unit, index) => {
+    const selected = unit.parts
+      .map(({ segment, before, after }) =>
+        segment.kind === "change" && segment.decision === "before"
+          ? before
+          : after,
+      )
+      .join("");
+    const nodes = anchored(
+      parseRange(selected, offset, context, options, new Map(), false),
+      index,
+    );
+    offset += selected.length;
+    return nodes;
+  });
   return {
     type: "doc",
     content: content.length ? content : [{ type: "paragraph" }],
@@ -353,7 +392,7 @@ export function buildComparisonPreviewDocument(
 /** The document is a display projection. Only server-side source slices apply. */
 export function buildComparisonDocument(
   review: ComparisonReviewData,
-  options: MarkdownOptions & { showReviewed?: boolean } = {},
+  options: ComparisonDisplayOptions & { showReviewed?: boolean } = {},
 ): ComparisonDocumentModel {
   const before = snapshot(review.beforeText);
   const after = snapshot(review.afterText);
@@ -418,12 +457,13 @@ export function buildComparisonDocument(
   const suggestions: CriticChangeRailItem[] = [];
   const blockHighlights: ControlledReviewBlockHighlight[] = [];
   let position = 0;
+  let currentUnit = 0;
   const append = (
     nodes: JSONContent[],
     change: CriticChangeAttrs | null,
     commentIds: string[] = [],
   ) => {
-    for (const node of nodes) {
+    for (const node of anchored(nodes, currentUnit)) {
       const rendered = decorate(node, change, commentIds);
       const size = nodeSize(rendered);
       if (change)
@@ -468,7 +508,8 @@ export function buildComparisonDocument(
   let selectedOffset = 0;
   let previousOffset = 0;
   let nextOffset = 0;
-  for (const unit of units) {
+  for (const [unitIndex, unit] of units.entries()) {
+    currentUnit = unitIndex;
     const previous = retainChoices
       ? projectedText(unit.parts, "before")
       : unit.parts.map((part) => part.before).join("");

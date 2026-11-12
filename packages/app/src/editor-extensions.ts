@@ -767,6 +767,39 @@ const RawMarkdownBlock = Node.create({
   },
 });
 
+// Display projections share a source-block identity even when their layout differs.
+const ComparisonReadingAnchor = Extension.create({
+  name: "comparisonReadingAnchor",
+  addGlobalAttributes() {
+    return [
+      {
+        types: [
+          "paragraph",
+          "heading",
+          "codeBlock",
+          "bulletList",
+          "orderedList",
+          "taskList",
+          "table",
+          "blockquote",
+          "image",
+          "horizontalRule",
+          "rawMarkdownBlock",
+        ],
+        attributes: {
+          comparisonAnchor: {
+            default: null,
+            renderHTML: (attributes) =>
+              attributes.comparisonAnchor
+                ? { "data-comparison-anchor": attributes.comparisonAnchor }
+                : {},
+          },
+        },
+      },
+    ];
+  },
+});
+
 export function createEditorExtensions(placeholder: string) {
   return [
     StarterKit.configure({
@@ -796,6 +829,7 @@ export function createEditorExtensions(placeholder: string) {
     TaskItem.configure({
       nested: true,
     }),
+    ComparisonReadingAnchor,
     CommentRef,
     CriticChange,
     RawMarkdownBlock,

@@ -30,6 +30,11 @@
 .comparison-header-diff-toggle {
   white-space: nowrap;
 }
+.comparison-header-views {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
 .comparison-header-mode {
   display: block;
   font-size: 11px;
@@ -272,4 +277,15 @@
     height: auto;
     min-height: 36px;
   }
+}
+
+.comparison-markdown .tiptap {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 14px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.comparison-markdown .tiptap > p {
+  margin: 0;
+  min-height: 0;
 }
