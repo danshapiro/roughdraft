@@ -1,20 +1,97 @@
+.comparison-header-bar {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  width: 100%;
+  border-bottom: 1px solid var(--border);
+  background: var(--background);
+}
+.comparison-header-inner {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 8px 24px;
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto auto;
+  align-items: center;
+  gap: 16px;
+}
+.comparison-header-identity {
+  min-width: 0;
+}
+.comparison-header-identity h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comparison-header-mode {
+  display: block;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.comparison-header-navigation {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+}
+.comparison-header-navigation > span {
+  min-width: 38px;
+  text-align: center;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-foreground);
+}
+.comparison-header-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 11px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.comparison-header-state {
+  color: var(--muted-foreground);
+  font-size: 10px;
+}
+.comparison-header-state-warning {
+  color: var(--destructive);
+}
+.comparison-header-primary {
+  min-width: 0;
+  max-width: 340px;
+}
+.comparison-header-primary > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (max-width: 760px) {
+  .comparison-header-inner {
+    grid-template-columns: minmax(0, 1fr) minmax(130px, 45%);
+    gap: 6px 12px;
+    padding: 8px 12px;
+  }
+  .comparison-header-navigation {
+    justify-self: end;
+  }
+  .comparison-header-progress {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+  }
+  .comparison-header-primary {
+    width: 100%;
+    justify-self: end;
+  }
+}
 .comparison-page {
   max-width: 1120px;
   margin: 0 auto;
   padding: 32px 24px 64px;
   color: var(--foreground);
-}
-.comparison-brand {
-  display: block;
-  width: fit-content;
-  margin-bottom: 24px;
-  font-weight: 650;
-  text-decoration: none;
-}
-.comparison-brand span {
-  color: var(--muted-foreground);
-  margin-left: 8px;
-  font-weight: 400;
 }
 .comparison-mode {
   display: inline-block;
@@ -23,13 +100,6 @@
   border-radius: 6px;
   padding: 4px 9px;
   font-size: 12px;
-}
-.comparison-header h1 {
-  font-size: clamp(24px, 4vw, 36px);
-  letter-spacing: -0.035em;
-  line-height: 1.2;
-  margin: 14px 0 12px;
-  overflow-wrap: anywhere;
 }
 .comparison-target {
   font-size: 13px;

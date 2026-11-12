@@ -62,6 +62,146 @@ function html(doc: JSONContent) {
   return generateHTML(doc, createEditorExtensions(""));
 }
 
+function changedText(doc: JSONContent) {
+  return nodes(doc)
+    .filter((node) => node.marks?.some((mark) => mark.type === "criticChange"))
+    .map((node) => node.text ?? "");
+}
+
+function projectedText(doc: JSONContent, side: "before" | "after"): string {
+  const change = doc.marks?.find((mark) => mark.type === "criticChange");
+  if (
+    (side === "before" &&
+      ["addition", "substitution-new"].includes(change?.attrs?.kind)) ||
+    (side === "after" &&
+      ["deletion", "substitution-old"].includes(change?.attrs?.kind))
+  )
+    return "";
+  return (
+    doc.text ??
+    (doc.content ?? []).map((child) => projectedText(child, side)).join("")
+  );
+}
+
+describe("precise rendered differences", () => {
+  it("shows a paragraph once and marks only its replaced word", () => {
+    const model = buildComparisonDocument(
+      review([
+        {
+          before: "Please read old guidance before running tests.\n",
+          after: "Please read new guidance before running tests.\n",
+        },
+      ]),
+    );
+    expect(model.doc.content).toHaveLength(1);
+    expect(text(model.doc)).toBe(
+      "Please read oldnew guidance before running tests.",
+    );
+    expect(changedText(model.doc)).toEqual(["old", "new"]);
+    expect(model.blockHighlights).toEqual([]);
+    expect(model.suggestions).toMatchObject([
+      { oldText: "old", newText: "new" },
+    ]);
+  });
+
+  it("keeps unchanged list items single and unmarked inside a linked group", () => {
+    const model = buildComparisonDocument(
+      review([
+        {
+          before: "- First unchanged\n- Read old guidance\n- Last unchanged\n",
+          after: "- First unchanged\n- Read new guidance\n- Last unchanged\n",
+        },
+      ]),
+    );
+    expect(
+      nodes(model.doc).filter((node) => node.type === "bulletList"),
+    ).toHaveLength(1);
+    expect(
+      nodes(model.doc).filter((node) => node.type === "listItem"),
+    ).toHaveLength(3);
+    expect(text(model.doc).match(/First unchanged/g)).toHaveLength(1);
+    expect(changedText(model.doc)).toEqual(["old", "new"]);
+    expect(model.blockHighlights).toEqual([]);
+    expect(model.suggestions[0].oldText).toBe("old");
+  });
+
+  it("keeps unchanged table cells single and unmarked", () => {
+    const model = buildComparisonDocument(
+      review([
+        {
+          before:
+            "| Key | Value |\n| --- | --- |\n| stable | same |\n| next | old |\n",
+          after:
+            "| Key | Value |\n| --- | --- |\n| stable | same |\n| next | new |\n",
+        },
+      ]),
+    );
+    expect(
+      nodes(model.doc).filter((node) => node.type === "table"),
+    ).toHaveLength(1);
+    expect(
+      nodes(model.doc).filter((node) => node.type === "tableCell"),
+    ).toHaveLength(4);
+    expect(text(model.doc).match(/stable/g)).toHaveLength(1);
+    expect(changedText(model.doc)).toEqual(["old", "new"]);
+    expect(model.blockHighlights).toEqual([]);
+  });
+
+  it("retains both formatting alternatives without duplicating unchanged words", () => {
+    const model = buildComparisonDocument(
+      review([
+        {
+          before: "Keep **important** words.\n",
+          after: "Keep *important* words.\n",
+        },
+      ]),
+    );
+    expect(model.doc.content).toHaveLength(1);
+    expect(text(model.doc)).toBe("Keep importantimportant words.");
+    expect(changedText(model.doc)).toEqual(["important", "important"]);
+    expect(model.suggestions[0].oldText).toContain("bold");
+    expect(model.suggestions[0].newText).toContain("italic");
+    expect(model.blockHighlights).toEqual([]);
+  });
+
+  it("shows changed link targets explicitly while retaining unchanged context once", () => {
+    const model = buildComparisonDocument(
+      review([
+        {
+          before: "Read [the guide](https://old.test) before starting.\n",
+          after: "Read [the guide](https://new.test) before starting.\n",
+        },
+      ]),
+    );
+    expect(model.doc.content).toHaveLength(1);
+    expect(text(model.doc)).toBe("Read the guidethe guide before starting.");
+    expect(model.suggestions[0].oldText).toContain("https://old.test");
+    expect(model.suggestions[0].newText).toContain("https://new.test");
+    expect(model.blockHighlights).toEqual([]);
+    expect(html(model.doc)).toContain('href="https://old.test"');
+    expect(html(model.doc)).toContain('href="https://new.test"');
+  });
+
+  it("keeps source-only changes reviewable when their rendered formatting is identical", () => {
+    const model = buildComparisonDocument(
+      review([
+        {
+          before: "Use **care**.\n",
+          after: "Use __care__.\n",
+        },
+      ]),
+    );
+    expect(text(model.doc).replaceAll("\u2060", "")).toBe("Use care.");
+    expect(model.suggestions).toHaveLength(1);
+    expect(
+      `${model.suggestions[0].oldText} ${model.suggestions[0].newText}`,
+    ).toMatch(/source|formatting/i);
+    expect(changedText(model.doc).every((value) => value === "\u2060")).toBe(
+      true,
+    );
+  });
+});
+
 describe("rendered comparison document", () => {
   it("uses native headings, paragraphs and change marks with persisted IDs", () => {
     const input = review([
@@ -81,8 +221,9 @@ describe("rendered comparison document", () => {
     expect(model.suggestions).toMatchObject([
       {
         changeId: "123-change-1",
-        oldText: "Read the guide.",
-        newText: "Read the updated guide.",
+        oldText: "",
+        newText: "updated",
+        kind: "addition",
       },
     ]);
     const marks = nodes(model.doc)
@@ -92,7 +233,13 @@ describe("rendered comparison document", () => {
       new Set(["123-change-1"]),
     );
     expect(new Set(marks.map((mark) => mark.attrs?.kind))).toEqual(
-      new Set(["substitution-old", "substitution-new"]),
+      new Set(["addition"]),
+    );
+    expect(projectedText(model.doc, "before")).toBe(
+      "InstructionsRead the guide.",
+    );
+    expect(projectedText(model.doc, "after")).toBe(
+      "InstructionsRead the updated guide.",
     );
     expect(text(model.doc)).not.toContain("**");
   });
@@ -116,10 +263,12 @@ describe("rendered comparison document", () => {
     expect(model.suggestions[0].sourceChangeCount).toBe(2);
     expect(
       nodes(model.doc).filter((node) => node.type === "bulletList"),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
     expect(
       nodes(model.doc).filter((node) => node.type === "listItem"),
-    ).toHaveLength(8);
+    ).toHaveLength(4);
+    expect(changedText(model.doc)).toEqual(["Old", "New", "Old", "New"]);
+    expect(model.blockHighlights).toEqual([]);
     expect(text(model.doc).match(/Separate paragraph/g)).toHaveLength(1);
   });
 
@@ -138,10 +287,12 @@ describe("rendered comparison document", () => {
     ]);
     expect(
       nodes(model.doc).filter((node) => node.type === "table"),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
     expect(
       nodes(model.doc).filter((node) => node.type === "tableHeader"),
-    ).toHaveLength(4);
+    ).toHaveLength(2);
+    expect(changedText(model.doc)).toEqual(["old", "new", "old", "new"]);
+    expect(model.blockHighlights).toEqual([]);
     expect(html(model.doc)).toContain("<table");
     expect(text(model.doc)).not.toContain("| --- |");
   });
@@ -155,9 +306,10 @@ describe("rendered comparison document", () => {
     const model = buildComparisonDocument(input);
     expect(
       nodes(model.doc).filter((node) => node.type === "codeBlock"),
-    ).toHaveLength(2);
-    expect(text(model.doc)).toContain("{++literal old++}");
-    expect(text(model.doc)).toContain("{++literal new++}");
+    ).toHaveLength(1);
+    expect(projectedText(model.doc, "before")).toContain("{++literal old++}");
+    expect(projectedText(model.doc, "after")).toContain("{++literal new++}");
+    expect(changedText(model.doc)).toEqual(["old", "new"]);
     expect(text(model.doc)).toContain("{--literal--}");
     expect(model.suggestions.map((item) => item.changeId)).toEqual([
       "123-change-1",
@@ -323,7 +475,7 @@ describe("rendered comparison document", () => {
     const links = nodes(model.doc)
       .flatMap((node) => node.marks ?? [])
       .filter((mark) => mark.type === "link");
-    expect(links).toHaveLength(2);
+    expect(links.length).toBeGreaterThan(0);
     expect(
       links.every(
         (mark) =>
@@ -331,6 +483,9 @@ describe("rendered comparison document", () => {
           mark.attrs?.title === "Reference",
       ),
     ).toBe(true);
+    expect(changedText(model.doc)).toEqual(["old", "new"]);
+    expect(projectedText(model.doc, "before")).toBe("LinksRead old text.");
+    expect(projectedText(model.doc, "after")).toBe("LinksRead new text.");
     expect(text(model.doc)).not.toContain("[guide]");
   });
 
@@ -348,13 +503,14 @@ describe("rendered comparison document", () => {
     const model = buildComparisonDocument(input);
     expect(model.groups).toHaveLength(2);
     expect(model.suggestions).toHaveLength(2);
-    expect(text(model.doc)).toContain("title: Old");
-    expect(text(model.doc)).toContain("title: New");
-    expect(text(model.doc)).toContain("Old feedback");
-    expect(text(model.doc)).toContain("New feedback");
+    expect(projectedText(model.doc, "before")).toContain("title: Old");
+    expect(projectedText(model.doc, "after")).toContain("title: New");
+    expect(projectedText(model.doc, "before")).toContain("Old feedback");
+    expect(projectedText(model.doc, "after")).toContain("New feedback");
+    expect(changedText(model.doc)).toEqual(["Old", "New", "Old", "New"]);
     expect(
       nodes(model.doc).filter((node) => node.type === "codeBlock"),
-    ).toHaveLength(4);
+    ).toHaveLength(2);
     expect(
       nodes(model.doc).filter((node) => node.type === "heading"),
     ).toHaveLength(1);
@@ -373,8 +529,9 @@ describe("rendered comparison document", () => {
     const frozen = JSON.stringify(input);
     const model = buildComparisonDocument(input);
     expect(model.suggestions).toHaveLength(1);
-    expect(text(model.doc)).toContain("https://old.test");
-    expect(text(model.doc)).toContain("https://new.test");
+    expect(projectedText(model.doc, "before")).toContain("https://old.test");
+    expect(projectedText(model.doc, "after")).toContain("https://new.test");
+    expect(changedText(model.doc)).toEqual(["old", "new"]);
     expect(nodes(model.doc).some((node) => node.type === "codeBlock")).toBe(
       true,
     );
@@ -482,9 +639,10 @@ describe("rendered comparison document", () => {
     expect(model.suggestions).toHaveLength(1);
     expect(text(model.doc)).not.toContain("Old accepted");
     expect(text(model.doc)).toContain("New accepted");
-    expect(text(model.doc)).toContain("Old pending");
-    expect(text(model.doc)).toContain("New pending");
+    expect(projectedText(model.doc, "before")).toContain("Old pending");
+    expect(projectedText(model.doc, "after")).toContain("New pending");
+    expect(changedText(model.doc)).toEqual(["Old", "New"]);
     const shown = buildComparisonDocument(input, { showReviewed: true });
-    expect(text(shown.doc)).toContain("Old accepted");
+    expect(projectedText(shown.doc, "before")).toContain("Old accepted");
   });
 });

@@ -103,6 +103,8 @@ The MCP server exposes tools to read the review index, list pending feedback, wa
 ## Review file changes
 Use a comparison when you want to choose which changes reach a Markdown file. Comparisons use Roughdraft’s rendered document and suggestion sidebar: headings, lists, links and formatting appear as they do in the editor, with changes highlighted in place.
 
+Unchanged text appears once. Highlights pick out the words added or removed, including within lists and table cells; formatting and link changes remain visible too. The header stays at the top while you scroll, showing the filename, review mode, remaining decisions and save status. Use its arrows to move between visible changes and its final Apply or Revert button to save your selection. Show reviewed changes also makes settled choices available to the arrows.
+
 | What you want | Command | What the final action does |
 | --- | --- | --- |
 | Propose edits before changing the file | `roughdraft propose AGENTS.md --after AGENTS.proposed.md` | **Accept / Skip** each change, then **Apply** writes accepted changes to `AGENTS.md`. |

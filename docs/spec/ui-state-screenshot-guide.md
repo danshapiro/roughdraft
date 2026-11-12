@@ -151,12 +151,15 @@ Create a record with `roughdraft propose`, `roughdraft review`, or `roughdraft c
 
 | State | Setup | Stable selectors | What to capture |
 | --- | --- | --- | --- |
+| Compact review header | Scroll a long comparison | `comparison-header`, `comparison-header-filename`, `comparison-header-state` | Full-width header stays at the page top; filename/path tooltip, mode, remaining decisions, save/conflict state and one explicit primary action. |
+| Change navigation | Use Previous / Next in a long comparison | `comparison-previous-change`, `comparison-next-change`, `comparison-navigation-position` | Native change anchors land below the sticky header. Reviewed changes become navigable when Show reviewed changes is selected. |
+| Mobile header | Open a long filename at 390px wide | `comparison-header`, `comparison-remaining`, `comparison-apply` | Compact two-row layout, visible navigation and final action, no page overflow; full destination remains available from the filename/action tooltip and review details. |
 | Proposed changes, undecided | Create proposal | `comparison-mode`, `document-review-rail`, `comparison-apply` | Native suggestion cards with Accept / Skip; disabled Apply until every source change is decided; destination and save explanation. |
 | Proposed changes, mixed choices | Accept one and Skip another | `comment-rail-<id>-action-accept`, `comment-rail-<id>-action-reject`, `comparison-save-status` | Resolved choices display their selected content. Show reviewed changes reveals the original native highlights/cards so choices can be revised; Apply names the count and destination. |
 | Changes already made | Create applied review | `comparison-mode`, `document-review-rail` | Keep / Revert labels and explicit final Revert action. |
 | Comparison only | Compare two versions | `comparison-propose`, `comparison-complete` | Rendered versions with native highlights and feedback threads, without approval buttons or destination; Finish comparison cannot write either version. |
 | Choose proposal destination | Click Propose these edits | `comparison-convert`, `comparison-convert-target` | Absolute path entry and explanation that conversion does not write the file. |
-| Destination conflict | Modify destination externally | `comparison-conflict`, `comparison-refresh` | Preserved choices, blocked Apply, explicit refresh explanation. |
+| Destination conflict | Modify destination externally | `comparison-header-state`, `comparison-conflict`, `comparison-refresh` | Preserved choices, blocked Apply, explicit refresh explanation. |
 | Refreshed comparison | Click Refresh comparison | `comparison-refresh-notice` | New current version and undecided changes requiring a fresh decision. |
 | Review save failed | Interrupt API during a choice | `comparison-error`, `comparison-retry` | Local choices remain visible; retry is explicit. |
 | Completed review | Apply or finish without applying | `comparison-outcome` | Distinguishes a saved destination from “No file was written.” |

@@ -1,3 +1,4 @@
+import { ArrowDown, ArrowUp } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiBackend } from "./api-backend";
 import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
@@ -69,11 +70,13 @@ function NativeComparisonDocument({
   showReviewed,
   busy,
   onChoices,
+  onNavigationGroupsChange,
 }: {
   review: Comparison;
   showReviewed: boolean;
   busy: boolean;
   onChoices: (choices: Choices) => void;
+  onNavigationGroupsChange: (ids: string[]) => void;
 }) {
   const contextPath =
     review.targetPath ??
@@ -107,6 +110,16 @@ function NativeComparisonDocument({
       }),
     [review, showReviewed, backend, contextPath],
   );
+  useEffect(() => {
+    const visibleIds = new Set(
+      model.suggestions.map((suggestion) => suggestion.changeId),
+    );
+    onNavigationGroupsChange(
+      model.groups
+        .filter((group) => visibleIds.has(group.id))
+        .map((group) => group.id),
+    );
+  }, [model, onNavigationGroupsChange]);
   const commentsRef = useRef(review.reviewComments ?? []);
   commentsRef.current = review.reviewComments ?? [];
   const legacyCommentSegment = (commentId: string) =>
@@ -244,6 +257,74 @@ export function ComparisonReview({ id }: { id: string }) {
   const [destination, setDestination] = useState("");
   const [refreshNotice, setRefreshNotice] = useState(false);
   const [showReviewed, setShowReviewed] = useState(false);
+  const [navigationIds, setNavigationIds] = useState<string[]>([]);
+  const [activeChangeId, setActiveChangeId] = useState<string | null>(null);
+  const headerRef = useRef<HTMLElement | null>(null);
+  const documentRef = useRef<HTMLDivElement | null>(null);
+  const convertRef = useRef<HTMLDivElement | null>(null);
+  const receiveNavigationGroups = useCallback((ids: string[]) => {
+    setNavigationIds((current) =>
+      current.length === ids.length &&
+      current.every((id, index) => id === ids[index])
+        ? current
+        : ids,
+    );
+  }, []);
+  useEffect(() => {
+    if (activeChangeId && !navigationIds.includes(activeChangeId))
+      setActiveChangeId(null);
+  }, [activeChangeId, navigationIds]);
+  const scrollBelowHeader = useCallback((element: HTMLElement) => {
+    const top =
+      window.scrollY +
+      element.getBoundingClientRect().top -
+      (headerRef.current?.offsetHeight ?? 0) -
+      12;
+    window.scrollTo({
+      top: Math.max(0, top),
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "auto"
+        : "smooth",
+    });
+  }, []);
+  const navigateChange = (direction: -1 | 1) => {
+    if (!navigationIds.length) return;
+    const current =
+      activeChangeId === null ? -1 : navigationIds.indexOf(activeChangeId);
+    const index =
+      current < 0
+        ? direction > 0
+          ? 0
+          : navigationIds.length - 1
+        : (current + direction + navigationIds.length) % navigationIds.length;
+    const nextId = navigationIds[index];
+    const root = documentRef.current;
+    if (!root) return;
+    const anchor =
+      [
+        ...root.querySelectorAll<HTMLElement>(
+          ".critic-change[data-critic-change-id]",
+        ),
+      ].find(
+        (element) =>
+          element.dataset.criticChangeId === nextId &&
+          element.getBoundingClientRect().height > 0,
+      ) ??
+      [
+        ...root.querySelectorAll<HTMLElement>(
+          '[data-suggestion-thread-container="true"]',
+        ),
+      ].find(
+        (element) => element.dataset.testid === `suggestion-thread-${nextId}`,
+      );
+    if (!anchor) return;
+    setActiveChangeId(nextId);
+    scrollBelowHeader(anchor);
+  };
+  useEffect(() => {
+    if (convertVisible && convertRef.current)
+      scrollBelowHeader(convertRef.current);
+  }, [convertVisible, scrollBelowHeader]);
   const savedRef = useRef<Comparison | null>(null);
   const queueRef = useRef<Choices[]>([]);
   const savingRef = useRef(false);
@@ -415,6 +496,31 @@ export function ComparisonReview({ id }: { id: string }) {
       : review.mode === "applied"
         ? "Changes already made"
         : "Compare two versions";
+  const shortMode =
+    review.mode === "proposal"
+      ? "Proposed"
+      : review.mode === "applied"
+        ? "Already changed"
+        : "Compare";
+  const headerState = !open
+    ? review.completion?.fileWritten
+      ? "Saved"
+      : "Finished"
+    : review.targetChanged
+      ? "File changed"
+      : saveState === "saving"
+        ? "Saving…"
+        : saveState === "failed"
+          ? "Not saved"
+          : error
+            ? "Review issue"
+            : "Review saved";
+  const applyLabel =
+    review.mode === "applied"
+      ? `Revert ${selected} ${selected === 1 ? "change" : "changes"} in ${basename}`
+      : `Apply ${selected} ${selected === 1 ? "change" : "changes"} to ${basename}`;
+  const activeChangeIndex =
+    activeChangeId === null ? -1 : navigationIds.indexOf(activeChangeId);
   const chooseAll = (decision: Decision) =>
     changeChoices({
       decisions: changes.map(({ id: segmentId }) => ({
@@ -424,223 +530,97 @@ export function ComparisonReview({ id }: { id: string }) {
     });
 
   return (
-    <main className="comparison-page" data-testid="comparison-page">
-      <header className="comparison-header">
-        <a href="/" className="comparison-brand">
-          Roughdraft <span>Changes</span>
-        </a>
-        <span className="comparison-mode" data-testid="comparison-mode">
-          {modeLabel}
-        </span>
-        <h1>{review.title || basename}</h1>
-        {review.targetPath ? (
-          <p className="comparison-target" data-testid="comparison-target">
-            File: <code>{review.targetPath}</code>
-          </p>
-        ) : (
-          <p className="comparison-target">
-            No destination file. This comparison cannot write to either version.
-          </p>
-        )}
-        <p
-          className="comparison-explanation"
-          data-testid="comparison-explanation"
-        >
-          {!open
-            ? review.completion?.fileWritten
-              ? "Your selected changes were saved to the destination file."
-              : "This review finished without writing a file."
-            : review.mode === "proposal"
-              ? "The file is unchanged. Accept or Skip each change, then Apply to write your selection."
-              : review.mode === "applied"
-                ? "These changes are already in the file. Keep or Revert each change, then save the selected reversions."
-                : "These are frozen versions for discussion. To apply changes, first choose a destination with Propose these edits."}{" "}
-          Choices and comments save separately from the file.
-        </p>
-      </header>
-
-      {error && (
-        <div
-          className="comparison-error"
-          role="alert"
-          data-testid="comparison-error"
-        >
-          <p>{error}</p>
-          {saveState === "failed" && (
-            <>
-              <p>Your unsaved choices remain on this page.</p>
-              <Button
-                variant="outline"
-                data-testid="comparison-retry"
-                disabled={busy}
-                onClick={() => void retryChoices()}
-              >
-                Retry saving these choices
-              </Button>
-            </>
-          )}
-          <p>Reloading replaces this page’s choices with the saved review.</p>
-          <Button
-            variant="outline"
-            data-testid="comparison-reload"
-            disabled={busy}
-            onClick={() => window.location.reload()}
-          >
-            Reload saved review
-          </Button>
-        </div>
-      )}
-      {review.targetChanged && open && (
-        <div
-          className="comparison-conflict"
-          role="alert"
-          data-testid="comparison-conflict"
-        >
-          <p>
-            The destination changed after this comparison was created. Your
-            choices are preserved. Applying is blocked.
-          </p>
-          <p>
-            Refresh compares with the current file. Choices survive only where
-            the exact change is unchanged; review the remaining changes again.
-          </p>
-          <Button
-            variant="outline"
-            data-testid="comparison-refresh"
-            disabled={disabled}
-            onClick={() => void finish("refresh")}
-          >
-            Refresh comparison
-          </Button>
-        </div>
-      )}
-      {refreshNotice && (
-        <p
-          className="comparison-notice"
-          data-testid="comparison-refresh-notice"
-        >
-          Comparison refreshed from the current file. Review undecided changes
-          again before applying.
-        </p>
-      )}
-      {!open && (
-        <div
-          className="comparison-outcome"
-          role="status"
-          data-testid="comparison-outcome"
-        >
-          {review.completion?.fileWritten ? (
-            <>
-              Saved your selected changes to{" "}
-              <code>{review.completion.targetPath}</code>.
-            </>
-          ) : (
-            <>Review finished. No file was written.</>
-          )}{" "}
-          <span>Review choices and comments are retained.</span>
-        </div>
-      )}
-
-      <div className="comparison-toolbar" data-testid="comparison-toolbar">
-        <p>
-          {changes.length} {changes.length === 1 ? "change" : "changes"}
-          {writable && open ? ` · ${pending} undecided` : ""}
-        </p>
-        {writable && open && (
-          <div className="comparison-batch">
-            <Button
-              variant="outline"
-              size="sm"
-              data-testid="comparison-accept-all"
-              disabled={busy}
-              onClick={() => chooseAll("after")}
+    <>
+      <header
+        className="comparison-header-bar"
+        data-testid="comparison-header"
+        ref={headerRef}
+      >
+        <div className="comparison-header-inner">
+          <div className="comparison-header-identity">
+            <h1
+              data-testid="comparison-header-filename"
+              title={
+                review.targetPath ??
+                `${review.beforeLabel} → ${review.afterLabel}`
+              }
             >
-              {review.mode === "applied" ? "Keep all" : "Accept all"}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              data-testid="comparison-skip-all"
-              disabled={busy}
-              onClick={() => chooseAll("before")}
+              {review.targetPath
+                ? basename
+                : review.title || "Compare versions"}
+            </h1>
+            <span
+              className="comparison-header-mode"
+              data-testid="comparison-header-mode"
+              title={modeLabel}
             >
-              {review.mode === "applied" ? "Revert all" : "Skip all"}
-            </Button>
+              {shortMode}
+            </span>
           </div>
-        )}
-        <span
-          className={`comparison-save comparison-save-${saveState}`}
-          role="status"
-          data-testid="comparison-save-status"
-        >
-          {saveState === "saving"
-            ? "Saving review…"
-            : saveState === "failed"
-              ? "Review not saved"
-              : "Review saved separately"}
-        </span>
-      </div>
-      <div className="comparison-version-labels">
-        <span>Before: {review.beforeLabel}</span>
-        <span>After: {review.afterLabel}</span>
-      </div>
-      <Button
-        variant="outline"
-        size="sm"
-        data-testid="comparison-show-reviewed"
-        aria-pressed={showReviewed}
-        onClick={() => setShowReviewed(!showReviewed)}
-      >
-        {showReviewed ? "Hide reviewed changes" : "Show reviewed changes"}
-      </Button>
-      {changes.length === 0 && (
-        <p className="comparison-empty" data-testid="comparison-identical">
-          The versions are identical. There are no changes to apply.
-        </p>
-      )}
-      <NativeComparisonDocument
-        review={review}
-        showReviewed={showReviewed}
-        busy={busy}
-        onChoices={changeChoices}
-      />
-      <label
-        className="comparison-overall-comment"
-        htmlFor="comparison-overall-feedback"
-      >
-        <span>Overall feedback</span>
-        <Textarea
-          id="comparison-overall-feedback"
-          data-testid="comparison-comment"
-          value={review.comment}
-          placeholder="Optional feedback for the agent"
-          disabled={!open || busy}
-          onChange={(event) => changeChoices({ comment: event.target.value })}
-        />
-      </label>
-      {open && (
-        <footer className="comparison-actions">
-          <p>
-            {writable
-              ? pending > 0
-                ? `Choose ${review.mode === "applied" ? "Keep or Revert" : "Accept or Skip"} for all ${pending} undecided ${pending === 1 ? "change" : "changes"} before saving the file.`
-                : selected > 0
-                  ? `${selected} selected ${selected === 1 ? "change will" : "changes will"} be written to ${basename}.`
-                  : "Your selection keeps the file as it is. No content changes will be written."
-              : "Finishing this comparison does not write to either version."}
-          </p>
-          <div className="comparison-final-buttons">
+          <nav
+            className="comparison-header-navigation"
+            aria-label="Change navigation"
+          >
             <Button
-              variant="outline"
-              data-testid="comparison-complete"
-              disabled={disabled}
-              onClick={() => void finish("complete")}
+              variant="ghost"
+              size="icon"
+              data-testid="comparison-previous-change"
+              aria-label="Previous change"
+              title="Previous change"
+              disabled={!navigationIds.length}
+              onClick={() => navigateChange(-1)}
             >
-              {writable ? "Finish without applying" : "Finish comparison"}
+              <ArrowUp />
             </Button>
-            {writable ? (
+            <span
+              data-testid="comparison-navigation-position"
+              aria-live="polite"
+            >
+              {activeChangeIndex < 0 ? "–" : activeChangeIndex + 1} /{" "}
+              {navigationIds.length}
+            </span>
+            <Button
+              variant="ghost"
+              size="icon"
+              data-testid="comparison-next-change"
+              aria-label="Next change"
+              title="Next change"
+              disabled={!navigationIds.length}
+              onClick={() => navigateChange(1)}
+            >
+              <ArrowDown />
+            </Button>
+          </nav>
+          <div className="comparison-header-progress">
+            <span
+              data-testid="comparison-remaining"
+              title={
+                writable
+                  ? `${pending} changes remain undecided`
+                  : "Comparison only; no file will be written"
+              }
+            >
+              {!open ? "Closed" : writable ? `${pending} left` : "Read only"}
+            </span>
+            <span
+              className={`comparison-header-state ${review.targetChanged || saveState === "failed" ? "comparison-header-state-warning" : ""}`}
+              data-testid="comparison-header-state"
+              role="status"
+              title="Review choices and submitted comments save separately from the Markdown file."
+            >
+              {headerState}
+            </span>
+          </div>
+          {open &&
+            (writable ? (
               <Button
+                className="comparison-header-primary"
                 data-testid="comparison-apply"
+                title={
+                  review.targetPath
+                    ? `${applyLabel} (${review.targetPath})`
+                    : applyLabel
+                }
                 disabled={
                   disabled ||
                   pending > 0 ||
@@ -649,51 +629,268 @@ export function ComparisonReview({ id }: { id: string }) {
                 }
                 onClick={() => void finish("apply")}
               >
-                {review.mode === "applied"
-                  ? `Revert ${selected} ${selected === 1 ? "change" : "changes"} in ${basename}`
-                  : `Apply ${selected} ${selected === 1 ? "change" : "changes"} to ${basename}`}
+                <span>{applyLabel}</span>
               </Button>
             ) : (
               <Button
+                className="comparison-header-primary"
                 data-testid="comparison-propose"
                 disabled={disabled}
                 onClick={() => setConvertVisible(true)}
               >
                 Propose these edits
               </Button>
+            ))}
+        </div>
+      </header>
+      <main className="comparison-page" data-testid="comparison-page">
+        <section className="comparison-summary" aria-label="Review details">
+          <span className="comparison-mode" data-testid="comparison-mode">
+            {modeLabel}
+          </span>
+          {review.targetPath ? (
+            <p className="comparison-target" data-testid="comparison-target">
+              File: <code>{review.targetPath}</code>
+            </p>
+          ) : (
+            <p className="comparison-target">
+              No destination file. This comparison cannot write to either
+              version.
+            </p>
+          )}
+          <p
+            className="comparison-explanation"
+            data-testid="comparison-explanation"
+          >
+            {!open
+              ? review.completion?.fileWritten
+                ? "Your selected changes were saved to the destination file."
+                : "This review finished without writing a file."
+              : review.mode === "proposal"
+                ? "The file is unchanged. Accept or Skip each change, then Apply to write your selection."
+                : review.mode === "applied"
+                  ? "These changes are already in the file. Keep or Revert each change, then save the selected reversions."
+                  : "These are frozen versions for discussion. To apply changes, first choose a destination with Propose these edits."}{" "}
+            Choices and comments save separately from the file.
+          </p>
+        </section>
+
+        {error && (
+          <div
+            className="comparison-error"
+            role="alert"
+            data-testid="comparison-error"
+          >
+            <p>{error}</p>
+            {saveState === "failed" && (
+              <>
+                <p>Your unsaved choices remain on this page.</p>
+                <Button
+                  variant="outline"
+                  data-testid="comparison-retry"
+                  disabled={busy}
+                  onClick={() => void retryChoices()}
+                >
+                  Retry saving these choices
+                </Button>
+              </>
             )}
-          </div>
-          {convertVisible && !writable && (
-            <div
-              className="comparison-convert"
-              data-testid="comparison-convert"
+            <p>Reloading replaces this page’s choices with the saved review.</p>
+            <Button
+              variant="outline"
+              data-testid="comparison-reload"
+              disabled={busy}
+              onClick={() => window.location.reload()}
             >
-              <label htmlFor="comparison-destination">
-                Destination file (must currently match Before)
-              </label>
-              <Input
-                id="comparison-destination"
-                data-testid="comparison-convert-target"
-                placeholder="/absolute/path/to/AGENTS.md"
-                value={destination}
-                disabled={disabled}
-                onChange={(event) => setDestination(event.target.value)}
-              />
-              <p>
-                This creates a new proposal. It does not write the file; Accept
-                / Skip and Apply happen in the next review.
-              </p>
+              Reload saved review
+            </Button>
+          </div>
+        )}
+        {review.targetChanged && open && (
+          <div
+            className="comparison-conflict"
+            role="alert"
+            data-testid="comparison-conflict"
+          >
+            <p>
+              The destination changed after this comparison was created. Your
+              choices are preserved. Applying is blocked.
+            </p>
+            <p>
+              Refresh compares with the current file. Choices survive only where
+              the exact change is unchanged; review the remaining changes again.
+            </p>
+            <Button
+              variant="outline"
+              data-testid="comparison-refresh"
+              disabled={disabled}
+              onClick={() => void finish("refresh")}
+            >
+              Refresh comparison
+            </Button>
+          </div>
+        )}
+        {refreshNotice && (
+          <p
+            className="comparison-notice"
+            data-testid="comparison-refresh-notice"
+          >
+            Comparison refreshed from the current file. Review undecided changes
+            again before applying.
+          </p>
+        )}
+        {!open && (
+          <div
+            className="comparison-outcome"
+            role="status"
+            data-testid="comparison-outcome"
+          >
+            {review.completion?.fileWritten ? (
+              <>
+                Saved your selected changes to{" "}
+                <code>{review.completion.targetPath}</code>.
+              </>
+            ) : (
+              <>Review finished. No file was written.</>
+            )}{" "}
+            <span>Review choices and comments are retained.</span>
+          </div>
+        )}
+
+        <div className="comparison-toolbar" data-testid="comparison-toolbar">
+          <p>
+            {changes.length} {changes.length === 1 ? "change" : "changes"}
+            {writable && open ? ` · ${pending} undecided` : ""}
+          </p>
+          {writable && open && (
+            <div className="comparison-batch">
               <Button
-                data-testid="comparison-convert-submit"
-                disabled={disabled || !destination.trim()}
-                onClick={() => void finish("convert")}
+                variant="outline"
+                size="sm"
+                data-testid="comparison-accept-all"
+                disabled={busy}
+                onClick={() => chooseAll("after")}
               >
-                Create proposal for this file
+                {review.mode === "applied" ? "Keep all" : "Accept all"}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                data-testid="comparison-skip-all"
+                disabled={busy}
+                onClick={() => chooseAll("before")}
+              >
+                {review.mode === "applied" ? "Revert all" : "Skip all"}
               </Button>
             </div>
           )}
-        </footer>
-      )}
-    </main>
+          <span
+            className={`comparison-save comparison-save-${saveState}`}
+            role="status"
+            data-testid="comparison-save-status"
+          >
+            {saveState === "saving"
+              ? "Saving review…"
+              : saveState === "failed"
+                ? "Review not saved"
+                : "Review saved separately"}
+          </span>
+        </div>
+        <div className="comparison-version-labels">
+          <span>Before: {review.beforeLabel}</span>
+          <span>After: {review.afterLabel}</span>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          data-testid="comparison-show-reviewed"
+          aria-pressed={showReviewed}
+          onClick={() => setShowReviewed(!showReviewed)}
+        >
+          {showReviewed ? "Hide reviewed changes" : "Show reviewed changes"}
+        </Button>
+        {changes.length === 0 && (
+          <p className="comparison-empty" data-testid="comparison-identical">
+            The versions are identical. There are no changes to apply.
+          </p>
+        )}
+        <div ref={documentRef}>
+          <NativeComparisonDocument
+            review={review}
+            showReviewed={showReviewed}
+            busy={busy}
+            onChoices={changeChoices}
+            onNavigationGroupsChange={receiveNavigationGroups}
+          />
+        </div>
+        <label
+          className="comparison-overall-comment"
+          htmlFor="comparison-overall-feedback"
+        >
+          <span>Overall feedback</span>
+          <Textarea
+            id="comparison-overall-feedback"
+            data-testid="comparison-comment"
+            value={review.comment}
+            placeholder="Optional feedback for the agent"
+            disabled={!open || busy}
+            onChange={(event) => changeChoices({ comment: event.target.value })}
+          />
+        </label>
+        {open && (
+          <footer className="comparison-actions">
+            <p>
+              {writable
+                ? pending > 0
+                  ? `Choose ${review.mode === "applied" ? "Keep or Revert" : "Accept or Skip"} for all ${pending} undecided ${pending === 1 ? "change" : "changes"} before saving the file.`
+                  : selected > 0
+                    ? `${selected} selected ${selected === 1 ? "change will" : "changes will"} be written to ${basename}.`
+                    : "Your selection keeps the file as it is. No content changes will be written."
+                : "Finishing this comparison does not write to either version."}
+            </p>
+            <div className="comparison-final-buttons">
+              <Button
+                variant="outline"
+                data-testid="comparison-complete"
+                disabled={disabled}
+                onClick={() => void finish("complete")}
+              >
+                {writable ? "Finish without applying" : "Finish comparison"}
+              </Button>
+            </div>
+            {convertVisible && !writable && (
+              <div
+                className="comparison-convert"
+                data-testid="comparison-convert"
+                ref={convertRef}
+              >
+                <label htmlFor="comparison-destination">
+                  Destination file (must currently match Before)
+                </label>
+                <Input
+                  id="comparison-destination"
+                  data-testid="comparison-convert-target"
+                  placeholder="/absolute/path/to/AGENTS.md"
+                  value={destination}
+                  disabled={disabled}
+                  onChange={(event) => setDestination(event.target.value)}
+                />
+                <p>
+                  This creates a new proposal. It does not write the file;
+                  Accept / Skip and Apply happen in the next review.
+                </p>
+                <Button
+                  data-testid="comparison-convert-submit"
+                  disabled={disabled || !destination.trim()}
+                  onClick={() => void finish("convert")}
+                >
+                  Create proposal for this file
+                </Button>
+              </div>
+            )}
+          </footer>
+        )}
+      </main>
+    </>
   );
 }
