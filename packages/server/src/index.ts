@@ -16,6 +16,7 @@ import {
   resolveBindHosts,
 } from "./network.js";
 import { ReviewEventQueue } from "./review-events.js";
+import { comparisonRouter } from "./comparisons.js";
 import { resolveUpdateStatus } from "./update-status.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -67,6 +68,7 @@ interface CreateAppOptions {
   fetchImpl?: typeof fetch;
   packageName?: string;
   remoteDocumentToken?: string;
+  comparisonsDir?: string;
 }
 
 interface CreateAppResult {
@@ -452,6 +454,14 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   remoteSessionSweeper.unref?.();
 
   app.use(express.json({ limit: "50mb" }));
+  app.use(
+    "/api/comparisons",
+    comparisonRouter(
+      options.comparisonsDir ??
+        process.env.ROUGHDRAFT_COMPARISONS_DIR ??
+        path.join(homeDir, ".roughdraft", "comparisons"),
+    ),
+  );
 
   function requestedProjectPath(req: Request): string | null {
     const queryPath =

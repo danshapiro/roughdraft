@@ -4,6 +4,7 @@
     "includes": [
       "**",
       "!.context",
+      "!.test-tmp",
       "!.roughdraft-state",
       "!**/coverage",
       "!**/playwright-report",
