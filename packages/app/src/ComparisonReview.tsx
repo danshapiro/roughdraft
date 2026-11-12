@@ -2,7 +2,10 @@ import { ArrowDown, ArrowUp } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiBackend } from "./api-backend";
 import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
-import { buildComparisonDocument } from "./comparison-document";
+import {
+  buildComparisonDocument,
+  buildComparisonPreviewDocument,
+} from "./comparison-document";
 import type {
   ComparisonReviewData as Comparison,
   ComparisonReviewComment,
@@ -68,12 +71,14 @@ function applyLocalChoices(review: Comparison, choices: Choices): Comparison {
 function NativeComparisonDocument({
   review,
   showReviewed,
+  showDiffs,
   busy,
   onChoices,
   onNavigationGroupsChange,
 }: {
   review: Comparison;
   showReviewed: boolean;
+  showDiffs: boolean;
   busy: boolean;
   onChoices: (choices: Choices) => void;
   onNavigationGroupsChange: (ids: string[]) => void;
@@ -96,10 +101,9 @@ function NativeComparisonDocument({
       }),
     [contextPath],
   );
-  const model = useMemo(
+  const markdownOptions = useMemo(
     () =>
-      buildComparisonDocument(review, {
-        showReviewed,
+      ({
         resolveFileUrl: (path) => backend.resolveFileUrl(path),
         resolveLinkUrl: (href) =>
           buildLocationForLinkedMarkdownDocument({
@@ -107,8 +111,19 @@ function NativeComparisonDocument({
             currentDocumentPath: contextPath,
             href,
           }),
-      }),
-    [review, showReviewed, backend, contextPath],
+      }) satisfies Parameters<typeof buildComparisonDocument>[1],
+    [backend, contextPath],
+  );
+  const model = useMemo(
+    () => buildComparisonDocument(review, { ...markdownOptions, showReviewed }),
+    [review, showReviewed, markdownOptions],
+  );
+  const previewDoc = useMemo(
+    () =>
+      showDiffs
+        ? null
+        : buildComparisonPreviewDocument(review, markdownOptions),
+    [review, showDiffs, markdownOptions],
   );
   useEffect(() => {
     const visibleIds = new Set(
@@ -205,43 +220,82 @@ function NativeComparisonDocument({
   );
   return (
     <>
-      {linkedGroups.length > 0 && (
-        <p
-          className="comparison-linked-notice"
-          data-testid="comparison-linked-notice"
+      {/* Keep the review mounted so hiding changes preserves comment drafts. */}
+      <div hidden={!showDiffs}>
+        {linkedGroups.length > 0 && (
+          <p
+            className="comparison-linked-notice"
+            data-testid="comparison-linked-notice"
+          >
+            {
+              review.segments.filter((segment) => segment.kind === "change")
+                .length
+            }{" "}
+            source changes appear in {model.groups.length} review{" "}
+            {model.groups.length === 1 ? "group" : "groups"}. Changes within one
+            Markdown block are reviewed together; each card shows its linked
+            count. Existing individual choices remain saved until you choose
+            again.
+          </p>
+        )}
+        <div
+          className="comparison-native-document"
+          data-testid="comparison-native-document"
         >
-          {
-            review.segments.filter((segment) => segment.kind === "change")
-              .length
-          }{" "}
-          source changes appear in {model.groups.length} review{" "}
-          {model.groups.length === 1 ? "group" : "groups"}. Changes within one
-          Markdown block are reviewed together; each card shows its linked
-          count. Existing individual choices remain saved until you choose
-          again.
-        </p>
-      )}
-      <div
-        className="comparison-native-document"
-        data-testid="comparison-native-document"
-      >
-        <RichTextEditorSurface
-          page={{
-            id: review.id,
-            title: review.title,
-            content: review.afterText,
-          }}
-          activeDocumentPath={contextPath}
-          selected={true}
-          layout="default"
-          focusRequestKey={null}
-          sourceMarkdown={review.afterText}
-          onMarkdownChange={() => {}}
-          interactionMode="viewing"
-          backend={backend}
-          controlledReview={controlledReview}
-        />
+          <RichTextEditorSurface
+            page={{
+              id: review.id,
+              title: review.title,
+              content: review.afterText,
+            }}
+            activeDocumentPath={contextPath}
+            selected={true}
+            layout="default"
+            focusRequestKey={null}
+            sourceMarkdown={review.afterText}
+            onMarkdownChange={() => {}}
+            interactionMode="viewing"
+            backend={backend}
+            controlledReview={controlledReview}
+          />
+        </div>
       </div>
+      {previewDoc && (
+        <div
+          className="comparison-native-document"
+          data-testid="comparison-clean-preview"
+        >
+          <p className="comparison-preview-explanation">
+            {review.mode === "compare"
+              ? "After version. Neither file is changed."
+              : "Preview of your choices. Undecided changes show the new version."}
+          </p>
+          <RichTextEditorSurface
+            page={{
+              id: `${review.id}-preview`,
+              title: review.title,
+              content: "",
+            }}
+            activeDocumentPath={contextPath}
+            selected={false}
+            layout="default"
+            focusRequestKey={null}
+            sourceMarkdown=""
+            onMarkdownChange={() => {}}
+            interactionMode="viewing"
+            backend={backend}
+            controlledReview={{
+              ...controlledReview,
+              doc: previewDoc,
+              suggestions: [],
+              comments: new Map(),
+              blockHighlights: [],
+              canDecide: false,
+              disabled: true,
+            }}
+          />
+        </div>
+      )}
     </>
   );
 }
@@ -257,6 +311,7 @@ export function ComparisonReview({ id }: { id: string }) {
   const [destination, setDestination] = useState("");
   const [refreshNotice, setRefreshNotice] = useState(false);
   const [showReviewed, setShowReviewed] = useState(false);
+  const [showDiffs, setShowDiffs] = useState(true);
   const [navigationIds, setNavigationIds] = useState<string[]>([]);
   const [activeChangeId, setActiveChangeId] = useState<string | null>(null);
   const headerRef = useRef<HTMLElement | null>(null);
@@ -545,9 +600,14 @@ export function ComparisonReview({ id }: { id: string }) {
                 `${review.beforeLabel} → ${review.afterLabel}`
               }
             >
-              {review.targetPath
-                ? basename
-                : review.title || "Compare versions"}
+              {review.targetPath ? (
+                review.targetPath
+              ) : (
+                <>
+                  <span className="block">Before: {review.beforeLabel}</span>
+                  <span className="block">After: {review.afterLabel}</span>
+                </>
+              )}
             </h1>
             <span
               className="comparison-header-mode"
@@ -557,6 +617,17 @@ export function ComparisonReview({ id }: { id: string }) {
               {shortMode}
             </span>
           </div>
+          <Button
+            variant="outline"
+            size="sm"
+            className="comparison-header-diff-toggle"
+            data-testid="comparison-show-diffs"
+            aria-pressed={showDiffs}
+            title="Show change marks, or preview your choices without them. Undecided changes use the new version. This does not save the file."
+            onClick={() => setShowDiffs(!showDiffs)}
+          >
+            {showDiffs ? "Hide diffs" : "Show diffs"}
+          </Button>
           <nav
             className="comparison-header-navigation"
             aria-label="Change navigation"
@@ -567,7 +638,7 @@ export function ComparisonReview({ id }: { id: string }) {
               data-testid="comparison-previous-change"
               aria-label="Previous change"
               title="Previous change"
-              disabled={!navigationIds.length}
+              disabled={!showDiffs || !navigationIds.length}
               onClick={() => navigateChange(-1)}
             >
               <ArrowUp />
@@ -585,7 +656,7 @@ export function ComparisonReview({ id }: { id: string }) {
               data-testid="comparison-next-change"
               aria-label="Next change"
               title="Next change"
-              disabled={!navigationIds.length}
+              disabled={!showDiffs || !navigationIds.length}
               onClick={() => navigateChange(1)}
             >
               <ArrowDown />
@@ -805,6 +876,7 @@ export function ComparisonReview({ id }: { id: string }) {
           size="sm"
           data-testid="comparison-show-reviewed"
           aria-pressed={showReviewed}
+          disabled={!showDiffs}
           onClick={() => setShowReviewed(!showReviewed)}
         >
           {showReviewed ? "Hide reviewed changes" : "Show reviewed changes"}
@@ -818,6 +890,7 @@ export function ComparisonReview({ id }: { id: string }) {
           <NativeComparisonDocument
             review={review}
             showReviewed={showReviewed}
+            showDiffs={showDiffs}
             busy={busy}
             onChoices={changeChoices}
             onNavigationGroupsChange={receiveNavigationGroups}

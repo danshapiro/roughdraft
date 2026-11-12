@@ -11,7 +11,7 @@
   margin: 0 auto;
   padding: 8px 24px;
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) auto auto auto;
+  grid-template-columns: minmax(180px, 1fr) auto auto auto auto;
   align-items: center;
   gap: 16px;
 }
@@ -23,8 +23,11 @@
   font-size: 14px;
   font-weight: 600;
   line-height: 1.3;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+.comparison-header-diff-toggle {
   white-space: nowrap;
 }
 .comparison-header-mode {
@@ -73,6 +76,9 @@
     grid-template-columns: minmax(0, 1fr) minmax(130px, 45%);
     gap: 6px 12px;
     padding: 8px 12px;
+  }
+  .comparison-header-identity {
+    grid-column: 1 / -1;
   }
   .comparison-header-navigation {
     justify-self: end;
@@ -150,6 +156,11 @@
 }
 .comparison-native-document {
   margin-top: 20px;
+}
+.comparison-preview-explanation {
+  margin-bottom: 12px;
+  color: var(--muted-foreground);
+  font-size: 12px;
 }
 .comparison-linked-notice {
   font-size: 12px;

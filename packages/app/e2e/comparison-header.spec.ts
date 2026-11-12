@@ -74,7 +74,7 @@ test.describe("compact comparison header", () => {
     await expect(header).toBeVisible();
     await expect(header).toHaveCSS("position", "sticky");
     await expect(header.getByTestId("comparison-header-filename")).toHaveText(
-      "AGENTS.md",
+      targetPath,
     );
     await expect(
       header.getByTestId("comparison-header-filename"),
