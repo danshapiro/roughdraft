@@ -1195,7 +1195,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
-    res.sendFile(absolutePath);
+    // Project-path validation above also permits Roughdraft's own hidden asset
+    // directory and projects inside .worktrees.
+    res.sendFile(absolutePath, { dotfiles: "allow" });
   });
 
   app.post("/api/assets", (req, res) => {
