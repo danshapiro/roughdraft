@@ -11,6 +11,7 @@ import type {
   ComparisonReviewComment,
   ComparisonDecision as Decision,
 } from "./comparison-types";
+import { useComparisonReadingPosition } from "./comparison-reading-position";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
@@ -72,6 +73,7 @@ function NativeComparisonDocument({
   review,
   showReviewed,
   showDiffs,
+  formatted,
   busy,
   onChoices,
   onNavigationGroupsChange,
@@ -79,6 +81,7 @@ function NativeComparisonDocument({
   review: Comparison;
   showReviewed: boolean;
   showDiffs: boolean;
+  formatted: boolean;
   busy: boolean;
   onChoices: (choices: Choices) => void;
   onNavigationGroupsChange: (ids: string[]) => void;
@@ -104,6 +107,7 @@ function NativeComparisonDocument({
   const markdownOptions = useMemo(
     () =>
       ({
+        formatted,
         resolveFileUrl: (path) => backend.resolveFileUrl(path),
         resolveLinkUrl: (href) =>
           buildLocationForLinkedMarkdownDocument({
@@ -112,7 +116,7 @@ function NativeComparisonDocument({
             href,
           }),
       }) satisfies Parameters<typeof buildComparisonDocument>[1],
-    [backend, contextPath],
+    [backend, contextPath, formatted],
   );
   const model = useMemo(
     () => buildComparisonDocument(review, { ...markdownOptions, showReviewed }),
@@ -221,7 +225,10 @@ function NativeComparisonDocument({
   return (
     <>
       {/* Keep the review mounted so hiding changes preserves comment drafts. */}
-      <div hidden={!showDiffs}>
+      <div
+        hidden={!showDiffs}
+        className={formatted ? undefined : "comparison-markdown"}
+      >
         {linkedGroups.length > 0 && (
           <p
             className="comparison-linked-notice"
@@ -262,7 +269,7 @@ function NativeComparisonDocument({
       </div>
       {previewDoc && (
         <div
-          className="comparison-native-document"
+          className={`comparison-native-document${formatted ? "" : " comparison-markdown"}`}
           data-testid="comparison-clean-preview"
         >
           <p className="comparison-preview-explanation">
@@ -312,11 +319,17 @@ export function ComparisonReview({ id }: { id: string }) {
   const [refreshNotice, setRefreshNotice] = useState(false);
   const [showReviewed, setShowReviewed] = useState(false);
   const [showDiffs, setShowDiffs] = useState(true);
+  const [formatted, setFormatted] = useState(true);
   const [navigationIds, setNavigationIds] = useState<string[]>([]);
   const [activeChangeId, setActiveChangeId] = useState<string | null>(null);
   const headerRef = useRef<HTMLElement | null>(null);
   const documentRef = useRef<HTMLDivElement | null>(null);
   const convertRef = useRef<HTMLDivElement | null>(null);
+  const captureReadingPosition = useComparisonReadingPosition(
+    documentRef,
+    headerRef,
+    `${showDiffs}-${showReviewed}-${formatted}`,
+  );
   const receiveNavigationGroups = useCallback((ids: string[]) => {
     setNavigationIds((current) =>
       current.length === ids.length &&
@@ -617,17 +630,35 @@ export function ComparisonReview({ id }: { id: string }) {
               {shortMode}
             </span>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="comparison-header-diff-toggle"
-            data-testid="comparison-show-diffs"
-            aria-pressed={showDiffs}
-            title="Show change marks, or preview your choices without them. Undecided changes use the new version. This does not save the file."
-            onClick={() => setShowDiffs(!showDiffs)}
-          >
-            {showDiffs ? "Hide diffs" : "Show diffs"}
-          </Button>
+          <div className="comparison-header-views">
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="comparison-formatted"
+              aria-pressed={formatted}
+              title="Switch between formatted Markdown and its literal source. This changes only the view."
+              onClick={() => {
+                captureReadingPosition();
+                setFormatted(!formatted);
+              }}
+            >
+              {formatted ? "Markdown" : "Formatted"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="comparison-header-diff-toggle"
+              data-testid="comparison-show-diffs"
+              aria-pressed={showDiffs}
+              title="Show change marks, or preview your choices without them. Undecided changes use the new version. This does not save the file."
+              onClick={() => {
+                captureReadingPosition();
+                setShowDiffs(!showDiffs);
+              }}
+            >
+              {showDiffs ? "Hide diffs" : "Show diffs"}
+            </Button>
+          </div>
           <nav
             className="comparison-header-navigation"
             aria-label="Change navigation"
@@ -877,7 +908,10 @@ export function ComparisonReview({ id }: { id: string }) {
           data-testid="comparison-show-reviewed"
           aria-pressed={showReviewed}
           disabled={!showDiffs}
-          onClick={() => setShowReviewed(!showReviewed)}
+          onClick={() => {
+            captureReadingPosition();
+            setShowReviewed(!showReviewed);
+          }}
         >
           {showReviewed ? "Hide reviewed changes" : "Show reviewed changes"}
         </Button>
@@ -891,6 +925,7 @@ export function ComparisonReview({ id }: { id: string }) {
             review={review}
             showReviewed={showReviewed}
             showDiffs={showDiffs}
+            formatted={formatted}
             busy={busy}
             onChoices={changeChoices}
             onNavigationGroupsChange={receiveNavigationGroups}

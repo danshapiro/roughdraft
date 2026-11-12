@@ -1,7 +1,10 @@
 import type { JSONContent } from "@tiptap/core";
 import { generateHTML } from "@tiptap/core";
 import { describe, expect, it } from "vitest";
-import { buildComparisonDocument } from "./comparison-document";
+import {
+  buildComparisonDocument,
+  buildComparisonPreviewDocument,
+} from "./comparison-document";
 import type {
   ComparisonReviewData,
   ComparisonSegment,
@@ -209,7 +212,12 @@ describe("rendered comparison document", () => {
       { before: "Read the guide.\n", after: "Read the **updated** guide.\n" },
     ]);
     const model = buildComparisonDocument(input);
-    expect(html(model.doc)).toContain("<h1>Instructions</h1>");
+    expect(
+      new DOMParser()
+        .parseFromString(html(model.doc), "text/html")
+        .getElementsByTagName("h1")
+        .item(0)?.textContent,
+    ).toBe("Instructions");
     expect(
       nodes(model.doc).some((node) =>
         node.marks?.some((mark) => mark.type === "bold"),
@@ -459,7 +467,49 @@ describe("rendered comparison document", () => {
       changeId: "123-change-0",
       kind: "substitution-new",
     });
-    expect(html(model.doc)).toContain("<hr>");
+    expect(
+      new DOMParser()
+        .parseFromString(html(model.doc), "text/html")
+        .getElementsByTagName("hr")
+        .item(0),
+    ).not.toBeNull();
+  });
+
+  it("preserves full-document Markdown context in a selected clean preview", () => {
+    const input = review([
+      { before: "---\ntitle: Instructions\n---\n\n# Guide\n\n" },
+      {
+        before: "Read [old guide][guide].\n\n",
+        after: "Read [new guide][guide].\n\n",
+        decision: "before",
+      },
+      {
+        before:
+          "- First **item**\n- Second item\n\n| Name | Value |\n| --- | --- |\n| A | B |\n\n",
+      },
+      { before: '[guide]: https://example.com/guide "Guide"\n' },
+    ]);
+    const frozen = JSON.stringify(input);
+    const doc = buildComparisonPreviewDocument(input);
+    const rendered = new DOMParser().parseFromString(html(doc), "text/html");
+    expect(rendered.getElementsByTagName("h1").item(0)?.textContent).toBe(
+      "Guide",
+    );
+    expect(rendered.getElementsByTagName("a").item(0)?.textContent).toBe(
+      "old guide",
+    );
+    expect(
+      rendered.getElementsByTagName("a").item(0)?.getAttribute("href"),
+    ).toBe("https://example.com/guide");
+    expect(rendered.getElementsByTagName("li")).toHaveLength(2);
+    expect(rendered.getElementsByTagName("strong").item(0)?.textContent).toBe(
+      "item",
+    );
+    expect(rendered.getElementsByTagName("td").item(0)?.textContent).toBe("A");
+    expect(
+      rendered.getElementsByTagName("code").item(0)?.textContent,
+    ).toContain("title: Instructions");
+    expect(JSON.stringify(input)).toBe(frozen);
   });
 
   it("resolves reference links from their full snapshot outside a rendered unit", () => {

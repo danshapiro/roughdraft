@@ -142,7 +142,7 @@ test.describe("comparison diff visibility", () => {
     });
   }
 
-  test("hiding diffs retains an unsubmitted native comment draft", async ({
+  test("display toggles retain an unsubmitted native comment draft", async ({
     page,
     request,
   }) => {
@@ -173,10 +173,17 @@ test.describe("comparison diff visibility", () => {
     const beforeToggle = await (
       await request.get(`${apiUrl}/api/comparisons/${review.id}`)
     ).json();
+    const formatted = page.getByTestId("comparison-formatted");
+    await formatted.click();
+    await expect(editor).toBeVisible();
+    await expect(editor).toHaveValue("Unsubmitted draft survives preview");
     const toggle = page.getByTestId("comparison-show-diffs");
     await toggle.click();
     await expect(editor).toBeHidden();
     await toggle.click();
+    await expect(editor).toBeVisible();
+    await expect(editor).toHaveValue("Unsubmitted draft survives preview");
+    await formatted.click();
     await expect(editor).toBeVisible();
     await expect(editor).toHaveValue("Unsubmitted draft survives preview");
     expect(
