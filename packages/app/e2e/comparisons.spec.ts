@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 import {
   createMarkdownProject,
   readProjectFile,
@@ -8,6 +8,19 @@ import {
 } from "./helpers";
 
 const apiUrl = `http://127.0.0.1:${process.env.API_PORT ?? 4317}`;
+
+async function leaveNativeReply(page: Page, changeId: string, content: string) {
+  await page.getByTestId(`comment-rail-${changeId}-action-reply`).click();
+  const editor = page.getByTestId(/^comment-rail-review-.*-editor$/);
+  await editor.fill(content);
+  await editor.press(
+    process.platform === "darwin" ? "Meta+Enter" : "Control+Enter",
+  );
+  await expect(page.getByTestId("document-review-rail")).toContainText(content);
+  await expect(page.getByTestId("comparison-save-status")).toHaveText(
+    "Review saved separately",
+  );
+}
 
 test.describe("file comparisons", () => {
   let projectDir: string;
@@ -30,33 +43,72 @@ test.describe("file comparisons", () => {
     });
     expect(response.status()).toBe(201);
     const review = await response.json();
+    const [first, second] = review.segments.filter(
+      (segment: { kind: string }) => segment.kind === "change",
+    );
     await page.goto(`/?comparison=${review.id}`);
     await expect(page.getByTestId("comparison-mode")).toHaveText(
       "Proposed changes",
     );
     await expect(page.getByTestId("comparison-apply")).toBeDisabled();
-    const changes = page.getByTestId("comparison-change");
-    await expect(changes).toHaveCount(2);
-    await changes.nth(0).getByTestId("comparison-choice-after").click();
-    await changes.nth(1).getByTestId("comparison-choice-before").click();
-    await changes
-      .nth(0)
-      .getByTestId("comparison-change-comment")
-      .fill("Keep the first improvement.");
+    await expect(
+      page.locator('[data-suggestion-thread-container="true"]'),
+    ).toHaveCount(2);
+    await leaveNativeReply(page, first.id, "Keep the first improvement.");
+    const feedback = await (
+      await request.get(`${apiUrl}/api/comparisons/${review.id}`)
+    ).json();
+    const firstReply = feedback.reviewComments.find(
+      (comment: { content: string }) =>
+        comment.content === "Keep the first improvement.",
+    );
+    await leaveNativeReply(
+      page,
+      firstReply.id,
+      "A nested follow-up stays attached.",
+    );
+    await page.getByTestId(`comment-rail-${first.id}-action-accept`).click();
+    await page.getByTestId(`comment-rail-${second.id}-action-reject`).click();
     await expect(page.getByTestId("comparison-save-status")).toHaveText(
       "Review saved separately",
     );
     expect(readProjectFile(projectDir, "AGENTS.md")).toBe(beforeText);
     await page.reload();
+    const saved = await (
+      await request.get(`${apiUrl}/api/comparisons/${review.id}`)
+    ).json();
+    expect(
+      saved.segments.find((segment: { id: string }) => segment.id === first.id)
+        .decision,
+    ).toBe("after");
+    expect(
+      saved.segments.find((segment: { id: string }) => segment.id === second.id)
+        .decision,
+    ).toBe("before");
+    expect(
+      saved.reviewComments.map(
+        (comment: { content: string }) => comment.content,
+      ),
+    ).toContain("Keep the first improvement.");
+    expect(
+      saved.reviewComments.find(
+        (comment: { content: string }) =>
+          comment.content === "A nested follow-up stays attached.",
+      ).parentCommentId,
+    ).toBe(firstReply.id);
+    await page.getByTestId("comparison-show-reviewed").click();
+    await expect(page.getByTestId("document-review-rail")).toContainText(
+      "Keep the first improvement.",
+    );
+    await expect(page.getByTestId("document-review-rail")).toContainText(
+      "A nested follow-up stays attached.",
+    );
     await expect(
-      changes.nth(0).getByTestId("comparison-choice-after"),
-    ).toHaveAttribute("aria-pressed", "true");
+      page.getByTestId(`suggestion-thread-${first.id}`),
+    ).toBeVisible();
     await expect(
-      changes.nth(1).getByTestId("comparison-choice-before"),
-    ).toHaveAttribute("aria-pressed", "true");
-    await expect(
-      changes.nth(0).getByTestId("comparison-change-comment"),
-    ).toHaveValue("Keep the first improvement.");
+      page.getByTestId(`suggestion-thread-${second.id}`),
+    ).toBeVisible();
     await expect(page.getByTestId("comparison-apply")).toHaveText(
       "Apply 1 change to AGENTS.md",
     );
@@ -68,7 +120,7 @@ test.describe("file comparisons", () => {
     expect(readProjectFile(projectDir, "AGENTS.md")).toBe(
       beforeText.replace("Old first.", "New first."),
     );
-    await expect(page.getByTestId("page-card-rich")).toHaveCount(0);
+    await expect(page.getByTestId("page-card-rich-text")).toBeVisible();
   });
 
   test("Keep/Revert selections only write the chosen reversions at the end @smoke", async ({
@@ -85,19 +137,21 @@ test.describe("file comparisons", () => {
     });
     expect(response.status()).toBe(201);
     const review = await response.json();
+    const [first, second] = review.segments.filter(
+      (segment: { kind: string }) => segment.kind === "change",
+    );
     await page.goto(`/?comparison=${review.id}`);
     await expect(page.getByTestId("comparison-mode")).toHaveText(
       "Changes already made",
     );
-    const changes = page.getByTestId("comparison-change");
     await expect(
-      changes.nth(0).getByTestId("comparison-choice-after"),
-    ).toHaveText("Keep");
+      page.getByTestId(`comment-rail-${first.id}-action-accept`),
+    ).toHaveAttribute("aria-label", "Keep");
     await expect(
-      changes.nth(0).getByTestId("comparison-choice-before"),
-    ).toHaveText("Revert");
-    await changes.nth(0).getByTestId("comparison-choice-after").click();
-    await changes.nth(1).getByTestId("comparison-choice-before").click();
+      page.getByTestId(`comment-rail-${first.id}-action-reject`),
+    ).toHaveAttribute("aria-label", "Revert");
+    await page.getByTestId(`comment-rail-${first.id}-action-accept`).click();
+    await page.getByTestId(`comment-rail-${second.id}-action-reject`).click();
     await expect(page.getByTestId("comparison-save-status")).toHaveText(
       "Review saved separately",
     );
@@ -122,7 +176,9 @@ test.describe("file comparisons", () => {
     expect(response.status()).toBe(201);
     const review = await response.json();
     await page.goto(`/?comparison=${review.id}`);
-    await expect(page.getByTestId("comparison-choice-after")).toHaveCount(0);
+    await expect(
+      page.getByTestId(/^comment-rail-.*-action-(accept|reject)$/),
+    ).toHaveCount(0);
     await expect(page.getByTestId("comparison-apply")).toHaveCount(0);
     await page.getByTestId("comparison-propose").click();
     await expect(page.getByTestId("comparison-convert-submit")).toBeDisabled();
@@ -153,6 +209,9 @@ test.describe("file comparisons", () => {
     });
     expect(response.status()).toBe(201);
     const review = await response.json();
+    const segmentId = review.segments.find(
+      (segment: { kind: string }) => segment.kind === "change",
+    ).id;
     await page.goto(`/?comparison=${review.id}`);
     await page.getByTestId("comparison-accept-all").click();
     await expect(page.getByTestId("comparison-save-status")).toHaveText(
@@ -161,24 +220,27 @@ test.describe("file comparisons", () => {
     fs.writeFileSync(targetPath, "# Someone else's edit\n");
     await page.getByTestId("comparison-apply").click();
     await expect(page.getByTestId("comparison-conflict")).toBeVisible();
-    await expect(page.getByTestId("comparison-choice-after")).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    const saved = await (
+      await request.get(`${apiUrl}/api/comparisons/${review.id}`)
+    ).json();
+    expect(
+      saved.segments.find((segment: { id: string }) => segment.id === segmentId)
+        .decision,
+    ).toBe("after");
     expect(readProjectFile(projectDir, "conflict.md")).toBe(
       "# Someone else's edit\n",
     );
     await page.getByTestId("comparison-refresh").click();
     await expect(page.getByTestId("comparison-refresh-notice")).toBeVisible();
     await expect(page.getByTestId("comparison-apply")).toBeDisabled();
-    await expect(page.getByTestId("comparison-choice-after")).toHaveAttribute(
-      "aria-pressed",
-      "false",
+    await expect(page.getByTestId("comparison-toolbar")).toContainText(
+      "1 undecided",
     );
-    await expect(page.getByTestId("comparison-diff")).toContainText(
+    await expect(page.getByTestId("rich-text-editor")).toContainText(
       "Someone else's edit",
     );
   });
+
   test("comparison comments save separately and Finish comparison never writes", async ({
     page,
     request,
@@ -190,13 +252,11 @@ test.describe("file comparisons", () => {
     });
     expect(response.status()).toBe(201);
     const review = await response.json();
+    const segmentId = review.segments.find(
+      (segment: { kind: string }) => segment.kind === "change",
+    ).id;
     await page.goto(`/?comparison=${review.id}`);
-    await page
-      .getByTestId("comparison-change-comment")
-      .fill("Discuss this alternative.");
-    await expect(page.getByTestId("comparison-save-status")).toHaveText(
-      "Review saved separately",
-    );
+    await leaveNativeReply(page, segmentId, "Discuss this alternative.");
     await page.getByTestId("comparison-complete").click();
     await expect(page.getByTestId("comparison-outcome")).toContainText(
       "No file was written",
@@ -207,11 +267,15 @@ test.describe("file comparisons", () => {
       await request.get(`${apiUrl}/api/comparisons/${review.id}`)
     ).json();
     expect(
-      saved.segments.find(
-        (segment: { kind: string }) => segment.kind === "change",
-      ).comment,
-    ).toBe("Discuss this alternative.");
+      saved.reviewComments.map(
+        (comment: { content: string }) => comment.content,
+      ),
+    ).toContain("Discuss this alternative.");
     expect(saved.completion.fileWritten).toBe(false);
+    await page.reload();
+    await expect(page.getByTestId("document-review-rail")).toContainText(
+      "Discuss this alternative.",
+    );
   });
 
   test("stale review revisions preserve local choices until explicit retry", async ({
@@ -237,14 +301,14 @@ test.describe("file comparisons", () => {
       { data: { revision: review.revision, comment: "Saved in another tab." } },
     );
     expect(external.ok()).toBe(true);
-    await page.getByTestId("comparison-choice-after").click();
+    await page.getByTestId(`comment-rail-${segmentId}-action-accept`).click();
     await expect(page.getByTestId("comparison-save-status")).toHaveText(
       "Review not saved",
     );
-    await expect(page.getByTestId("comparison-choice-after")).toHaveAttribute(
-      "aria-pressed",
-      "true",
+    await expect(page.getByTestId("comparison-toolbar")).toContainText(
+      "0 undecided",
     );
+    await expect(page.getByTestId("comparison-apply")).toBeDisabled();
     expect(readProjectFile(projectDir, "parallel.md")).toBe("# Before\n");
     await page.getByTestId("comparison-retry").click();
     await expect(page.getByTestId("comparison-save-status")).toHaveText(
@@ -259,5 +323,130 @@ test.describe("file comparisons", () => {
     ).toBe("after");
     expect(saved.comment).toBe("Saved in another tab.");
     expect(readProjectFile(projectDir, "parallel.md")).toBe("# Before\n");
+  });
+  test("refreshed comparisons retain editable native feedback after its source change disappears @smoke", async ({
+    page,
+    request,
+  }) => {
+    const beforeText = "# Feedback\r\n\r\nOriginal wording.\r\n";
+    const targetPath = writeProjectFile(projectDir, "detached.md", beforeText);
+    const response = await request.post(`${apiUrl}/api/comparisons`, {
+      data: {
+        mode: "proposal",
+        targetPath,
+        afterText: beforeText.replace("Original wording.", "Proposed wording."),
+      },
+    });
+    expect(response.status()).toBe(201);
+    const review = await response.json();
+    const originalChangeId = review.segments.find(
+      (segment: { kind: string }) => segment.kind === "change",
+    ).id;
+    await page.goto(`/?comparison=${review.id}`);
+    await leaveNativeReply(
+      page,
+      originalChangeId,
+      "Please retain this feedback if the file changes.",
+    );
+    let saved = await (
+      await request.get(`${apiUrl}/api/comparisons/${review.id}`)
+    ).json();
+    const rootComment = saved.reviewComments.find(
+      (comment: { content: string }) =>
+        comment.content === "Please retain this feedback if the file changes.",
+    );
+    await leaveNativeReply(
+      page,
+      rootComment.id,
+      "The original reply should remain attached.",
+    );
+    saved = await (
+      await request.get(`${apiUrl}/api/comparisons/${review.id}`)
+    ).json();
+    const originalReply = saved.reviewComments.find(
+      (comment: { content: string }) =>
+        comment.content === "The original reply should remain attached.",
+    );
+    expect(originalReply.parentCommentId).toBe(rootComment.id);
+    expect(readProjectFile(projectDir, "detached.md")).toBe(beforeText);
+
+    const currentText =
+      "# A different current file\r\n\r\nNewer external content, without a final newline.";
+    fs.writeFileSync(targetPath, currentText);
+    await expect(page.getByTestId("comparison-conflict")).toBeVisible();
+    await page.getByTestId("comparison-refresh").click();
+    await expect(page.getByTestId("comparison-refresh-notice")).toBeVisible();
+    saved = await (
+      await request.get(`${apiUrl}/api/comparisons/${review.id}`)
+    ).json();
+    expect(
+      saved.segments.some(
+        (segment: { id: string }) => segment.id === originalChangeId,
+      ),
+    ).toBe(false);
+
+    const detachedThread = page.getByTestId(`comment-thread-${rootComment.id}`);
+    await expect(detachedThread).toBeVisible();
+    await expect(detachedThread).toContainText(
+      "Please retain this feedback if the file changes.",
+    );
+    await expect(detachedThread).toContainText(
+      "The original reply should remain attached.",
+    );
+    await detachedThread.click();
+    await page
+      .getByTestId(`comment-rail-${rootComment.id}-action-edit`)
+      .click();
+    const editor = page.getByTestId(`comment-rail-${rootComment.id}-editor`);
+    await editor.fill(
+      "Edited through the native document feedback thread after refresh.",
+    );
+    await editor.press(
+      process.platform === "darwin" ? "Meta+Enter" : "Control+Enter",
+    );
+    await expect(page.getByTestId("comparison-save-status")).toHaveText(
+      "Review saved separately",
+    );
+    await leaveNativeReply(
+      page,
+      originalReply.id,
+      "A new nested reply after the anchor disappeared.",
+    );
+    expect(readProjectFile(projectDir, "detached.md")).toBe(currentText);
+
+    await page.reload();
+    const reloadedThread = page.getByTestId(`comment-thread-${rootComment.id}`);
+    await expect(reloadedThread).toBeVisible();
+    await expect(reloadedThread).toContainText(
+      "Edited through the native document feedback thread after refresh.",
+    );
+    await expect(reloadedThread).toContainText(
+      "The original reply should remain attached.",
+    );
+    await expect(reloadedThread).toContainText(
+      "A new nested reply after the anchor disappeared.",
+    );
+    saved = await (
+      await request.get(`${apiUrl}/api/comparisons/${review.id}`)
+    ).json();
+    expect(
+      saved.reviewComments.find(
+        (comment: { id: string }) => comment.id === originalReply.id,
+      ).parentCommentId,
+    ).toBe(rootComment.id);
+    expect(
+      saved.reviewComments.find(
+        (comment: { content: string }) =>
+          comment.content ===
+          "A new nested reply after the anchor disappeared.",
+      ).parentCommentId,
+    ).toBe(originalReply.id);
+    expect(
+      saved.reviewComments.find(
+        (comment: { id: string }) => comment.id === rootComment.id,
+      ).changeId,
+    ).toBe(originalChangeId);
+    expect(readProjectFile(projectDir, "detached.md")).toBe(currentText);
+    await expect(page.getByTestId("comparison-apply")).toBeDisabled();
   });
 });

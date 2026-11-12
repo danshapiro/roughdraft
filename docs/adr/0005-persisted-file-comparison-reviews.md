@@ -14,6 +14,8 @@ Proposals write accepted blocks only after the explicit final apply action. Alre
 
 The server constructs output from the exact source blocks, preserving line endings and the absence of a final newline. It checks the destination version before writing. If the destination changed, the write is blocked; only an explicit refresh replaces the relevant snapshot and carries forward decisions for unchanged blocks. A comparison can become a new proposal only after the user names a destination matching the frozen before version.
 
+The comparison route reuses the native rendered editor and suggestion rail through a controlled, read-only adapter. It builds display documents at complete Markdown block boundaries, explicitly linking source changes when one rendered block contains several. Display choices map back to persisted source IDs; rich-text serialization never participates in a destination write. Native comments and replies live in the review record. Refresh preserves historical feedback even when its source anchor disappears, presenting detached threads as document feedback. Resolved changes show their selected content; showing reviewed changes restores the original highlights and controls.
+
 ## Consequences
 
 Comparison records must be preserved along with other application data. They contain source text and review comments, so their filesystem access follows the application's local-file trust model. They are not a global document index, collaboration service, or version-control database.
