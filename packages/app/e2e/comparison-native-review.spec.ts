@@ -43,25 +43,39 @@ test("comparisons render Markdown and review changes through Roughdraft's native
 
     // The real Roughdraft renderer must produce semantic Markdown elements;
     // printing source markers in a parallel diff surface does not satisfy this.
-    await expect(page.getByTestId("page-card-rich-text")).toBeVisible();
     await expect(
-      page.locator('[data-testid="rich-text-editor"] h1'),
+      page
+        .getByTestId("comparison-native-document")
+        .getByTestId("page-card-rich-text"),
+    ).toBeVisible();
+    await expect(
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] h1',
+      ),
     ).toHaveText("Agent rules");
     await expect(
-      page.locator('[data-testid="rich-text-editor"] h2'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] h2',
+      ),
     ).toHaveText("Review process");
     await expect(
-      page.locator('[data-testid="rich-text-editor"] ul'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] ul',
+      ),
     ).not.toHaveCount(0);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] li'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] li',
+      ),
     ).not.toHaveCount(0);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] strong'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] strong',
+      ),
     ).toContainText(["thorough"]);
     await expect(
       page.locator(
-        '[data-testid="rich-text-editor"] a[href="https://example.com/reference"]',
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] a[href="https://example.com/reference"]',
       ),
     ).toContainText(["reference docs"]);
     await expect(page.getByTestId("document-review-rail")).toBeVisible();
@@ -133,7 +147,11 @@ test("native comparison decisions and comments remain usable on mobile", async (
     ).id;
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto(`/?comparison=${review.id}`);
-    await expect(page.getByTestId("page-card-rich-text")).toBeVisible();
+    await expect(
+      page
+        .getByTestId("comparison-native-document")
+        .getByTestId("page-card-rich-text"),
+    ).toBeVisible();
     await expect(page.getByTestId("document-review-rail")).toBeVisible();
     await expect(
       page.getByTestId(`comment-rail-${changeId}-action-accept`),
@@ -204,12 +222,16 @@ test("linked list changes preserve existing mixed choices and legacy feedback un
     );
     expect(seeded.ok()).toBe(true);
     await page.goto(`/?comparison=${review.id}`);
-    await expect(page.getByTestId("rich-text-editor")).toContainText(
-      "alpha new",
-    );
-    await expect(page.getByTestId("rich-text-editor")).toContainText(
-      "gamma old",
-    );
+    await expect(
+      page
+        .getByTestId("comparison-native-document")
+        .getByTestId("rich-text-editor"),
+    ).toContainText("alpha new");
+    await expect(
+      page
+        .getByTestId("comparison-native-document")
+        .getByTestId("rich-text-editor"),
+    ).toContainText("gamma old");
     let saved = await (
       await request.get(`${apiUrl}/api/comparisons/${review.id}`)
     ).json();
@@ -303,10 +325,14 @@ test("format-only changes retain native highlights and an explicit decision", as
     ).id;
     await page.goto(`/?comparison=${review.id}`);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] strong'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] strong',
+      ),
     ).toHaveText("these words");
     await expect(
-      page.locator('[data-testid="rich-text-editor"] em'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] em',
+      ),
     ).toHaveText("these words");
     await expect(
       page.locator(".critic-change[data-critic-change-id]"),

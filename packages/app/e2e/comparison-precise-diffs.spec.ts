@@ -1,6 +1,6 @@
 import {
-  expect,
   type APIRequestContext,
+  expect,
   type Page,
   test,
 } from "@playwright/test";
@@ -32,21 +32,25 @@ async function createProposal(
 }
 
 async function nativeMarks(page: Page) {
-  return page.getByTestId("rich-text-editor").evaluate((root) =>
-    [
-      ...root.querySelectorAll<HTMLElement>(
-        ".critic-change[data-critic-change-id]",
-      ),
-    ].map((element) => ({
-      text: element.textContent,
-      kind: element.dataset.criticChangeKind,
-      id: element.dataset.criticChangeId,
-    })),
-  );
+  return page
+    .getByTestId("comparison-native-document")
+    .getByTestId("rich-text-editor")
+    .evaluate((root) =>
+      [
+        ...root.querySelectorAll<HTMLElement>(
+          ".critic-change[data-critic-change-id]",
+        ),
+      ].map((element) => ({
+        text: element.textContent,
+        kind: element.dataset.criticChangeKind,
+        id: element.dataset.criticChangeId,
+      })),
+    );
 }
 
 async function expectUnchangedOnce(page: Page, text: string) {
   const rendered = await page
+    .getByTestId("comparison-native-document")
     .getByTestId("rich-text-editor")
     .evaluate((root, expected) => {
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -98,7 +102,9 @@ test.describe("precise rendered comparison changes", () => {
     );
     await page.goto(`/?comparison=${review.id}`);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] p'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] p',
+      ),
     ).toHaveCount(1);
     await expectUnchangedOnce(page, "Use ");
     await expectUnchangedOnce(page, " reasoning before lunch.");
@@ -163,10 +169,14 @@ test.describe("precise rendered comparison changes", () => {
     );
     await page.goto(`/?comparison=${review.id}`);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] ul'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] ul',
+      ),
     ).toHaveCount(1);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] li'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] li',
+      ),
     ).toHaveCount(3);
     for (const text of [
       "First unchanged item.",
@@ -198,10 +208,14 @@ test.describe("precise rendered comparison changes", () => {
     );
     await page.goto(`/?comparison=${review.id}`);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] table'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] table',
+      ),
     ).toHaveCount(1);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] tr'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] tr',
+      ),
     ).toHaveCount(3);
     for (const text of [
       "Name",
@@ -234,13 +248,19 @@ test.describe("precise rendered comparison changes", () => {
     );
     await page.goto(`/?comparison=${review.id}`);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] p'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] p',
+      ),
     ).toHaveCount(1);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] strong'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] strong',
+      ),
     ).toHaveText("these words");
     await expect(
-      page.locator('[data-testid="rich-text-editor"] em'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] em',
+      ),
     ).toHaveText("these words");
     await expectUnchangedOnce(page, "Keep ");
     await expectUnchangedOnce(page, " carefully.");
@@ -267,16 +287,18 @@ test.describe("precise rendered comparison changes", () => {
     );
     await page.goto(`/?comparison=${review.id}`);
     await expect(
-      page.locator('[data-testid="rich-text-editor"] p'),
+      page.locator(
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] p',
+      ),
     ).toHaveCount(1);
     await expect(
       page.locator(
-        '[data-testid="rich-text-editor"] a[href="https://example.com/old"]',
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] a[href="https://example.com/old"]',
       ),
     ).toHaveText("documentation");
     await expect(
       page.locator(
-        '[data-testid="rich-text-editor"] a[href="https://example.com/new"]',
+        '[data-testid="comparison-native-document"] [data-testid="rich-text-editor"] a[href="https://example.com/new"]',
       ),
     ).toHaveText("documentation");
     await expectUnchangedOnce(page, "Read ");
