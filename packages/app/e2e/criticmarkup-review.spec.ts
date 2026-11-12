@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import {
   createMarkdownProject,
+  documentSaveStatus,
   logE2eEvent,
   openMarkdownFile,
   readProjectFile,
@@ -130,6 +131,19 @@ test.describe("CriticMarkup review flows", () => {
     const removeSamples = await removeSamplesPromise;
 
     expect(hasAnimatedReviewLayout(removeSamples)).toBe(true);
+    await expect(documentSaveStatus(page)).toHaveAttribute(
+      "aria-label",
+      "Saved",
+    );
+    await expect
+      .poll(() => readProjectFile(projectDir, "layout-animation.md"))
+      .not.toContain("Clarify this phrase.");
+    const savedMarkdown = readProjectFile(projectDir, "layout-animation.md");
+    expect(savedMarkdown).not.toContain("{>>");
+    expect(savedMarkdown).toContain(
+      "This paragraph has target text to review.",
+    );
+    await expect(page.getByTestId("file-conflict-notice")).toHaveCount(0);
 
     logE2eEvent("criticmarkup.layout-animation", {
       file: "layout-animation.md",
@@ -227,16 +241,23 @@ async function sampleReviewLayoutAnimation(page: Page) {
       return new DOMMatrixReadOnly(transform).m41;
     };
     const samples: ReviewLayoutAnimationSample[] = [];
-    const start = performance.now();
+    const waitingStartedAt = performance.now();
+    let animationStartedAt: number | null = null;
 
-    while (performance.now() - start < 500) {
+    // Playwright may wait for the target to settle before clicking. Arm the
+    // sampler first, then give the actual animation its own observation window.
+    while (
+      performance.now() - waitingStartedAt < 5_000 &&
+      (animationStartedAt === null ||
+        performance.now() - animationStartedAt < 500)
+    ) {
       const shell = document.querySelector(
         '[data-testid="document-page-shell"]',
       );
       const header = document.querySelector(
         '[data-testid="document-page-header"]',
       );
-      samples.push({
+      const sample = {
         shellAnimating:
           shell instanceof HTMLElement &&
           shell.classList.contains("review-layout-grid--animating"),
@@ -245,7 +266,14 @@ async function sampleReviewLayoutAnimation(page: Page) {
           header.classList.contains("review-layout-grid--animating"),
         shellTranslateX: readTranslateX(shell),
         headerTranslateX: readTranslateX(header),
-      });
+      };
+      samples.push(sample);
+      if (
+        animationStartedAt === null &&
+        (sample.shellAnimating || sample.headerAnimating)
+      ) {
+        animationStartedAt = performance.now();
+      }
       await new Promise((resolve) => requestAnimationFrame(resolve));
     }
 
