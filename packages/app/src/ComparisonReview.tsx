@@ -127,9 +127,11 @@ function NativeComparisonDocument({
   );
   const previewDoc = useMemo(
     () =>
-      view === "diff"
-        ? null
-        : buildComparisonPreviewDocument(review, markdownOptions, view),
+      buildComparisonPreviewDocument(
+        review,
+        markdownOptions,
+        view === "diff" ? "after" : view,
+      ),
     [review, view, markdownOptions],
   );
   useEffect(() => {
@@ -227,27 +229,27 @@ function NativeComparisonDocument({
   );
   return (
     <>
-      {/* Keep the review mounted so switching views preserves comment drafts. */}
+      {linkedGroups.length > 0 && (
+        <p
+          className="comparison-linked-notice"
+          data-testid="comparison-linked-notice"
+        >
+          {
+            review.segments.filter((segment) => segment.kind === "change")
+              .length
+          }{" "}
+          source changes appear in {model.groups.length} review{" "}
+          {model.groups.length === 1 ? "group" : "groups"}. Changes within one
+          Markdown block are reviewed together; each card shows its linked
+          count. Existing individual choices remain saved until you choose
+          again.
+        </p>
+      )}
+      {/* Keep both surfaces ready so switching never collapses the page. */}
       <div
         hidden={view !== "diff"}
         className={formatted ? undefined : "comparison-markdown"}
       >
-        {linkedGroups.length > 0 && (
-          <p
-            className="comparison-linked-notice"
-            data-testid="comparison-linked-notice"
-          >
-            {
-              review.segments.filter((segment) => segment.kind === "change")
-                .length
-            }{" "}
-            source changes appear in {model.groups.length} review{" "}
-            {model.groups.length === 1 ? "group" : "groups"}. Changes within one
-            Markdown block are reviewed together; each card shows its linked
-            count. Existing individual choices remain saved until you choose
-            again.
-          </p>
-        )}
         <div
           className="comparison-native-document"
           data-testid="comparison-native-document"
@@ -270,45 +272,45 @@ function NativeComparisonDocument({
           />
         </div>
       </div>
-      {previewDoc && (
-        <div
-          className={`comparison-native-document${formatted ? "" : " comparison-markdown"}`}
-          data-testid="comparison-clean-preview"
-          data-comparison-view={view}
-        >
-          <p className="comparison-preview-explanation">
-            {view === "before"
-              ? "Original version. Your review choices do not change this view."
-              : view === "after"
-                ? "New version. Your review choices do not change this view."
-                : "Result of your choices. Undecided changes use After. Viewing this preview does not save the file."}
-          </p>
-          <RichTextEditorSurface
-            page={{
-              id: `${review.id}-preview`,
-              title: review.title,
-              content: "",
-            }}
-            activeDocumentPath={contextPath}
-            selected={false}
-            layout="default"
-            focusRequestKey={null}
-            sourceMarkdown=""
-            onMarkdownChange={() => {}}
-            interactionMode="viewing"
-            backend={backend}
-            controlledReview={{
-              ...controlledReview,
-              doc: previewDoc,
-              suggestions: [],
-              comments: new Map(),
-              blockHighlights: [],
-              canDecide: false,
-              disabled: true,
-            }}
-          />
-        </div>
-      )}
+      <div
+        hidden={view === "diff"}
+        className={`comparison-native-document${formatted ? "" : " comparison-markdown"}`}
+        data-testid="comparison-clean-preview"
+        data-comparison-view={view}
+        role="region"
+        aria-label={
+          view === "before"
+            ? "Original version"
+            : review.mode === "compare"
+              ? "New version"
+              : "Preview of your choices; undecided changes use the new version"
+        }
+      >
+        <RichTextEditorSurface
+          page={{
+            id: `${review.id}-preview`,
+            title: review.title,
+            content: "",
+          }}
+          activeDocumentPath={contextPath}
+          selected={false}
+          layout="default"
+          focusRequestKey={null}
+          sourceMarkdown=""
+          onMarkdownChange={() => {}}
+          interactionMode="viewing"
+          backend={backend}
+          controlledReview={{
+            ...controlledReview,
+            doc: previewDoc,
+            suggestions: [],
+            comments: new Map(),
+            blockHighlights: [],
+            canDecide: false,
+            disabled: true,
+          }}
+        />
+      </div>
     </>
   );
 }
@@ -656,6 +658,15 @@ export function ComparisonReview({ id }: { id: string }) {
                   size="sm"
                   data-testid={`comparison-view-${version}`}
                   aria-pressed={view === version}
+                  title={
+                    version === "before"
+                      ? "Original version. Viewing it does not change the file."
+                      : version === "diff"
+                        ? "Review highlighted changes. Choices save separately; only Apply or Revert changes the file."
+                        : review.mode === "compare"
+                          ? "New version. Neither file is changed."
+                          : "Preview your current choices. Undecided changes use the new version. Viewing After does not save the file."
+                  }
                   onClick={() => changeView(version)}
                 >
                   {version === "before"
@@ -666,18 +677,6 @@ export function ComparisonReview({ id }: { id: string }) {
                 </Button>
               ))}
             </div>
-            {review.mode !== "compare" && (
-              <Button
-                variant={view === "result" ? "secondary" : "outline"}
-                size="sm"
-                data-testid="comparison-view-result"
-                aria-pressed={view === "result"}
-                title="Preview your choices. Undecided changes use After. This does not save the file."
-                onClick={() => changeView("result")}
-              >
-                Result
-              </Button>
-            )}
             <Button
               variant="outline"
               size="sm"

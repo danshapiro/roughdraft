@@ -8,7 +8,15 @@ import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { ControlledDocumentReview } from "./controlled-review";
 import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { CommentEditorList } from "./CommentEditorList";
 import {
@@ -1511,7 +1519,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     refreshCriticChanges();
   }, [editor, isControlled, parsedContent, refreshCriticChanges]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!editor || !controlledReview?.doc) {
       lastControlledDocumentRef.current = null;
       return;
@@ -2156,8 +2164,10 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   }, []);
 
   const hasReviewRail = comments.size > 0 || reviewSuggestions.length > 0;
+  // Comparison versions share one reading column, even without visible cards.
+  const hasReviewColumn = isControlled || hasReviewRail;
   const documentShellRef =
-    useReviewLayoutShiftAnimation<HTMLDivElement>(hasReviewRail);
+    useReviewLayoutShiftAnimation<HTMLDivElement>(hasReviewColumn);
   const activeComments = activeCommentIds
     .map((commentId) => comments.get(commentId))
     .filter((comment): comment is CriticComment => Boolean(comment));
@@ -2168,9 +2178,9 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     layout === "embedded-demo"
       ? "grid grid-cols-1 gap-3 p-4 min-[900px]:grid-cols-[minmax(0,min(100%,42rem))_minmax(13rem,16rem)] min-[900px]:items-start min-[900px]:justify-start"
       : "review-layout-grid",
-    !hasReviewRail && "document-page-shell-no-comments",
+    !hasReviewColumn && "document-page-shell-no-comments",
     layout !== "embedded-demo" &&
-      !hasReviewRail &&
+      !hasReviewColumn &&
       "review-layout-grid--centered",
   );
   const documentMainClass = cn(

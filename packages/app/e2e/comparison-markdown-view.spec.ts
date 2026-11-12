@@ -133,7 +133,7 @@ test.describe("comparison Markdown view", () => {
     await page.screenshot({
       path: test.info().outputPath("markdown-native-review.png"),
     });
-    await header.getByTestId("comparison-view-result").click();
+    await header.getByTestId("comparison-view-after").click();
     await expect(editor).toContainText("# Source preview");
     await expect(editor).toContainText("Choose old alpha.");
     await expect(editor).toContainText("Choose new beta.");
@@ -199,7 +199,7 @@ test.describe("comparison Markdown view", () => {
     await expect(formatted).toHaveAttribute("aria-pressed", "false");
     await expectReadingPlace(editor, first, offset);
     await readAt(editor, later, offset);
-    for (const view of ["before", "after", "result", "diff"]) {
+    for (const view of ["before", "after", "diff"]) {
       await header.getByTestId(`comparison-view-${view}`).click();
       await expectReadingPlace(editor, later, offset);
     }

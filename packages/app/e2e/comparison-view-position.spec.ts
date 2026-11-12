@@ -99,7 +99,7 @@ test.describe("comparison display position", () => {
       await placePassage(visibleParagraph(firstPassage), offset);
       const originalScroll = await page.evaluate(() => window.scrollY);
       expect(originalScroll).toBeGreaterThan(1000);
-      for (const view of ["before", "after", "result"]) {
+      for (const view of ["before", "after"]) {
         const button = header.getByTestId(`comparison-view-${view}`);
         await button.click();
         await expect(button).toHaveAttribute("aria-pressed", "true");
@@ -109,7 +109,7 @@ test.describe("comparison display position", () => {
       // Read elsewhere in a clean view, then follow the new passage through
       // every mode instead of restoring the previous reading location.
       await placePassage(visibleParagraph(laterPassage), offset);
-      for (const view of ["diff", "before", "after", "result", "diff"]) {
+      for (const view of ["diff", "before", "after", "diff"]) {
         const button = header.getByTestId(`comparison-view-${view}`);
         await button.click();
         await expect(button).toHaveAttribute("aria-pressed", "true");

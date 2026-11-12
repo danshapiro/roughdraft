@@ -19,7 +19,7 @@ test.describe("comparison version views", () => {
   test.afterEach(() => removeMarkdownProject(projectDir));
 
   for (const mode of ["proposal", "applied", "compare"] as const) {
-    test(`${mode} keeps frozen Before and After distinct from the selected Result without changing review or files${mode === "proposal" ? " @smoke" : ""}`, async ({
+    test(`${mode} keeps Before fixed and previews choices in After without changing review or files${mode === "proposal" ? " @smoke" : ""}`, async ({
       page,
       request,
     }) => {
@@ -101,15 +101,19 @@ test.describe("comparison version views", () => {
           const body = clean.getByTestId("rich-text-editor");
           const prefix = version === "before" ? "old" : "new";
           const other = version === "before" ? "new" : "old";
-          await expect(body).toContainText(`${prefix} alpha`);
+          const alpha =
+            version === "before" || mode !== "compare" ? "old" : "new";
+          await expect(body).toContainText(`${alpha} alpha`);
           await expect(body).toContainText(`${prefix} beta`);
           await expect(body).toContainText(`${prefix} gamma`);
-          await expect(body).not.toContainText(`${other} alpha`);
+          await expect(body).not.toContainText(
+            `${alpha === "old" ? "new" : "old"} alpha`,
+          );
           await expect(body).not.toContainText(`${other} beta`);
           await expect(body).not.toContainText(`${other} gamma`);
           if (literal) {
             await expect(body).toContainText("# Preview");
-            await expect(body).toContainText(`**${prefix} alpha**`);
+            await expect(body).toContainText(`**${alpha} alpha**`);
             await expect(body).toContainText(`*${prefix} beta*`);
           } else {
             await expect(body.getByRole("heading", { level: 1 })).toHaveText(
@@ -131,26 +135,12 @@ test.describe("comparison version views", () => {
             page.getByTestId("comparison-show-reviewed"),
           ).toBeDisabled();
         }
-        if (mode !== "compare") {
-          await header.getByTestId("comparison-view-result").click();
-          const body = page
-            .getByTestId("comparison-clean-preview")
-            .getByTestId("rich-text-editor");
-          await expect(body).toContainText("old alpha");
-          await expect(body).toContainText("new beta");
-          await expect(body).toContainText("Pending new gamma.");
-          await expect(body).not.toContainText("new alpha");
-          await expect(body).not.toContainText("old beta");
-          if (literal) await expect(body).toContainText("**old alpha**");
-        } else
-          await expect(
-            header.getByTestId("comparison-view-result"),
-          ).toHaveCount(0);
+        await expect(header.getByTestId("comparison-view-result")).toHaveCount(
+          0,
+        );
       }
       await formatted.click();
-      const cleanView = header.getByTestId(
-        mode === "compare" ? "comparison-view-after" : "comparison-view-result",
-      );
+      const cleanView = header.getByTestId("comparison-view-after");
       await cleanView.click();
       await expect(cleanView).toHaveAttribute("aria-pressed", "true");
       const preview = page.getByTestId("comparison-clean-preview");
@@ -186,7 +176,7 @@ test.describe("comparison version views", () => {
       });
       await diff.click();
       await expect(diff).toHaveAttribute("aria-pressed", "true");
-      await expect(preview).toHaveCount(0);
+      await expect(preview).toBeHidden();
       await expect(
         page.getByTestId("comparison-show-reviewed"),
       ).toHaveAttribute("aria-pressed", "true");
@@ -239,7 +229,7 @@ test.describe("comparison version views", () => {
     await formatted.click();
     await expect(editor).toBeVisible();
     await expect(editor).toHaveValue("Unsubmitted draft survives preview");
-    for (const view of ["before", "after", "result"]) {
+    for (const view of ["before", "after"]) {
       await page.getByTestId(`comparison-view-${view}`).click();
       await expect(editor).toBeHidden();
     }
@@ -302,7 +292,7 @@ test.describe("comparison version views", () => {
       .poll(async () => Math.round((await header.boundingBox())?.y ?? -1))
       .toBe(0);
     await header.getByTestId("comparison-view-after").click();
-    for (const view of ["before", "diff", "after", "result"])
+    for (const view of ["before", "diff", "after"])
       await expect(header.getByTestId(`comparison-view-${view}`)).toBeVisible();
     await expect(header.getByTestId("comparison-apply")).toBeVisible();
     expect(

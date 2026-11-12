@@ -175,11 +175,6 @@
 .comparison-native-document {
   margin-top: 20px;
 }
-.comparison-preview-explanation {
-  margin-bottom: 12px;
-  color: var(--muted-foreground);
-  font-size: 12px;
-}
 .comparison-linked-notice {
   font-size: 12px;
   color: var(--muted-foreground);
