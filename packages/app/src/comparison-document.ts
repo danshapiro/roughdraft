@@ -349,33 +349,31 @@ function anchored(nodes: JSONContent[], unit: number): JSONContent[] {
   }));
 }
 
-/** Read-only preview of the current choices; undecided changes use After. */
+export type ComparisonPreviewVersion = "before" | "after" | "result";
+
+/** Frozen versions ignore choices; Result uses After for undecided changes. */
 export function buildComparisonPreviewDocument(
   review: ComparisonReviewData,
   options: ComparisonDisplayOptions = {},
+  version: ComparisonPreviewVersion = "result",
 ): JSONContent {
-  const source = review.segments
-    .map((segment) =>
-      segment.kind === "change" && segment.decision === "before"
-        ? segment.before
-        : segment.after,
-    )
-    .join("");
   const units = displayUnits(
     review.segments,
     snapshot(review.beforeText),
     snapshot(review.afterText),
   );
+  const select = ({ segment, before, after }: UnitPart) =>
+    version === "before" ||
+    (version === "result" &&
+      segment.kind === "change" &&
+      segment.decision === "before")
+      ? before
+      : after;
+  const source = units.flatMap((unit) => unit.parts.map(select)).join("");
   const context = snapshot(source);
   let offset = 0;
   const content = units.flatMap((unit, index) => {
-    const selected = unit.parts
-      .map(({ segment, before, after }) =>
-        segment.kind === "change" && segment.decision === "before"
-          ? before
-          : after,
-      )
-      .join("");
+    const selected = unit.parts.map(select).join("");
     const nodes = anchored(
       parseRange(selected, offset, context, options, new Map(), false),
       index,

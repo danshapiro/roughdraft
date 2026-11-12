@@ -475,6 +475,46 @@ describe("rendered comparison document", () => {
     ).not.toBeNull();
   });
 
+  it.each([
+    "before",
+    "after",
+    "result",
+  ] as const)("renders the %s version independently of review decisions", (version) => {
+    const input = review([
+      {
+        before: "# Before title\n\n",
+        after: "# After title\n\n",
+        decision: "before",
+      },
+      {
+        before: "Old accepted paragraph.\n\n",
+        after: "New accepted paragraph.\n\n",
+        decision: "after",
+      },
+      {
+        before: "Old pending paragraph.\n\n",
+        after: "New pending paragraph.\n\n",
+      },
+    ]);
+    const frozen = JSON.stringify(input);
+    const doc = buildComparisonPreviewDocument(input, {}, version);
+    const rendered = new DOMParser().parseFromString(html(doc), "text/html");
+    expect(rendered.getElementsByTagName("h1").item(0)?.textContent).toBe(
+      version === "after" ? "After title" : "Before title",
+    );
+    expect(rendered.body.textContent).toContain(
+      version === "before"
+        ? "Old accepted paragraph."
+        : "New accepted paragraph.",
+    );
+    expect(rendered.body.textContent).toContain(
+      version === "before"
+        ? "Old pending paragraph."
+        : "New pending paragraph.",
+    );
+    expect(JSON.stringify(input)).toBe(frozen);
+  });
+
   it("preserves full-document Markdown context in a selected clean preview", () => {
     const input = review([
       { before: "---\ntitle: Instructions\n---\n\n# Guide\n\n" },

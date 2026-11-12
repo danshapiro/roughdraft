@@ -27,13 +27,26 @@
   text-overflow: clip;
   white-space: normal;
 }
-.comparison-header-diff-toggle {
-  white-space: nowrap;
-}
 .comparison-header-views {
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
+  max-width: 300px;
   gap: 4px;
+}
+.comparison-version-switch {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.comparison-version-switch > button {
+  border-radius: 0;
+}
+.comparison-version-switch > button:first-child {
+  border-radius: 5px 0 0 5px;
+}
+.comparison-version-switch > button:last-child {
+  border-radius: 0 5px 5px 0;
 }
 .comparison-header-mode {
   display: block;

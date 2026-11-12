@@ -5,6 +5,7 @@ import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
 import {
   buildComparisonDocument,
   buildComparisonPreviewDocument,
+  type ComparisonPreviewVersion,
 } from "./comparison-document";
 import type {
   ComparisonReviewData as Comparison,
@@ -18,6 +19,8 @@ import { Textarea } from "./components/ui/textarea";
 import type { ControlledDocumentReview } from "./controlled-review";
 import { RichTextEditorSurface } from "./PageCard";
 import "./ComparisonReview.css";
+
+type ComparisonView = "diff" | ComparisonPreviewVersion;
 
 type Choices = {
   decisions?: { id: string; decision?: Decision; comment?: string }[];
@@ -72,7 +75,7 @@ function applyLocalChoices(review: Comparison, choices: Choices): Comparison {
 function NativeComparisonDocument({
   review,
   showReviewed,
-  showDiffs,
+  view,
   formatted,
   busy,
   onChoices,
@@ -80,7 +83,7 @@ function NativeComparisonDocument({
 }: {
   review: Comparison;
   showReviewed: boolean;
-  showDiffs: boolean;
+  view: ComparisonView;
   formatted: boolean;
   busy: boolean;
   onChoices: (choices: Choices) => void;
@@ -124,10 +127,10 @@ function NativeComparisonDocument({
   );
   const previewDoc = useMemo(
     () =>
-      showDiffs
+      view === "diff"
         ? null
-        : buildComparisonPreviewDocument(review, markdownOptions),
-    [review, showDiffs, markdownOptions],
+        : buildComparisonPreviewDocument(review, markdownOptions, view),
+    [review, view, markdownOptions],
   );
   useEffect(() => {
     const visibleIds = new Set(
@@ -224,9 +227,9 @@ function NativeComparisonDocument({
   );
   return (
     <>
-      {/* Keep the review mounted so hiding changes preserves comment drafts. */}
+      {/* Keep the review mounted so switching views preserves comment drafts. */}
       <div
-        hidden={!showDiffs}
+        hidden={view !== "diff"}
         className={formatted ? undefined : "comparison-markdown"}
       >
         {linkedGroups.length > 0 && (
@@ -271,11 +274,14 @@ function NativeComparisonDocument({
         <div
           className={`comparison-native-document${formatted ? "" : " comparison-markdown"}`}
           data-testid="comparison-clean-preview"
+          data-comparison-view={view}
         >
           <p className="comparison-preview-explanation">
-            {review.mode === "compare"
-              ? "After version. Neither file is changed."
-              : "Preview of your choices. Undecided changes show the new version."}
+            {view === "before"
+              ? "Original version. Your review choices do not change this view."
+              : view === "after"
+                ? "New version. Your review choices do not change this view."
+                : "Result of your choices. Undecided changes use After. Viewing this preview does not save the file."}
           </p>
           <RichTextEditorSurface
             page={{
@@ -318,7 +324,8 @@ export function ComparisonReview({ id }: { id: string }) {
   const [destination, setDestination] = useState("");
   const [refreshNotice, setRefreshNotice] = useState(false);
   const [showReviewed, setShowReviewed] = useState(false);
-  const [showDiffs, setShowDiffs] = useState(true);
+  const [view, setView] = useState<ComparisonView>("diff");
+  const showDiffs = view === "diff";
   const [formatted, setFormatted] = useState(true);
   const [navigationIds, setNavigationIds] = useState<string[]>([]);
   const [activeChangeId, setActiveChangeId] = useState<string | null>(null);
@@ -328,8 +335,13 @@ export function ComparisonReview({ id }: { id: string }) {
   const captureReadingPosition = useComparisonReadingPosition(
     documentRef,
     headerRef,
-    `${showDiffs}-${showReviewed}-${formatted}`,
+    `${view}-${showReviewed}-${formatted}`,
   );
+  const changeView = (next: ComparisonView) => {
+    if (next === view) return;
+    captureReadingPosition();
+    setView(next);
+  };
   const receiveNavigationGroups = useCallback((ids: string[]) => {
     setNavigationIds((current) =>
       current.length === ids.length &&
@@ -631,6 +643,41 @@ export function ComparisonReview({ id }: { id: string }) {
             </span>
           </div>
           <div className="comparison-header-views">
+            <div
+              className="comparison-version-switch"
+              role="group"
+              aria-label="Document version"
+              data-testid="comparison-view-selector"
+            >
+              {(["before", "diff", "after"] as const).map((version) => (
+                <Button
+                  key={version}
+                  variant={view === version ? "secondary" : "ghost"}
+                  size="sm"
+                  data-testid={`comparison-view-${version}`}
+                  aria-pressed={view === version}
+                  onClick={() => changeView(version)}
+                >
+                  {version === "before"
+                    ? "Before"
+                    : version === "after"
+                      ? "After"
+                      : "Diff"}
+                </Button>
+              ))}
+            </div>
+            {review.mode !== "compare" && (
+              <Button
+                variant={view === "result" ? "secondary" : "outline"}
+                size="sm"
+                data-testid="comparison-view-result"
+                aria-pressed={view === "result"}
+                title="Preview your choices. Undecided changes use After. This does not save the file."
+                onClick={() => changeView("result")}
+              >
+                Result
+              </Button>
+            )}
             <Button
               variant="outline"
               size="sm"
@@ -643,20 +690,6 @@ export function ComparisonReview({ id }: { id: string }) {
               }}
             >
               {formatted ? "Markdown" : "Formatted"}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="comparison-header-diff-toggle"
-              data-testid="comparison-show-diffs"
-              aria-pressed={showDiffs}
-              title="Show change marks, or preview your choices without them. Undecided changes use the new version. This does not save the file."
-              onClick={() => {
-                captureReadingPosition();
-                setShowDiffs(!showDiffs);
-              }}
-            >
-              {showDiffs ? "Hide diffs" : "Show diffs"}
             </Button>
           </div>
           <nav
@@ -924,7 +957,7 @@ export function ComparisonReview({ id }: { id: string }) {
           <NativeComparisonDocument
             review={review}
             showReviewed={showReviewed}
-            showDiffs={showDiffs}
+            view={view}
             formatted={formatted}
             busy={busy}
             onChoices={changeChoices}

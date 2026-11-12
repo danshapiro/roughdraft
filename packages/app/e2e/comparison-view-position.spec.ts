@@ -66,7 +66,7 @@ test.describe("comparison display position", () => {
     { width: 1440, height: 1000, name: "desktop" },
     { width: 390, height: 844, name: "mobile" },
   ]) {
-    test(`${viewport.name} keeps the passage in view when hiding and showing diffs${viewport.name === "desktop" ? " @smoke" : ""}`, async ({
+    test(`${viewport.name} keeps the passage in view when switching versions${viewport.name === "desktop" ? " @smoke" : ""}`, async ({
       page,
       request,
     }) => {
@@ -93,22 +93,28 @@ test.describe("comparison display position", () => {
           .locator('[data-testid="rich-text-editor"]:visible p')
           .filter({ hasText: text });
       const header = page.getByTestId("comparison-header");
-      const toggle = header.getByTestId("comparison-show-diffs");
-      await expect(toggle).toBeVisible();
+      const diff = header.getByTestId("comparison-view-diff");
+      await expect(diff).toBeVisible();
       const offset = 240;
       await placePassage(visibleParagraph(firstPassage), offset);
       const originalScroll = await page.evaluate(() => window.scrollY);
       expect(originalScroll).toBeGreaterThan(1000);
-      await toggle.click();
-      await expect(toggle).toHaveAttribute("aria-pressed", "false");
-      await expectPassagePosition(visibleParagraph(firstPassage), offset);
+      for (const view of ["before", "after", "result"]) {
+        const button = header.getByTestId(`comparison-view-${view}`);
+        await button.click();
+        await expect(button).toHaveAttribute("aria-pressed", "true");
+        await expectPassagePosition(visibleParagraph(firstPassage), offset);
+      }
 
-      // The reader can move while previewing. Restore the newly read passage,
-      // rather than remembering the old scroll offset from before hiding diffs.
+      // Read elsewhere in a clean view, then follow the new passage through
+      // every mode instead of restoring the previous reading location.
       await placePassage(visibleParagraph(laterPassage), offset);
-      await toggle.click();
-      await expect(toggle).toHaveAttribute("aria-pressed", "true");
-      await expectPassagePosition(visibleParagraph(laterPassage), offset);
+      for (const view of ["diff", "before", "after", "result", "diff"]) {
+        const button = header.getByTestId(`comparison-view-${view}`);
+        await button.click();
+        await expect(button).toHaveAttribute("aria-pressed", "true");
+        await expectPassagePosition(visibleParagraph(laterPassage), offset);
+      }
       await page.screenshot({
         path: test.info().outputPath(`${viewport.name}-passage-preserved.png`),
       });
