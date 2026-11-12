@@ -324,6 +324,32 @@ function reviewStatus(
   return decision === "after" ? "Accepted" : "Skipped";
 }
 
+/** Read-only preview of the current choices; undecided changes use After. */
+export function buildComparisonPreviewDocument(
+  review: ComparisonReviewData,
+  options: MarkdownOptions = {},
+): JSONContent {
+  const source = review.segments
+    .map((segment) =>
+      segment.kind === "change" && segment.decision === "before"
+        ? segment.before
+        : segment.after,
+    )
+    .join("");
+  const content = parseRange(
+    source,
+    0,
+    snapshot(source),
+    options,
+    new Map(),
+    false,
+  );
+  return {
+    type: "doc",
+    content: content.length ? content : [{ type: "paragraph" }],
+  };
+}
+
 /** The document is a display projection. Only server-side source slices apply. */
 export function buildComparisonDocument(
   review: ComparisonReviewData,
