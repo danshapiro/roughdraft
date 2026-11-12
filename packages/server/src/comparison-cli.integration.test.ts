@@ -95,6 +95,8 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     let buffer = "";
     const opened: Promise<void>[] = [];
     const callbackErrors: unknown[] = [];
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
     child.stdout?.on("data", (data) => {
       const chunk = data.toString();
       output += chunk;
@@ -118,7 +120,7 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     });
     const code = await new Promise<number | null>((resolve, reject) => {
       child.once("error", reject);
-      child.once("exit", resolve);
+      child.once("close", resolve);
     });
     children.delete(child);
     await Promise.all(opened);
@@ -214,6 +216,51 @@ describe("comparison CLI actual subprocess and filesystem", () => {
       reverted: 1,
     });
     expect(fs.readFileSync(target, "utf8")).toBe("Original\n");
+  }, 15000);
+
+  it("delivers complete large JSON events through a pipe before exiting, including completed resume", async () => {
+    const target = path.join(directory, "large-AGENTS.md");
+    const candidate = path.join(directory, "large-AGENTS.proposed.md");
+    const before = `${Array.from(
+      { length: 3000 },
+      (_, index) =>
+        `${index}: Preserve this exact Unicode content: café, 東京, and 📝.\r\n`,
+    ).join("")}No final newline`;
+    const after = `${before} — proposed addition`;
+    fs.writeFileSync(target, before);
+    fs.writeFileSync(candidate, after);
+    const opened = await command([
+      "propose",
+      target,
+      "--after",
+      candidate,
+      "--no-watch",
+    ]);
+    expect(opened.code, opened.errors).toBe(0);
+    expect(opened.events).toHaveLength(1);
+    const review = opened.events[0].comparison;
+    expect(review.beforeText).toBe(before);
+    expect(review.afterText).toBe(after);
+    expect(fs.readFileSync(target, "utf8")).toBe(before);
+    const decided = await api(`/${review.id}/decisions`, {
+      revision: review.revision,
+      decisions: review.segments
+        .filter((segment) => segment.kind === "change")
+        .map((segment) => ({ id: segment.id, decision: "after" })),
+    });
+    await api(`/${review.id}/apply`, { revision: decided.revision });
+    const resumed = await command(["comparison", review.id]);
+    expect(resumed.code, resumed.errors).toBe(0);
+    expect(resumed.events).toHaveLength(2);
+    for (const event of resumed.events) {
+      expect(event.comparison.beforeText).toBe(before);
+      expect(event.comparison.afterText).toBe(after);
+    }
+    expect(resumed.events[1]).toMatchObject({
+      event: "comparison.completed",
+      completion: { fileWritten: true, targetPath: target },
+    });
+    expect(fs.readFileSync(target, "utf8")).toBe(after);
   }, 15000);
 
   it("finishes a two-version comparison without a destination or source writes", async () => {

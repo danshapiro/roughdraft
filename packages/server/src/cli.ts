@@ -2222,7 +2222,7 @@ function getConfidentStopCandidate(
   return payload.pid;
 }
 
-export async function runCli(
+async function runCliInternal(
   args: string[],
   overrides: Partial<CliDependencies> = {},
 ): Promise<number> {
@@ -2867,5 +2867,32 @@ export async function runCli(
     if (shouldPrintUpdateNotice) {
       await printUpdateNoticeIfAvailable(deps);
     }
+  }
+}
+
+/** Finish queued pipe writes before the executable calls process.exit(). */
+export async function runCli(
+  args: string[],
+  overrides: Partial<CliDependencies> = {},
+): Promise<number> {
+  try {
+    return await runCliInternal(args, overrides);
+  } finally {
+    const output: Promise<void>[] = [];
+    if (!overrides.log) {
+      output.push(
+        new Promise<void>((resolve) =>
+          process.stdout.write("", () => resolve()),
+        ),
+      );
+    }
+    if (!overrides.error) {
+      output.push(
+        new Promise<void>((resolve) =>
+          process.stderr.write("", () => resolve()),
+        ),
+      );
+    }
+    await Promise.all(output);
   }
 }
