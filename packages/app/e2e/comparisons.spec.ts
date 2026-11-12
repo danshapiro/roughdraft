@@ -120,7 +120,11 @@ test.describe("file comparisons", () => {
     expect(readProjectFile(projectDir, "AGENTS.md")).toBe(
       beforeText.replace("Old first.", "New first."),
     );
-    await expect(page.getByTestId("page-card-rich-text")).toBeVisible();
+    await expect(
+      page
+        .getByTestId("comparison-native-document")
+        .getByTestId("page-card-rich-text"),
+    ).toBeVisible();
   });
 
   test("Keep/Revert selections only write the chosen reversions at the end @smoke", async ({
@@ -236,9 +240,11 @@ test.describe("file comparisons", () => {
     await expect(page.getByTestId("comparison-toolbar")).toContainText(
       "1 undecided",
     );
-    await expect(page.getByTestId("rich-text-editor")).toContainText(
-      "Someone else's edit",
-    );
+    await expect(
+      page
+        .getByTestId("comparison-native-document")
+        .getByTestId("rich-text-editor"),
+    ).toContainText("Someone else's edit");
   });
 
   test("comparison comments save separately and Finish comparison never writes", async ({
