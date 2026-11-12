@@ -1,43 +1,23 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ApiBackend } from "./api-backend";
+import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
+import { buildComparisonDocument } from "./comparison-document";
+import type {
+  ComparisonReviewData as Comparison,
+  ComparisonReviewComment,
+  ComparisonDecision as Decision,
+} from "./comparison-types";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
+import type { ControlledDocumentReview } from "./controlled-review";
+import { RichTextEditorSurface } from "./PageCard";
 import "./ComparisonReview.css";
 
-type Decision = "pending" | "before" | "after";
-type Segment = {
-  id: string;
-  kind: "equal" | "change";
-  before: string;
-  after: string;
-  oldStart: number;
-  newStart: number;
-  decision: Decision;
-  comment: string;
-};
-type Comparison = {
-  id: string;
-  revision: number;
-  mode: "proposal" | "applied" | "compare";
-  title: string;
-  beforeLabel: string;
-  afterLabel: string;
-  targetPath: string | null;
-  segments: Segment[];
-  comment: string;
-  status: "open" | "completed" | "applied";
-  targetChanged: boolean;
-  completion: {
-    fileWritten: boolean;
-    targetPath: string | null;
-    accepted: number;
-    reverted: number;
-    completedAt: string;
-  } | null;
-};
 type Choices = {
   decisions?: { id: string; decision?: Decision; comment?: string }[];
   comment?: string;
+  reviewComments?: ComparisonReviewComment[];
 };
 
 class ComparisonError extends Error {
@@ -74,6 +54,9 @@ function applyLocalChoices(review: Comparison, choices: Choices): Comparison {
   return {
     ...review,
     ...(choices.comment !== undefined ? { comment: choices.comment } : {}),
+    ...(choices.reviewComments !== undefined
+      ? { reviewComments: choices.reviewComments }
+      : {}),
     segments: review.segments.map((segment) => {
       const choice = choices.decisions?.find((item) => item.id === segment.id);
       return choice ? { ...segment, ...choice } : segment;
@@ -81,98 +64,171 @@ function applyLocalChoices(review: Comparison, choices: Choices): Comparison {
   };
 }
 
-function sourceLines(text: string) {
-  if (!text) return [];
-  const lines = text.split("\n");
-  if (lines.at(-1) === "") lines.pop();
-  return lines;
-}
-
-function SourceRows({
-  text,
-  oldStart,
-  newStart,
-  kind,
+function NativeComparisonDocument({
+  review,
+  showReviewed,
+  busy,
+  onChoices,
 }: {
-  text: string;
-  oldStart: number | null;
-  newStart: number | null;
-  kind: "equal" | "removed" | "added";
+  review: Comparison;
+  showReviewed: boolean;
+  busy: boolean;
+  onChoices: (choices: Choices) => void;
 }) {
-  const rows = sourceLines(text).map((line, offset, lines) => ({
-    text: line.endsWith("\r") ? line.slice(0, -1) : line,
-    oldLine: oldStart === null ? null : oldStart + offset,
-    newLine: newStart === null ? null : newStart + offset,
-    noNewline: offset === lines.length - 1 && !text.endsWith("\n"),
-  }));
-  return rows.map((row) => (
-    <div
-      className={`comparison-line comparison-line-${kind}`}
-      key={`${kind}:${row.oldLine}:${row.newLine}`}
-    >
-      <span className="comparison-line-number" aria-hidden="true">
-        {row.oldLine}
-      </span>
-      <span className="comparison-line-number" aria-hidden="true">
-        {row.newLine}
-      </span>
-      <span className="comparison-line-sign" aria-hidden="true">
-        {kind === "added" ? "+" : kind === "removed" ? "−" : " "}
-      </span>
-      <code>
-        {kind !== "equal" && (
-          <span className="sr-only">
-            {kind === "added" ? "Added: " : "Removed: "}
-          </span>
-        )}
-        {row.text}
-        {row.noNewline && (
-          <span className="comparison-no-newline"> ⏎ No newline at end</span>
-        )}
-      </code>
-    </div>
-  ));
-}
-
-function EqualContext({ segment }: { segment: Segment }) {
-  const [expanded, setExpanded] = useState(false);
-  const lines = sourceLines(segment.before);
-  if (lines.length <= 8 || expanded) {
-    return (
-      <SourceRows
-        text={segment.before}
-        oldStart={segment.oldStart}
-        newStart={segment.newStart}
-        kind="equal"
-      />
+  const contextPath =
+    review.targetPath ??
+    [review.afterLabel, review.beforeLabel].find((label) =>
+      label.startsWith("/"),
+    ) ??
+    null;
+  const backend = useMemo(
+    () =>
+      new ApiBackend({
+        kind: "local-files",
+        label: "Markdown comparison",
+        detail: contextPath ?? "Frozen versions",
+        projectPath: contextPath
+          ? contextPath.slice(0, contextPath.lastIndexOf("/")) || "/"
+          : undefined,
+      }),
+    [contextPath],
+  );
+  const model = useMemo(
+    () =>
+      buildComparisonDocument(review, {
+        showReviewed,
+        resolveFileUrl: (path) => backend.resolveFileUrl(path),
+        resolveLinkUrl: (href) =>
+          buildLocationForLinkedMarkdownDocument({
+            projectPath: backend.info.projectPath,
+            currentDocumentPath: contextPath,
+            href,
+          }),
+      }),
+    [review, showReviewed, backend, contextPath],
+  );
+  const commentsRef = useRef(review.reviewComments ?? []);
+  commentsRef.current = review.reviewComments ?? [];
+  const legacyCommentSegment = (commentId: string) =>
+    review.segments.find(
+      (segment) =>
+        segment.kind === "change" && `legacy:${segment.id}` === commentId,
     );
-  }
-  const first = `${lines.slice(0, 3).join("\n")}\n`;
-  const last =
-    lines.slice(-3).join("\n") + (segment.before.endsWith("\n") ? "\n" : "");
+  const decide = (groupId: string, decision: Decision) => {
+    const group = model.groups.find((item) => item.id === groupId);
+    if (!group) return;
+    onChoices({ decisions: group.segmentIds.map((id) => ({ id, decision })) });
+  };
+  const updateComments = (comments: ComparisonReviewComment[]) => {
+    commentsRef.current = comments;
+    onChoices({ reviewComments: comments });
+  };
+  const createComment = (groupId: string | null, parentCommentId: string) => {
+    const group = model.groups.find(
+      (item) => item.id === groupId || item.segmentIds.includes(groupId ?? ""),
+    );
+    const parent = commentsRef.current.find(
+      (comment) => comment.id === parentCommentId,
+    );
+    const legacy = legacyCommentSegment(parentCommentId);
+    const changeId = group?.segmentIds[0] ?? parent?.changeId ?? legacy?.id;
+    if (!changeId) return null;
+    const id = `review-${crypto.randomUUID()}`;
+    updateComments([
+      ...commentsRef.current,
+      {
+        id,
+        changeId,
+        content: "",
+        createdAt: new Date().toISOString(),
+        authorType: "user",
+        parentCommentId: parentCommentId || groupId,
+      },
+    ]);
+    return id;
+  };
+  const updateComment = (commentId: string, content: string) => {
+    const legacy = legacyCommentSegment(commentId);
+    if (legacy) onChoices({ decisions: [{ id: legacy.id, comment: content }] });
+    else
+      updateComments(
+        commentsRef.current.map((comment) =>
+          comment.id === commentId ? { ...comment, content } : comment,
+        ),
+      );
+  };
+  const deleteComment = (commentId: string) => {
+    const removed = new Set([commentId]);
+    for (let previous = -1; previous !== removed.size; ) {
+      previous = removed.size;
+      for (const comment of commentsRef.current)
+        if (comment.parentCommentId && removed.has(comment.parentCommentId))
+          removed.add(comment.id);
+    }
+    const nextComments = commentsRef.current.filter(
+      (comment) => !removed.has(comment.id),
+    );
+    commentsRef.current = nextComments;
+    const legacy = legacyCommentSegment(commentId);
+    onChoices({
+      reviewComments: nextComments,
+      ...(legacy ? { decisions: [{ id: legacy.id, comment: "" }] } : {}),
+    });
+  };
+  const controlledReview: ControlledDocumentReview = {
+    ...model,
+    canDecide: review.mode !== "compare" && review.status === "open",
+    disabled: busy || review.status !== "open",
+    acceptLabel: review.mode === "applied" ? "Keep" : "Accept",
+    rejectLabel: review.mode === "applied" ? "Revert" : "Skip",
+    onAccept: (id) => decide(id, "after"),
+    onReject: (id) => decide(id, "before"),
+    onCreateComment: createComment,
+    onUpdateComment: updateComment,
+    onDeleteComment: deleteComment,
+  };
+  const linkedGroups = model.groups.filter(
+    (group) => group.segmentIds.length > 1,
+  );
   return (
     <>
-      <SourceRows
-        text={first}
-        oldStart={segment.oldStart}
-        newStart={segment.newStart}
-        kind="equal"
-      />
-      <Button
-        variant="ghost"
-        size="sm"
-        className="comparison-expand"
-        data-testid="comparison-expand-context"
-        onClick={() => setExpanded(true)}
+      {linkedGroups.length > 0 && (
+        <p
+          className="comparison-linked-notice"
+          data-testid="comparison-linked-notice"
+        >
+          {
+            review.segments.filter((segment) => segment.kind === "change")
+              .length
+          }{" "}
+          source changes appear in {model.groups.length} review{" "}
+          {model.groups.length === 1 ? "group" : "groups"}. Changes within one
+          Markdown block are reviewed together; each card shows its linked
+          count. Existing individual choices remain saved until you choose
+          again.
+        </p>
+      )}
+      <div
+        className="comparison-native-document"
+        data-testid="comparison-native-document"
       >
-        Show {lines.length - 6} unchanged lines
-      </Button>
-      <SourceRows
-        text={last}
-        oldStart={segment.oldStart + lines.length - 3}
-        newStart={segment.newStart + lines.length - 3}
-        kind="equal"
-      />
+        <RichTextEditorSurface
+          page={{
+            id: review.id,
+            title: review.title,
+            content: review.afterText,
+          }}
+          activeDocumentPath={contextPath}
+          selected={true}
+          layout="default"
+          focusRequestKey={null}
+          sourceMarkdown={review.afterText}
+          onMarkdownChange={() => {}}
+          interactionMode="viewing"
+          backend={backend}
+          controlledReview={controlledReview}
+        />
+      </div>
     </>
   );
 }
@@ -187,6 +243,7 @@ export function ComparisonReview({ id }: { id: string }) {
   const [convertVisible, setConvertVisible] = useState(false);
   const [destination, setDestination] = useState("");
   const [refreshNotice, setRefreshNotice] = useState(false);
+  const [showReviewed, setShowReviewed] = useState(false);
   const savedRef = useRef<Comparison | null>(null);
   const queueRef = useRef<Choices[]>([]);
   const savingRef = useRef(false);
@@ -484,7 +541,7 @@ export function ComparisonReview({ id }: { id: string }) {
         </div>
       )}
 
-      <div className="comparison-toolbar">
+      <div className="comparison-toolbar" data-testid="comparison-toolbar">
         <p>
           {changes.length} {changes.length === 1 ? "change" : "changes"}
           {writable && open ? ` · ${pending} undecided` : ""}
@@ -523,109 +580,30 @@ export function ComparisonReview({ id }: { id: string }) {
               : "Review saved separately"}
         </span>
       </div>
-      <section
-        className="comparison-diff"
-        data-testid="comparison-diff"
-        aria-label="Markdown source changes"
+      <div className="comparison-version-labels">
+        <span>Before: {review.beforeLabel}</span>
+        <span>After: {review.afterLabel}</span>
+      </div>
+      <Button
+        variant="outline"
+        size="sm"
+        data-testid="comparison-show-reviewed"
+        aria-pressed={showReviewed}
+        onClick={() => setShowReviewed(!showReviewed)}
       >
-        <div className="comparison-version-labels">
-          <span>− Before: {review.beforeLabel}</span>
-          <span>+ After: {review.afterLabel}</span>
-        </div>
-        {changes.length === 0 && (
-          <p className="comparison-empty" data-testid="comparison-identical">
-            The versions are identical. There are no changes to apply.
-          </p>
-        )}
-        {review.segments.map((segment) =>
-          segment.kind === "equal" ? (
-            <div className="comparison-context" key={segment.id}>
-              <EqualContext segment={segment} />
-            </div>
-          ) : (
-            <section
-              key={segment.id}
-              className={`comparison-change comparison-decision-${segment.decision}`}
-              data-testid="comparison-change"
-            >
-              <div className="comparison-change-heading">
-                <span>
-                  Lines {segment.oldStart} → {segment.newStart}
-                </span>
-                {writable && (
-                  <div className="comparison-choice-buttons">
-                    <Button
-                      size="sm"
-                      variant={
-                        segment.decision === "after" ? "default" : "outline"
-                      }
-                      data-testid="comparison-choice-after"
-                      aria-pressed={segment.decision === "after"}
-                      disabled={!open || busy}
-                      onClick={() =>
-                        changeChoices({
-                          decisions: [{ id: segment.id, decision: "after" }],
-                        })
-                      }
-                    >
-                      {review.mode === "applied" ? "Keep" : "Accept"}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant={
-                        segment.decision === "before" ? "default" : "outline"
-                      }
-                      data-testid="comparison-choice-before"
-                      aria-pressed={segment.decision === "before"}
-                      disabled={!open || busy}
-                      onClick={() =>
-                        changeChoices({
-                          decisions: [{ id: segment.id, decision: "before" }],
-                        })
-                      }
-                    >
-                      {review.mode === "applied" ? "Revert" : "Skip"}
-                    </Button>
-                  </div>
-                )}
-              </div>
-              <SourceRows
-                text={segment.before}
-                oldStart={segment.oldStart}
-                newStart={null}
-                kind="removed"
-              />
-              <SourceRows
-                text={segment.after}
-                oldStart={null}
-                newStart={segment.newStart}
-                kind="added"
-              />
-              <label
-                className="comparison-comment"
-                htmlFor={`comparison-comment-${segment.id}`}
-              >
-                <span>Comment on this change</span>
-                <Textarea
-                  id={`comparison-comment-${segment.id}`}
-                  data-testid="comparison-change-comment"
-                  aria-label={`Comment on change at line ${segment.oldStart}`}
-                  placeholder="Optional feedback for the agent"
-                  value={segment.comment}
-                  disabled={!open || busy}
-                  onChange={(event) =>
-                    changeChoices({
-                      decisions: [
-                        { id: segment.id, comment: event.target.value },
-                      ],
-                    })
-                  }
-                />
-              </label>
-            </section>
-          ),
-        )}
-      </section>
+        {showReviewed ? "Hide reviewed changes" : "Show reviewed changes"}
+      </Button>
+      {changes.length === 0 && (
+        <p className="comparison-empty" data-testid="comparison-identical">
+          The versions are identical. There are no changes to apply.
+        </p>
+      )}
+      <NativeComparisonDocument
+        review={review}
+        showReviewed={showReviewed}
+        busy={busy}
+        onChoices={changeChoices}
+      />
       <label
         className="comparison-overall-comment"
         htmlFor="comparison-overall-feedback"

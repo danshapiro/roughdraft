@@ -44,6 +44,8 @@ export interface CriticChangeRailItem {
   commentIds: string[];
   anchorTop: number;
   anchorBottom: number;
+  sourceChangeCount?: number;
+  reviewStatus?: string;
 }
 
 interface DocumentReviewRailProps {
@@ -78,6 +80,12 @@ interface DocumentReviewRailProps {
   onApplyDraftSuggestion?: () => void;
   onCancelDraftSuggestion?: () => void;
   editor?: Editor | null;
+  reviewControls?: {
+    canDecide: boolean;
+    disabled: boolean;
+    acceptLabel: string;
+    rejectLabel: string;
+  };
 }
 
 function railLayoutItemClass(layout: "anchored" | "flow") {
@@ -214,6 +222,7 @@ export function DocumentReviewRail({
   onApplyDraftSuggestion,
   onCancelDraftSuggestion,
   editor = null,
+  reviewControls,
 }: DocumentReviewRailProps) {
   const draftTextareaRef = useRef<HTMLTextAreaElement>(null);
   const itemRefs = useRef(new Map<string, HTMLDivElement>());
@@ -473,6 +482,7 @@ export function DocumentReviewRail({
                   variant="rail"
                   className={cn(!isExpanded && "pointer-events-none")}
                   interactive={isExpanded}
+                  readOnly={reviewControls?.disabled}
                   selectedCommentId={selectedCommentId}
                   hoveredCommentId={hoveredCommentId}
                   onDeleteComment={onDeleteComment}
@@ -610,39 +620,45 @@ export function DocumentReviewRail({
             defaultActions,
           }: CommentActionsRenderContext): CommentActionDefinition[] =>
             comment.id === suggestion.changeId
-              ? [
-                  {
-                    key: "accept",
-                    label: "Accept suggestion",
-                    icon: <Check className="size-3.5" />,
-                    compact: true,
-                    onClick: (event) => {
-                      event.stopPropagation();
-                      onAcceptSuggestion(suggestion.changeId);
+              ? (
+                  [
+                    {
+                      key: "accept",
+                      label: reviewControls?.acceptLabel ?? "Accept suggestion",
+                      icon: <Check className="size-3.5" />,
+                      compact: true,
+                      onClick: (event) => {
+                        event.stopPropagation();
+                        onAcceptSuggestion(suggestion.changeId);
+                      },
                     },
-                  },
-                  {
-                    key: "reject",
-                    label: "Reject suggestion",
-                    tone: "danger",
-                    icon: <X className="size-3.5" />,
-                    compact: true,
-                    onClick: (event) => {
-                      event.stopPropagation();
-                      onRejectSuggestion(suggestion.changeId);
+                    {
+                      key: "reject",
+                      label: reviewControls?.rejectLabel ?? "Reject suggestion",
+                      tone: "danger",
+                      icon: <X className="size-3.5" />,
+                      compact: true,
+                      onClick: (event) => {
+                        event.stopPropagation();
+                        onRejectSuggestion(suggestion.changeId);
+                      },
                     },
-                  },
-                  {
-                    key: "reply",
-                    label: "Reply",
-                    icon: <Reply className="size-3.5" />,
-                    compact: true,
-                    onClick: (event) => {
-                      event.stopPropagation();
-                      onReplySuggestion(suggestion.changeId);
+                    {
+                      key: "reply",
+                      label: "Reply",
+                      icon: <Reply className="size-3.5" />,
+                      compact: true,
+                      onClick: (event) => {
+                        event.stopPropagation();
+                        onReplySuggestion(suggestion.changeId);
+                      },
                     },
-                  },
-                ]
+                  ] satisfies CommentActionDefinition[]
+                ).filter(
+                  (action) =>
+                    action.key === "reply" ||
+                    reviewControls?.canDecide !== false,
+                )
               : defaultActions;
 
           return (
@@ -667,7 +683,25 @@ export function DocumentReviewRail({
                 onFocusSuggestion(suggestion.changeId);
               }}
             >
+              {suggestion.reviewStatus ||
+              (suggestion.sourceChangeCount ?? 0) > 1 ? (
+                <div
+                  className="px-4 pt-3 text-xs text-muted-foreground"
+                  data-testid={`suggestion-status-${suggestion.changeId}`}
+                >
+                  {suggestion.reviewStatus}
+                  {suggestion.reviewStatus &&
+                  (suggestion.sourceChangeCount ?? 0) > 1
+                    ? " · "
+                    : null}
+                  {(suggestion.sourceChangeCount ?? 0) > 1
+                    ? `${suggestion.sourceChangeCount} linked changes`
+                    : null}
+                </div>
+              ) : null}
               <CommentEditorList
+                readOnly={reviewControls?.disabled}
+                allowDeleteThread={!reviewControls}
                 comments={suggestionThreadComments}
                 variant="rail"
                 selectedCommentId={

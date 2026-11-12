@@ -101,7 +101,7 @@ roughdraft mcp
 
 The MCP server exposes tools to read the review index, list pending feedback, watch review events, append replies, and mark items resolved. CriticMarkup in the Markdown file remains the durable source of truth.
 ## Review file changes
-Use a comparison when you want to choose which changes reach a Markdown file. Comparisons display the exact Markdown source, with removed lines in red and added lines in green.
+Use a comparison when you want to choose which changes reach a Markdown file. Comparisons use Roughdraft’s rendered document and suggestion sidebar: headings, lists, links and formatting appear as they do in the editor, with changes highlighted in place.
 
 | What you want | Command | What the final action does |
 | --- | --- | --- |
@@ -109,7 +109,9 @@ Use a comparison when you want to choose which changes reach a Markdown file. Co
 | Review edits that are already in the file | `roughdraft review AGENTS.md --before AGENTS.before.md` | **Keep / Revert** each change, then **Revert** writes the selected reversions to `AGENTS.md`. |
 | Compare any two versions | `roughdraft compare BEFORE.md AFTER.md` | Shows the differences and saves review comments. It has no destination and does not write either file. |
 
-Choices and comments save automatically in a separate comparison record. They do not change the Markdown file. The final write button names the destination and how many changes it will apply or revert. **Finish without applying** ends a review without writing the file. Saving a file does not commit, install, or deploy it.
+Choices and submitted comments save in a separate comparison record. Use the comment editor’s **Save** button or Ctrl/⌘+Enter to submit a reply. These choices and comments do not change the Markdown file. The final write button names the destination and how many changes it will apply or revert. **Finish without applying** ends a review without writing the file. Saving a file does not commit, install, or deploy it.
+
+Use the sidebar’s change controls and reply threads as you would in the editor. Choosing a change shows its selected result; **Show reviewed changes** brings the original highlights and controls back so you can revise your choices. Changes within one list, table or other complete block may be linked; the sidebar states how many source changes its choice covers. The comparison document itself is read-only. Applying uses the original Markdown bytes, preserving untouched spacing and line endings.
 
 For proposed edits, prepare a separate candidate and leave the destination unchanged. For changes you will make first, save a snapshot before editing:
 
@@ -121,7 +123,7 @@ roughdraft review AGENTS.md --before AGENTS.before.md
 
 Snapshots preserve the file bytes exactly and refuse to overwrite an existing output. Choose a new snapshot name for each review round.
 
-Every comparison captures both versions when it starts. Later source edits do not silently change the displayed diff. If the destination changes during review, Roughdraft blocks writes. **Refresh comparison** explicitly reloads the destination, keeps choices for identical change blocks, and leaves changed blocks for another decision.
+Every comparison captures both versions when it starts. Later source edits do not silently change the displayed diff. If the destination changes during review, Roughdraft blocks writes. **Refresh comparison** explicitly reloads the destination, keeps choices for identical change blocks, and leaves changed blocks for another decision. Comments and replies remain saved; feedback whose original change has disappeared is shown as document feedback.
 
 A plain comparison can become a proposal through **Propose these edits**. Enter the destination explicitly; it must match the comparison's before version. That creates a separate proposal for review.
 

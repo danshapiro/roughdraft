@@ -147,20 +147,25 @@ suggestions:
 | Error/home fallback | Missing/unloadable path | Open URL with invalid markdown path through local backend | homepage error message | Captures load-error homepage variant. |
 ## File Comparison States
 
-Create a record with `roughdraft propose`, `roughdraft review`, or `roughdraft compare`, then open the printed `/?comparison=<id>` URL. Comparisons show exact Markdown source and never mount the rich editor. Capture both desktop and mobile.
+Create a record with `roughdraft propose`, `roughdraft review`, or `roughdraft compare`, then open the printed `/?comparison=<id>` URL. Comparisons use the same rendered Markdown editor, native change highlights, and suggestion/comment rail as ordinary Roughdraft files. The rendered body is read-only; decisions and comments save separately, and only the final action can write the destination. Capture both desktop and mobile.
 
 | State | Setup | Stable selectors | What to capture |
 | --- | --- | --- | --- |
-| Proposed changes, undecided | Create proposal | `comparison-mode`, `comparison-change`, `comparison-apply` | Accept / Skip; disabled Apply until every change is decided; destination and save explanation. |
-| Proposed changes, mixed choices | Accept one and Skip another | `comparison-choice-after`, `comparison-choice-before`, `comparison-save-status` | Selected states and the exact number and destination on Apply. |
-| Changes already made | Create applied review | `comparison-mode`, `comparison-change` | Keep / Revert labels and explicit final Revert action. |
-| Comparison only | Compare two versions | `comparison-propose`, `comparison-complete` | No approval buttons or destination; Finish comparison cannot write either version. |
+| Proposed changes, undecided | Create proposal | `comparison-mode`, `document-review-rail`, `comparison-apply` | Native suggestion cards with Accept / Skip; disabled Apply until every source change is decided; destination and save explanation. |
+| Proposed changes, mixed choices | Accept one and Skip another | `comment-rail-<id>-action-accept`, `comment-rail-<id>-action-reject`, `comparison-save-status` | Resolved choices display their selected content. Show reviewed changes reveals the original native highlights/cards so choices can be revised; Apply names the count and destination. |
+| Changes already made | Create applied review | `comparison-mode`, `document-review-rail` | Keep / Revert labels and explicit final Revert action. |
+| Comparison only | Compare two versions | `comparison-propose`, `comparison-complete` | Rendered versions with native highlights and feedback threads, without approval buttons or destination; Finish comparison cannot write either version. |
 | Choose proposal destination | Click Propose these edits | `comparison-convert`, `comparison-convert-target` | Absolute path entry and explanation that conversion does not write the file. |
 | Destination conflict | Modify destination externally | `comparison-conflict`, `comparison-refresh` | Preserved choices, blocked Apply, explicit refresh explanation. |
 | Refreshed comparison | Click Refresh comparison | `comparison-refresh-notice` | New current version and undecided changes requiring a fresh decision. |
 | Review save failed | Interrupt API during a choice | `comparison-error`, `comparison-retry` | Local choices remain visible; retry is explicit. |
 | Completed review | Apply or finish without applying | `comparison-outcome` | Distinguishes a saved destination from “No file was written.” |
-| Long unchanged context | Compare long Markdown versions | `comparison-expand-context` | Collapsed context, expanded source line numbers, feedback fields. |
+| Rendered document | Compare formatted Markdown versions | `page-card-rich-text`, `rich-text-editor` | Real headings, lists, bold text, links, tables and code; native additions/deletions in context. |
+| Reviewed choices | Decide a native suggestion, then click Show reviewed changes | `comparison-show-reviewed`, `suggestion-status-<id>` | Selected content by default, original change and saved status when shown again. |
+| Linked Markdown changes | Compare several changes in one list/table | `comparison-linked-notice`, `suggestion-status-<id>` | One native group with an explicit linked count; prior mixed choices stay preserved until another action. |
+| Native feedback | Reply to a suggestion and edit a reply | `comment-rail-<id>-action-reply`, `comment-rail-<id>-editor` | Full native comment threads, separately saved, including legacy feedback and resolved changes. |
+| Detached feedback | Refresh after the original source change disappears | `document-review-rail`, `comment-rail-<id>-action-reply` | Historical feedback remains visible as a document thread; editing and nested replies remain usable. |
+| Mobile comparison | Open at 390px wide | `document-review-rail`, `comment-rail-<id>-action-accept` | Native cards and comment actions flow below the document and remain usable. |
 | Identical versions | Compare identical source | `comparison-identical` | No-change explanation, disabled write action. |
 
 ## Playwright Capture Skeleton

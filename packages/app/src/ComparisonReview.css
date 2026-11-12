@@ -56,7 +56,6 @@
   font-size: 13px;
 }
 .comparison-batch,
-.comparison-choice-buttons,
 .comparison-final-buttons {
   display: flex;
   gap: 8px;
@@ -68,113 +67,39 @@
   font-size: 12px;
 }
 .comparison-save-failed {
-  color: #b91c1c;
-}
-.comparison-diff {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
+  color: var(--destructive);
 }
 .comparison-version-labels {
   display: flex;
   flex-wrap: wrap;
   gap: 8px 24px;
-  padding: 12px 14px;
-  background: var(--muted);
+  margin: 0 0 12px;
   font-size: 12px;
   color: var(--muted-foreground);
-  border-bottom: 1px solid var(--border);
   overflow-wrap: anywhere;
 }
-.comparison-context,
-.comparison-change {
-  overflow-x: auto;
+.comparison-native-document {
+  margin-top: 20px;
 }
-.comparison-line {
-  display: grid;
-  grid-template-columns: 40px 40px 24px minmax(0, 1fr);
-  min-width: 290px;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.7;
-}
-.comparison-line code {
-  font: inherit;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  padding-right: 12px;
-}
-.comparison-line-number {
-  color: var(--muted-foreground);
-  text-align: right;
-  padding-right: 8px;
-  user-select: none;
-}
-.comparison-line-sign {
-  text-align: center;
-  user-select: none;
-}
-.comparison-line-added {
-  background: #e9f8ee;
-  color: #164d29;
-}
-.comparison-line-removed {
-  background: #fff0ef;
-  color: #7a2923;
-}
-.comparison-no-newline {
-  color: var(--muted-foreground);
-  font-size: 10px;
-  font-style: italic;
-}
-.comparison-change {
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-}
-.comparison-change + .comparison-change {
-  border-top: 0;
-}
-.comparison-change-heading {
-  padding: 8px 12px;
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  justify-content: space-between;
-  background: var(--muted);
+.comparison-linked-notice {
   font-size: 12px;
   color: var(--muted-foreground);
-}
-.comparison-decision-before .comparison-change-heading,
-.comparison-decision-after .comparison-change-heading {
-  box-shadow: inset 3px 0 0 #4b8b64;
-}
-.comparison-comment {
-  display: block;
-  padding: 10px 14px;
-}
-.comparison-comment > span,
-.comparison-overall-comment > span {
-  display: block;
-  font-size: 12px;
-  color: var(--muted-foreground);
-  margin-bottom: 6px;
-}
-.comparison-comment textarea {
-  min-height: 38px;
-}
-.comparison-expand {
-  width: 100%;
-  border-radius: 0;
-  font-size: 11px;
-  color: var(--muted-foreground);
+  line-height: 1.6;
+  margin-top: 12px;
 }
 .comparison-empty {
-  padding: 24px;
+  padding: 24px 0;
   font-size: 14px;
 }
 .comparison-overall-comment {
   display: block;
   margin-top: 24px;
+}
+.comparison-overall-comment > span {
+  display: block;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  margin-bottom: 6px;
 }
 .comparison-actions {
   margin-top: 24px;
@@ -237,12 +162,10 @@
   font-family: ui-monospace, monospace;
   margin-bottom: 8px;
 }
-.dark .comparison-line-added,
 .dark .comparison-outcome {
   background: #153321;
   color: #b6e9c6;
 }
-.dark .comparison-line-removed,
 .dark .comparison-error {
   background: #3b2222;
   color: #f0bbb8;
@@ -258,10 +181,6 @@
   .comparison-save {
     margin-left: 0;
     width: 100%;
-  }
-  .comparison-line {
-    grid-template-columns: 30px 30px 18px minmax(0, 1fr);
-    font-size: 11px;
   }
   .comparison-final-buttons {
     flex-direction: column;

@@ -31,6 +31,8 @@ interface CommentEditorListProps {
   className?: string;
   testId?: string;
   interactive?: boolean;
+  readOnly?: boolean;
+  allowDeleteThread?: boolean;
   onDeleteComment: (commentId: string) => void;
   onUpdateComment: (commentId: string, nextContent: string) => void;
   onSelectComment?: (commentId: string) => void;
@@ -97,7 +99,9 @@ export function CommentEditorList({
   hoveredCommentId = null,
   className,
   testId,
-  interactive = true,
+  interactive: interactiveProp = true,
+  readOnly = false,
+  allowDeleteThread = true,
   onDeleteComment,
   onUpdateComment,
   onSelectComment,
@@ -110,6 +114,7 @@ export function CommentEditorList({
   renderCommentContent,
   getCommentActions,
 }: CommentEditorListProps) {
+  const interactive = interactiveProp && !readOnly;
   const textareaRefs = useRef(new Map<string, HTMLTextAreaElement>());
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [editingCommentIds, setEditingCommentIds] = useState<string[]>([]);
@@ -283,6 +288,8 @@ export function CommentEditorList({
           parentLines={[]}
           variant={variant}
           interactive={interactive}
+          readOnly={readOnly}
+          allowDeleteThread={allowDeleteThread}
           drafts={drafts}
           newCommentDraftIds={newCommentDraftIds}
           editingCommentIds={editingCommentIds}
@@ -321,6 +328,8 @@ interface CommentThreadNodeProps {
   parentLines: boolean[];
   variant: "banner" | "rail";
   interactive: boolean;
+  readOnly: boolean;
+  allowDeleteThread: boolean;
   drafts: Record<string, string>;
   newCommentDraftIds: string[];
   editingCommentIds: string[];
@@ -415,6 +424,8 @@ function CommentThreadNode({
   parentLines,
   variant,
   interactive,
+  readOnly,
+  allowDeleteThread,
   drafts,
   newCommentDraftIds,
   editingCommentIds,
@@ -541,13 +552,14 @@ function CommentThreadNode({
   const defaultVisibleActions = isNewRootCommentDraft
     ? defaultActions.filter((action) => action.key !== "cancel")
     : defaultActions;
-  const actions =
-    getCommentActions?.({
-      comment,
-      depth,
-      isEditing,
-      defaultActions: defaultVisibleActions,
-    }) ?? defaultVisibleActions;
+  const actions = readOnly
+    ? []
+    : (getCommentActions?.({
+        comment,
+        depth,
+        isEditing,
+        defaultActions: defaultVisibleActions,
+      }) ?? defaultVisibleActions);
   const ancestorGuideOffsets = parentLines.reduce<number[]>(
     (offsets, showLine, guideIndex) => {
       if (showLine) {
@@ -639,7 +651,7 @@ function CommentThreadNode({
         ) : null}
         <div className="min-w-0 flex-1">
           <div className="relative grid grid-cols-[1.5rem_minmax(0,1fr)] gap-x-1.5">
-            {interactive && isRootThread ? (
+            {interactive && allowDeleteThread && isRootThread ? (
               <CommentActionButton
                 label="Delete thread"
                 testId={`comment-${variant}-${comment.id}-action-delete-thread`}
@@ -783,6 +795,8 @@ function CommentThreadNode({
               parentLines={depth === 0 ? [] : [...parentLines, !isLast]}
               variant={variant}
               interactive={interactive}
+              readOnly={readOnly}
+              allowDeleteThread={allowDeleteThread}
               drafts={drafts}
               newCommentDraftIds={newCommentDraftIds}
               editingCommentIds={editingCommentIds}
