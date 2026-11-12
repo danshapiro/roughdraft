@@ -145,6 +145,24 @@ suggestions:
 | Code mode | Review rail absent | Open fenced fixture with `?editor=code` | `page-card-code`, `markdown-code-editor` | Confirms fenced CriticMarkup alone does not create review rail. |
 | Error/home fallback | Non-Markdown path | Open URL with `?path=/tmp/file.txt` | homepage error message | Copy: `Roughdraft now opens one .md file at a time.` |
 | Error/home fallback | Missing/unloadable path | Open URL with invalid markdown path through local backend | homepage error message | Captures load-error homepage variant. |
+## File Comparison States
+
+Create a record with `roughdraft propose`, `roughdraft review`, or `roughdraft compare`, then open the printed `/?comparison=<id>` URL. Comparisons show exact Markdown source and never mount the rich editor. Capture both desktop and mobile.
+
+| State | Setup | Stable selectors | What to capture |
+| --- | --- | --- | --- |
+| Proposed changes, undecided | Create proposal | `comparison-mode`, `comparison-change`, `comparison-apply` | Accept / Skip; disabled Apply until every change is decided; destination and save explanation. |
+| Proposed changes, mixed choices | Accept one and Skip another | `comparison-choice-after`, `comparison-choice-before`, `comparison-save-status` | Selected states and the exact number and destination on Apply. |
+| Changes already made | Create applied review | `comparison-mode`, `comparison-change` | Keep / Revert labels and explicit final Revert action. |
+| Comparison only | Compare two versions | `comparison-propose`, `comparison-complete` | No approval buttons or destination; Finish comparison cannot write either version. |
+| Choose proposal destination | Click Propose these edits | `comparison-convert`, `comparison-convert-target` | Absolute path entry and explanation that conversion does not write the file. |
+| Destination conflict | Modify destination externally | `comparison-conflict`, `comparison-refresh` | Preserved choices, blocked Apply, explicit refresh explanation. |
+| Refreshed comparison | Click Refresh comparison | `comparison-refresh-notice` | New current version and undecided changes requiring a fresh decision. |
+| Review save failed | Interrupt API during a choice | `comparison-error`, `comparison-retry` | Local choices remain visible; retry is explicit. |
+| Completed review | Apply or finish without applying | `comparison-outcome` | Distinguishes a saved destination from “No file was written.” |
+| Long unchanged context | Compare long Markdown versions | `comparison-expand-context` | Collapsed context, expanded source line numbers, feedback fields. |
+| Identical versions | Compare identical source | `comparison-identical` | No-change explanation, disabled write action. |
+
 ## Playwright Capture Skeleton
 ```ts
 import { chromium, devices } from "playwright";

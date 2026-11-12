@@ -100,6 +100,42 @@ roughdraft mcp
 ```
 
 The MCP server exposes tools to read the review index, list pending feedback, watch review events, append replies, and mark items resolved. CriticMarkup in the Markdown file remains the durable source of truth.
+## Review file changes
+Use a comparison when you want to choose which changes reach a Markdown file. Comparisons display the exact Markdown source, with removed lines in red and added lines in green.
+
+| What you want | Command | What the final action does |
+| --- | --- | --- |
+| Propose edits before changing the file | `roughdraft propose AGENTS.md --after AGENTS.proposed.md` | **Accept / Skip** each change, then **Apply** writes accepted changes to `AGENTS.md`. |
+| Review edits that are already in the file | `roughdraft review AGENTS.md --before AGENTS.before.md` | **Keep / Revert** each change, then **Revert** writes the selected reversions to `AGENTS.md`. |
+| Compare any two versions | `roughdraft compare BEFORE.md AFTER.md` | Shows the differences and saves review comments. It has no destination and does not write either file. |
+
+Choices and comments save automatically in a separate comparison record. They do not change the Markdown file. The final write button names the destination and how many changes it will apply or revert. **Finish without applying** ends a review without writing the file. Saving a file does not commit, install, or deploy it.
+
+For proposed edits, prepare a separate candidate and leave the destination unchanged. For changes you will make first, save a snapshot before editing:
+
+```bash
+roughdraft snapshot AGENTS.md --out AGENTS.before.md
+# Make the intended edits to AGENTS.md, then show what changed:
+roughdraft review AGENTS.md --before AGENTS.before.md
+```
+
+Snapshots preserve the file bytes exactly and refuse to overwrite an existing output. Choose a new snapshot name for each review round.
+
+Every comparison captures both versions when it starts. Later source edits do not silently change the displayed diff. If the destination changes during review, Roughdraft blocks writes. **Refresh comparison** explicitly reloads the destination, keeps choices for identical change blocks, and leaves changed blocks for another decision.
+
+A plain comparison can become a proposal through **Propose these edits**. Enter the destination explicitly; it must match the comparison's before version. That creates a separate proposal for review.
+
+Comparison commands print the URL immediately and wait for up to 30 minutes. Use `--no-open` on a headless machine, `--no-watch` to return immediately, or `--timeout SECONDS` to change the wait. A timeout is not approval. Resume with the ID from the command output:
+
+```bash
+roughdraft propose AGENTS.md --after AGENTS.proposed.md --no-open --json
+roughdraft comparison COMPARISON_ID --no-open --json
+```
+
+With `--json`, each output line is a JSON event. `comparison.opened` contains the URL and comparison ID; `comparison.completed` contains `completion.fileWritten`, the destination, the counts, and the saved review including comments. `comparison.timeout` returns exit status 1 and leaves the saved review open. A completed review that wrote no file reports `fileWritten: false`.
+
+Ordinary `roughdraft open` still saves edits directly to its opened file. Use the comparison commands when the user needs Accept/Skip or Keep/Revert decisions before a final write. Agents should reread the destination after completion, respond to saved comments, and handle any separate commit or deployment step through the source's normal workflow.
+
 ## Local development
 ```bash
 ./scripts/setup.sh

@@ -33,6 +33,7 @@ import {
   ROUGHDRAFT_FLAVORED_MARKDOWN_PATH,
   syncRequestedPathInUrl,
 } from "./app-navigation";
+import { ComparisonReview } from "./ComparisonReview";
 import { Button } from "./components/ui/button";
 import {
   Dialog,
@@ -1472,6 +1473,14 @@ export function PreviewPage() {
 }
 
 export function App() {
+  const comparisonId = new URLSearchParams(window.location.search).get(
+    "comparison",
+  );
+  if (comparisonId) return <ComparisonReview id={comparisonId} />;
+  return <DocumentApp />;
+}
+
+function DocumentApp() {
   const initialRequestedPathState = getRequestedPathState();
   const [requestedPathState] = useState(initialRequestedPathState);
   const isRoughdraftFlavoredMarkdownRoute =

@@ -11,6 +11,9 @@ importers:
       '@roughdraft/rfm':
         specifier: file:packages/rfm
         version: link:packages/rfm
+      diff:
+        specifier: 8.0.2
+        version: 8.0.2
       express:
         specifier: ^5.1.0
         version: 5.2.1
@@ -188,6 +191,9 @@ importers:
       '@roughdraft/rfm':
         specifier: workspace:*
         version: link:../rfm
+      diff:
+        specifier: 8.0.2
+        version: 8.0.2
       express:
         specifier: ^5.1.0
         version: 5.2.1
@@ -2139,8 +2145,8 @@ packages:
   dezalgo@1.0.4:
     resolution: {integrity: sha512-rXSP0bf+5n0Qonsb+SVVfNfIsimO4HEtmnIpPHY8Q1UCzKlQrDMfdobr8nJOOsRgWCyMRqeSBQzmWUMq7zvVig==}
 
-  diff@8.0.4:
-    resolution: {integrity: sha512-DPi0FmjiSU5EvQV0++GFDOJ9ASQUVFh5kD+OzOnYdi7n3Wpm9hWWGfB/O2blfHcMVTL5WkQXSnRiK9makhrcnw==}
+  diff@8.0.2:
+    resolution: {integrity: sha512-sSuxWU5j5SR9QQji/o2qMvqRNYRDOcBTgsJ/DeCf4iSN4gW+gNMXM7wFIP+fdXZxoNiAnHUTGjCr+TSWXdRDKg==}
     engines: {node: '>=0.3.1'}
 
   dotenv@17.4.2:
@@ -5298,7 +5304,7 @@ snapshots:
       asap: 2.0.6
       wrappy: 1.0.2
 
-  diff@8.0.4: {}
+  diff@8.0.2: {}
 
   dotenv@17.4.2: {}
 
@@ -6432,7 +6438,7 @@ snapshots:
       cosmiconfig: 9.0.1(typescript@5.9.3)
       dedent: 1.7.2
       deepmerge: 4.3.1
-      diff: 8.0.4
+      diff: 8.0.2
       execa: 9.6.1
       fast-glob: 3.3.3
       fs-extra: 11.3.4

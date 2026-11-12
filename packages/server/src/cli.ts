@@ -16,6 +16,12 @@ import {
   ROUGHDRAFT_PUBLIC_HOST,
 } from "./network.js";
 import { findAvailablePort } from "./ports.js";
+import {
+  COMPARISON_COMMANDS,
+  isComparisonCommand,
+  printComparisonHelp,
+  runComparisonCommand,
+} from "./comparison-cli.js";
 import { resolveUpdateStatus, type UpdateStatus } from "./update-status.js";
 
 const AGENT_SETUP_URL = "https://roughdraft.md/setup.md";
@@ -30,6 +36,7 @@ const PROCESS_WAIT_ATTEMPTS = 20;
 const PROCESS_WAIT_DELAY_MS = 150;
 const USAGE_ERROR = 2;
 const KNOWN_COMMANDS = [
+  ...COMPARISON_COMMANDS,
   "open",
   "start",
   "status",
@@ -847,6 +854,15 @@ function printHelp(log: (message: string) => void) {
   log("");
   log("Commands:");
   log("  open <path>        Open a Markdown file and wait for Done Reviewing");
+  log(
+    "  propose TARGET --after CANDIDATE  Review edits before writing the target",
+  );
+  log("  review TARGET --before SNAPSHOT  Keep or revert changes already made");
+  log(
+    "  compare BEFORE AFTER             Compare frozen versions without writing",
+  );
+  log("  comparison ID                    Resume a saved comparison review");
+  log("  snapshot FILE --out SNAPSHOT      Save an exact copy before editing");
   log("  start              Start or reuse the background server");
   log("  status             Show server status");
   log("  stop               Stop the managed background server");
@@ -880,6 +896,10 @@ function printCommandHelp(
   command: KnownCommand,
   log: (message: string) => void,
 ) {
+  if (isComparisonCommand(command)) {
+    printComparisonHelp(command, log);
+    return;
+  }
   if (command === "open") {
     log("Usage:");
     log(
@@ -2278,6 +2298,26 @@ export async function runCli(
     if (parsed.global.help) {
       printCommandHelp(command as KnownCommand, deps.log);
       return 0;
+    }
+
+    if (isComparisonCommand(command)) {
+      return runComparisonCommand(
+        command,
+        rest,
+        deps,
+        parsed.global.json,
+        async (effectiveDeps) => {
+          const frontend = await resolveLiveDevFrontendBaseUrl(effectiveDeps);
+          if (frontend?.apiUrl) {
+            return {
+              apiUrl: frontend.apiUrl,
+              frontendUrl: frontend.frontendUrl,
+            };
+          }
+          const result = await ensureServerRunning(effectiveDeps);
+          return { apiUrl: result.server.url, frontendUrl: result.server.url };
+        },
+      );
     }
 
     if (command === "criticmarkup") {
