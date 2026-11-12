@@ -439,4 +439,144 @@ describe("file comparison reviews", () => {
     expect(applied.status).toBe(200);
     expect(fs.readFileSync(target)).toEqual(Buffer.alloc(0));
   });
+
+  it("persists native comment threads separately through reload, refresh and completion", async () => {
+    const review = (await create()).body as Comparison;
+    const anchor = changes(review)[0].id;
+    const comments = [
+      {
+        id: "comment-one",
+        changeId: anchor,
+        content: "Explain this",
+        createdAt: "2026-11-11T12:00:00.000Z",
+        authorType: "user",
+        parentCommentId: anchor,
+      },
+      {
+        id: "comment-reply",
+        changeId: anchor,
+        content: "A reply",
+        createdAt: "2026-11-11T12:01:00.000Z",
+        authorType: "ai",
+        authorId: "agent",
+        parentCommentId: "comment-one",
+      },
+    ];
+    const saved = await request(api())
+      .post(`/api/comparisons/${review.id}/decisions`)
+      .send({
+        revision: review.revision,
+        reviewComments: comments,
+        decisions: [{ id: anchor, comment: "Older inline feedback" }],
+      });
+    expect(saved.status).toBe(200);
+    expect(fs.readFileSync(target, "utf8")).toBe(before);
+    const reloaded = await request(api()).get(`/api/comparisons/${review.id}`);
+    expect(reloaded.body.reviewComments).toEqual(comments);
+
+    // The original anchor disappears when another editor changes that source block.
+    const newer = before.replace("old first", "another edit");
+    fs.writeFileSync(target, newer);
+    const refreshed = await request(api())
+      .post(`/api/comparisons/${review.id}/refresh`)
+      .send({ revision: saved.body.revision });
+    expect(refreshed.status).toBe(200);
+    expect(
+      changes(refreshed.body).some((segment) => segment.id === anchor),
+    ).toBe(false);
+    expect(refreshed.body.reviewComments).toEqual(
+      expect.arrayContaining(comments),
+    );
+    expect(refreshed.body.reviewComments).toContainEqual(
+      expect.objectContaining({
+        id: `legacy:${anchor}`,
+        changeId: anchor,
+        content: "Older inline feedback",
+        scope: "document",
+      }),
+    );
+    const edited = (
+      refreshed.body.reviewComments as Comparison["reviewComments"]
+    ).map((comment) => ({
+      ...comment,
+      content: `${comment.content} updated`,
+    }));
+    const updated = await request(api())
+      .post(`/api/comparisons/${review.id}/decisions`)
+      .send({ revision: refreshed.body.revision, reviewComments: edited });
+    expect(updated.status).toBe(200);
+    const completed = await request(api())
+      .post(`/api/comparisons/${review.id}/complete`)
+      .send({ revision: updated.body.revision });
+    expect(completed.status).toBe(200);
+    const finished = await request(api()).get(`/api/comparisons/${review.id}`);
+    expect(finished.body.reviewComments).toEqual(edited);
+    expect(fs.readFileSync(target, "utf8")).toBe(newer);
+  });
+
+  it("rejects invalid or stale native comments without saving partial choices", async () => {
+    const review = (await create()).body as Comparison;
+    const anchor = changes(review)[0].id;
+    const comment = {
+      id: "comment-one",
+      changeId: anchor,
+      content: "Feedback",
+      createdAt: "2026-11-11T12:00:00.000Z",
+      parentCommentId: anchor,
+    };
+    for (const invalid of [
+      null,
+      {},
+      [{ ...comment, changeId: "missing" }],
+      [{ ...comment, content: 3 }],
+      [{ ...comment, authorType: "other" }],
+      [comment, comment],
+    ]) {
+      const rejected = await request(api())
+        .post(`/api/comparisons/${review.id}/decisions`)
+        .send({
+          revision: review.revision,
+          reviewComments: invalid,
+          decisions: [{ id: anchor, decision: "after" }],
+        });
+      expect(rejected.status).toBe(400);
+    }
+    const unchanged = await request(api()).get(`/api/comparisons/${review.id}`);
+    expect(unchanged.body.revision).toBe(review.revision);
+    expect(changes(unchanged.body)[0].decision).toBe("pending");
+    const saved = await request(api())
+      .post(`/api/comparisons/${review.id}/decisions`)
+      .send({ revision: review.revision, reviewComments: [comment] });
+    expect(saved.status).toBe(200);
+    const stale = await request(api())
+      .post(`/api/comparisons/${review.id}/decisions`)
+      .send({ revision: review.revision, reviewComments: [] });
+    expect(stale.status).toBe(409);
+    const reloaded = await request(api()).get(`/api/comparisons/${review.id}`);
+    expect(reloaded.body.reviewComments).toEqual([comment]);
+    expect(fs.readFileSync(target, "utf8")).toBe(before);
+  });
+
+  it("loads pre-threaded-review records and can save native feedback", async () => {
+    const review = (await create()).body as Comparison;
+    const filename = path.join(root, "comparisons", `${review.id}.json`);
+    const legacy = JSON.parse(fs.readFileSync(filename, "utf8"));
+    delete legacy.reviewComments;
+    fs.writeFileSync(filename, JSON.stringify(legacy));
+    const loaded = await request(api()).get(`/api/comparisons/${review.id}`);
+    expect(loaded.body.reviewComments).toEqual([]);
+    const comments = [
+      {
+        id: "new-comment",
+        changeId: changes(review)[0].id,
+        content: "Still works",
+        createdAt: new Date().toISOString(),
+      },
+    ];
+    const saved = await request(api())
+      .post(`/api/comparisons/${review.id}/decisions`)
+      .send({ revision: loaded.body.revision, reviewComments: comments });
+    expect(saved.status).toBe(200);
+    expect(saved.body.reviewComments).toEqual(comments);
+  });
 });
