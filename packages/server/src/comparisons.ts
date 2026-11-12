@@ -23,6 +23,16 @@ export interface ComparisonCompletion {
   reverted: number;
   completedAt: string;
 }
+export interface ComparisonReviewComment {
+  id: string;
+  changeId: string;
+  content: string;
+  createdAt: string;
+  authorType?: "user" | "ai";
+  authorId?: string | null;
+  parentCommentId?: string | null;
+  scope?: "document";
+}
 export interface Comparison {
   id: string;
   revision: number;
@@ -35,6 +45,7 @@ export interface Comparison {
   afterText: string;
   segments: ComparisonSegment[];
   comment: string;
+  reviewComments: ComparisonReviewComment[];
   status: "open" | "completed" | "applied";
   completion: ComparisonCompletion | null;
   targetChanged: boolean;
@@ -85,6 +96,75 @@ function objectBody(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new ComparisonError(400, "A JSON object is required");
   return value as Record<string, unknown>;
+}
+function reviewCommentsField(
+  value: unknown,
+  review: StoredComparison,
+): ComparisonReviewComment[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value))
+    throw new ComparisonError(400, "reviewComments must be an array");
+  const anchors = new Set([
+    ...review.segments
+      .filter((segment) => segment.kind === "change")
+      .map((segment) => segment.id),
+    ...review.reviewComments.map((comment) => comment.changeId),
+  ]);
+  const ids = new Set<string>();
+  return value.map((raw) => {
+    const input = objectBody(raw);
+    const id = stringField(input, "id");
+    const changeId = stringField(input, "changeId");
+    const content = stringField(input, "content");
+    const createdAt = stringField(input, "createdAt");
+    if (
+      !id ||
+      ids.has(id) ||
+      !changeId ||
+      !anchors.has(changeId) ||
+      content === undefined ||
+      !createdAt ||
+      !Number.isFinite(Date.parse(createdAt))
+    )
+      throw new ComparisonError(
+        400,
+        "Review comments need unique IDs, an existing change, content and a valid timestamp",
+      );
+    ids.add(id);
+    const { authorType, authorId, parentCommentId, scope } = input;
+    if (
+      authorType !== undefined &&
+      authorType !== "user" &&
+      authorType !== "ai"
+    )
+      throw new ComparisonError(400, "Comment authorType must be user or ai");
+    for (const key of ["authorId", "parentCommentId"])
+      if (
+        input[key] !== undefined &&
+        input[key] !== null &&
+        typeof input[key] !== "string"
+      )
+        throw new ComparisonError(
+          400,
+          `Comment ${key} must be a string or null`,
+        );
+    if (scope !== undefined && scope !== "document")
+      throw new ComparisonError(400, "Comment scope must be document");
+    return {
+      id,
+      changeId,
+      content,
+      createdAt,
+      ...(authorType !== undefined ? { authorType } : {}),
+      ...(authorId !== undefined
+        ? { authorId: authorId as string | null }
+        : {}),
+      ...(parentCommentId !== undefined
+        ? { parentCommentId: parentCommentId as string | null }
+        : {}),
+      ...(scope !== undefined ? { scope } : {}),
+    };
+  });
 }
 function snapshot(filename: string): FileSnapshot {
   try {
@@ -223,6 +303,7 @@ class ComparisonStore {
     const review = JSON.parse(
       fs.readFileSync(filename, "utf8"),
     ) as StoredComparison;
+    review.reviewComments ??= [];
     // An intent makes a retry safe if the process stopped after rename but before
     // recording completion. Never replay a write during recovery.
     if (review.pendingApply && review.targetPath) {
@@ -328,6 +409,7 @@ class ComparisonStore {
       afterText,
       segments: comparisonSegments(beforeText, afterText),
       comment: "",
+      reviewComments: [],
       status: "open",
       completion: null,
     };
@@ -392,6 +474,7 @@ class ComparisonStore {
       proposed.set(id, { decision, comment: stringField(update, "comment") });
     }
     const comment = stringField(body, "comment");
+    const reviewComments = reviewCommentsField(body.reviewComments, review);
     review.segments = review.segments.map((segment) => {
       const update = proposed.get(segment.id);
       return update
@@ -403,6 +486,7 @@ class ComparisonStore {
         : segment;
     });
     review.comment = comment ?? review.comment;
+    review.reviewComments = reviewComments ?? review.reviewComments;
     review.revision++;
     this.save(review);
     return review;
@@ -548,6 +632,24 @@ class ComparisonStore {
           : segment;
       },
     );
+    // Keep feedback even if a changed source block no longer has an anchor.
+    // The rendered view presents these threads as document feedback.
+    const surviving = new Set(review.segments.map((segment) => segment.id));
+    for (const segment of oldSegments.values()) {
+      const id = `legacy:${segment.id}`;
+      if (
+        segment.comment &&
+        !surviving.has(segment.id) &&
+        !review.reviewComments.some((comment) => comment.id === id)
+      )
+        review.reviewComments.push({
+          id,
+          changeId: segment.id,
+          content: segment.comment,
+          createdAt: new Date().toISOString(),
+          scope: "document",
+        });
+    }
     review.beforeText = beforeText;
     review.afterText = afterText;
     review.targetVersion = current.version;
