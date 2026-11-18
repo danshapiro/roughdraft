@@ -1,5 +1,15 @@
 # Roughdraft Agent Instructions
 
+## Shared application source
+
+This repository's `main` is the application source for both garageserver's local
+editor and Glowfer. Shared editor, comparison, link and endnote behavior belongs
+here. The machines repository owns local mounts, wrapper and packaging; the
+Glowfer repository owns its authorization, bot isolation, wrapper and packaging.
+Both deployments pin a tested commit from this repository. App changes need
+new deployment artifacts and each installation's documented rollout; merging
+app source alone does not update either running service.
+
 ## Testing Principles
 
 Use the repo-local `test-desiderata` skill when planning, adding, changing, or reviewing tests. Keep the core bar visible even when the skill is not loaded: tests should optimize for Kent Beck's Test Desiderata (https://testdesiderata.com/) as context-specific tradeoffs, not as a mechanical checklist.

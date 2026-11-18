@@ -1,5 +1,7 @@
+import { browserAnchorPath } from "./browser-base-path";
 import { tables, taskListItems } from "@joplin/turndown-plugin-gfm";
-import { marked } from "marked";
+import { marked, Marked } from "marked";
+import { endnoteExtension } from "./endnotes";
 import TurndownService from "turndown";
 import { parse as parseYaml } from "yaml";
 
@@ -341,7 +343,7 @@ export function createMarkedRenderer(options?: MarkdownOptions) {
         ? ' target="_blank" rel="noreferrer noopener"'
         : "";
 
-    return `<a href="${escapeHtml(renderedHref)}"${titleAttr}${markdownSrcAttr}${autolinkAttr}${externalAttr}>${text}</a>`;
+    return `<a href="${escapeHtml(browserAnchorPath(renderedHref))}"${titleAttr}${markdownSrcAttr}${autolinkAttr}${externalAttr}>${text}</a>`;
   };
 
   renderer.image = ({ href, title, text }) => {
@@ -524,6 +526,33 @@ export function createTurndownService(): TurndownService {
     },
   });
 
+  service.addRule("endnoteReference", {
+    filter: (node) => node.hasAttribute("data-endnote-ref"),
+    replacement: (_content, node) =>
+      `[^${node.getAttribute("data-endnote-ref")}]`,
+  });
+  service.addRule("endnoteDefinition", {
+    filter: (node) => node.hasAttribute("data-endnote-definition"),
+    replacement: (_content, node) => {
+      const element = node as HTMLElement;
+      const body = service
+        .turndown(element.querySelector(".endnote-body")?.innerHTML ?? "")
+        .trim();
+      const original = decodeURIComponent(
+        element.getAttribute("data-endnote-original") ?? "",
+      );
+      const raw = decodeURIComponent(
+        element.getAttribute("data-endnote-source") ?? "",
+      );
+      if (
+        raw &&
+        normalizeBlockSpacing(body) ===
+          normalizeBlockSpacing(service.turndown(original).trim())
+      )
+        return `\n\n${raw.trimEnd()}\n\n`;
+      return `\n\n[^${element.getAttribute("data-endnote-definition")}]: ${body.replaceAll("\n", "\n    ")}\n\n`;
+    },
+  });
   return service;
 }
 
@@ -550,7 +579,7 @@ export function toMarkdown(html: string): string {
 }
 
 export function toHtml(markdown: string, options?: MarkdownOptions): string {
-  return marked.parse(markdown, {
+  return new Marked(endnoteExtension()).parse(markdown, {
     async: false,
     gfm: true,
     renderer: createMarkedRenderer(options),

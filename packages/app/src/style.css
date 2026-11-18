@@ -1,7 +1,73 @@
 @import "tailwindcss";
+
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/inter";
+
+.tiptap a[href] {
+  cursor: pointer;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.tiptap a[href]:hover {
+  text-decoration-thickness: 2px;
+}
+.tiptap a[href]:focus-visible {
+  outline: 2px solid #b65e34;
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+.tiptap a[data-endnote-ref] {
+  font-size: 0.75em;
+  vertical-align: super;
+  font-weight: 600;
+  padding: 0 0.15em;
+}
+.tiptap [data-endnote-definition] {
+  display: grid;
+  grid-template-columns: 1.5rem minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  margin: 1.25rem 0;
+  padding-top: 1rem;
+  border-top: 1px solid #dcd6cc;
+  font-size: 0.9em;
+  scroll-margin-top: 6rem;
+}
+.tiptap [data-endnote-definition] p:first-child {
+  margin-top: 0;
+}
+.endnote-label {
+  color: #777;
+  font-size: 0.85em;
+}
+.endnote-backlink {
+  align-self: start;
+}
+.link-preview-card {
+  width: 22rem;
+  max-width: calc(100vw - 2rem);
+}
+.link-preview-destination {
+  overflow-wrap: anywhere;
+  color: #78716c;
+  font-size: 0.8rem;
+}
+.link-preview-excerpt {
+  margin-top: 0.75rem;
+  line-height: 1.6;
+}
+.endnote-preview-body {
+  max-height: 18rem;
+  overflow-y: auto;
+  line-height: 1.65;
+}
+.endnote-preview-body p + p {
+  margin-top: 0.6rem;
+}
+.endnote-preview-body a {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 
 @font-face {
   font-family: "Die Grotesk A";

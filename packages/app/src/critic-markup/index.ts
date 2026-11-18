@@ -8,6 +8,7 @@ import {
   type Tokens,
 } from "marked";
 import type TurndownService from "turndown";
+import { endnoteExtension } from "../endnotes";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   createEditorExtensions,
@@ -1260,6 +1261,7 @@ function createCriticMarked(
     async: false,
     renderer,
   });
+  parser.use(endnoteExtension());
 
   parser.use({
     extensions: [

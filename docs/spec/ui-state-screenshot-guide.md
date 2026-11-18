@@ -145,6 +145,35 @@ suggestions:
 | Code mode | Review rail absent | Open fenced fixture with `?editor=code` | `page-card-code`, `markdown-code-editor` | Confirms fenced CriticMarkup alone does not create review rail. |
 | Error/home fallback | Non-Markdown path | Open URL with `?path=/tmp/file.txt` | homepage error message | Copy: `Roughdraft now opens one .md file at a time.` |
 | Error/home fallback | Missing/unloadable path | Open URL with invalid markdown path through local backend | homepage error message | Captures load-error homepage variant. |
+## File Comparison States
+
+Create a record with `roughdraft propose`, `roughdraft review`, or `roughdraft compare`, then open the printed `/?comparison=<id>` URL. Comparisons use the same rendered Markdown editor, native change highlights, and suggestion/comment rail as ordinary Roughdraft files. The rendered body is read-only; decisions and comments save separately, and only the final action can write the destination. Capture both desktop and mobile.
+
+| State | Setup | Stable selectors | What to capture |
+| --- | --- | --- | --- |
+| Compact review header | Scroll a long comparison | `comparison-header`, `comparison-header-filename`, `comparison-header-state` | Full-width header stays at the page top; full destination path wraps visibly, with mode, remaining decisions, save/conflict state and one explicit primary action. A comparison without a destination shows both labeled version paths. |
+| Change navigation | Use Previous / Next in a long comparison | `comparison-previous-change`, `comparison-next-change`, `comparison-navigation-position` | Native change anchors land below the sticky header. Reviewed changes become navigable when Show reviewed changes is selected. |
+| Mobile header | Open a long path at 390px wide | `comparison-header`, `comparison-remaining`, `comparison-apply` | Full visible path wraps above compact controls, including the version selector and final action, with no page overflow. |
+| Original and selected preview | Select Before, then After | `comparison-view-before`, `comparison-view-after`, `comparison-clean-preview` | Before is frozen; After reflects current choices with pending changes using the new version. No separate Result button or inline explanation. Meanings are in tooltips. Reading column and heading spacing remain stable. |
+| Version round trips | Read a changed/deleted passage and cycle Before / Diff / After in normal motion | `comparison-view-before`, `comparison-view-diff`, `comparison-view-after` | No transient flash to the top. Returning restores the original passage even if it was absent in another view. The top stays at zero; x/width and unchanged title y remain stable. Actual reader scrolling selects a new passage. Drafts survive. |
+| Literal Markdown comparison | Click Markdown in each version view | `comparison-formatted`, `comparison-view-selector` | Literal Markdown syntax in a monospace read-only document, with the same native change highlights and review controls. Formatted returns to rendered headings/lists. Both controls preserve the reading passage; neither saves choices or writes source. |
+| Proposed changes, undecided | Create proposal | `comparison-mode`, `document-review-rail`, `comparison-apply` | Native suggestion cards with Accept / Skip; disabled Apply until every source change is decided; destination and save explanation. |
+| Proposed changes, mixed choices | Accept one and Skip another | `comment-rail-<id>-action-accept`, `comment-rail-<id>-action-reject`, `comparison-save-status` | Resolved choices display their selected content. Show reviewed changes reveals the original native highlights/cards so choices can be revised; Apply names the count and destination. |
+| Changes already made | Create applied review | `comparison-mode`, `document-review-rail` | Keep / Revert labels and explicit final Revert action. |
+| Comparison only | Compare two versions | `comparison-propose`, `comparison-complete` | Rendered versions with native highlights and feedback threads, without approval buttons or destination; Finish comparison cannot write either version. |
+| Choose proposal destination | Click Propose these edits | `comparison-convert`, `comparison-convert-target` | Absolute path entry and explanation that conversion does not write the file. |
+| Destination conflict | Modify destination externally | `comparison-header-state`, `comparison-conflict`, `comparison-refresh` | Preserved choices, blocked Apply, explicit refresh explanation. |
+| Refreshed comparison | Click Refresh comparison | `comparison-refresh-notice` | New current version and undecided changes requiring a fresh decision. |
+| Review save failed | Interrupt API during a choice | `comparison-error`, `comparison-retry` | Local choices remain visible; retry is explicit. |
+| Completed review | Apply or finish without applying | `comparison-outcome` | Distinguishes a saved destination from “No file was written.” |
+| Rendered document | Compare formatted Markdown versions | `page-card-rich-text`, `rich-text-editor` | Real headings, lists, bold text, links, tables and code; native additions/deletions in context. |
+| Reviewed choices | Decide a native suggestion, then click Show reviewed changes | `comparison-show-reviewed`, `suggestion-status-<id>` | Selected content by default, original change and saved status when shown again. |
+| Linked Markdown changes | Compare several changes in one list/table | `comparison-linked-notice`, `suggestion-status-<id>` | One native group with an explicit linked count; prior mixed choices stay preserved until another action. |
+| Native feedback | Reply to a suggestion and edit a reply | `comment-rail-<id>-action-reply`, `comment-rail-<id>-editor` | Full native comment threads, separately saved, including legacy feedback and resolved changes. |
+| Detached feedback | Refresh after the original source change disappears | `document-review-rail`, `comment-rail-<id>-action-reply` | Historical feedback remains visible as a document thread; editing and nested replies remain usable. |
+| Mobile comparison | Open at 390px wide | `document-review-rail`, `comment-rail-<id>-action-accept` | Native cards and comment actions flow below the document and remain usable. |
+| Identical versions | Compare identical source | `comparison-identical` | No-change explanation, disabled write action. |
+
 ## Playwright Capture Skeleton
 ```ts
 import { chromium, devices } from "playwright";
@@ -183,6 +212,13 @@ These are real product states, but they are awkward to capture deterministically
 
 The most reliable long-term solution is a dedicated screenshot harness route or Playwright component harness that renders `DocumentWorkspace` with controlled backend, disk, remote, watcher, and save states. Keep the production-route screenshots for broad layout coverage and use the harness for rare operational states.
 ## Maintenance Checklist
+
+The shared editor also needs desktop and narrow-screen captures of document
+link hover/focus previews (destination, excerpt and Open link), website link
+previews, formatted multiline endnote previews, repeated references and their
+jump/return controls. Capture these in Editing, Suggesting and Viewing, plus
+Before/Diff/After comparison views. Use only disposable fixture documents.
+
 - Add a row when a new route, dialog, popover, banner, editor mode, or empty/error state ships.
   
 - Add or update a fixture when a new Markdown/Roughdraft Format feature changes rendering.

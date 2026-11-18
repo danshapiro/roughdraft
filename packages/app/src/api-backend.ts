@@ -1,3 +1,4 @@
+import { browserPath } from "./browser-base-path";
 import {
   type BackendInfo,
   type CompleteReviewOptions,
@@ -27,7 +28,7 @@ export class ApiBackend implements StorageBackend {
   }
 
   private buildUrl(route: string, params?: Record<string, string>): string {
-    const url = new URL(route, window.location.origin);
+    const url = new URL(browserPath(route), window.location.origin);
     const projectPath = this.info.projectPath?.trim();
 
     if (projectPath) {
@@ -53,6 +54,17 @@ export class ApiBackend implements StorageBackend {
       );
     }
     return res.json();
+  }
+
+  async getMarkdownFileAtPath(absolutePath: string): Promise<Page> {
+    const normalized = absolutePath.replace(/\\/g, "/");
+    const split = normalized.lastIndexOf("/");
+    if (split < 0) return this.getMarkdownFile(normalized);
+    const reader = new ApiBackend({
+      ...this.info,
+      projectPath: normalized.slice(0, split) || "/",
+    });
+    return reader.getMarkdownFile(normalized.slice(split + 1));
   }
 
   async saveMarkdownFile(
@@ -183,7 +195,8 @@ export class ApiBackend implements StorageBackend {
     });
 
     if (!res.ok) throw new Error(`Failed to save asset: ${res.status}`);
-    return res.json();
+    const asset = (await res.json()) as StoredAsset;
+    return { ...asset, previewUrl: browserPath(asset.previewUrl) };
   }
 
   resolveFileUrl(path: string): string | null {
