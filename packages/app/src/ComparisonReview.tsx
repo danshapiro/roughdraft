@@ -1,7 +1,11 @@
+import { browserPath } from "./browser-base-path";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiBackend } from "./api-backend";
-import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
+import {
+  buildLocationForLinkedMarkdownDocument,
+  getPathLeaf,
+} from "./app-navigation";
 import {
   buildComparisonDocument,
   buildComparisonPreviewDocument,
@@ -39,7 +43,9 @@ class ComparisonError extends Error {
 
 async function requestComparison(id: string, action?: string, body?: unknown) {
   const response = await fetch(
-    `/api/comparisons/${encodeURIComponent(id)}${action ? `/${action}` : ""}`,
+    browserPath(
+      `/api/comparisons/${encodeURIComponent(id)}${action ? `/${action}` : ""}`,
+    ),
     body === undefined
       ? undefined
       : {
@@ -115,7 +121,7 @@ function NativeComparisonDocument({
         resolveLinkUrl: (href) =>
           buildLocationForLinkedMarkdownDocument({
             projectPath: backend.info.projectPath,
-            currentDocumentPath: contextPath,
+            currentDocumentPath: getPathLeaf(contextPath),
             href,
           }),
       }) satisfies Parameters<typeof buildComparisonDocument>[1],
@@ -523,7 +529,9 @@ export function ComparisonReview({ id }: { id: string }) {
         ...(action === "convert" ? { targetPath: destination } : {}),
       });
       if (action === "convert") {
-        window.location.assign(`/?comparison=${encodeURIComponent(next.id)}`);
+        window.location.assign(
+          browserPath(`/?comparison=${encodeURIComponent(next.id)}`),
+        );
         return;
       }
       savedRef.current = next;

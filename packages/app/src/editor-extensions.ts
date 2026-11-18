@@ -1,4 +1,4 @@
-import { Extension, Mark, Node, mergeAttributes } from "@tiptap/core";
+import { Extension, Mark, mergeAttributes, Node } from "@tiptap/core";
 import Code from "@tiptap/extension-code";
 import CodeBlock from "@tiptap/extension-code-block";
 import Image from "@tiptap/extension-image";
@@ -17,6 +17,8 @@ import type {
 import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
+import { browserAnchorPath } from "./browser-base-path";
+import { noteId } from "./endnotes";
 import { rawMarkdownBlockAttribute } from "./markdown";
 
 declare module "@tiptap/core" {
@@ -767,6 +769,145 @@ const RawMarkdownBlock = Node.create({
   },
 });
 
+const EndnoteReference = Node.create({
+  name: "endnoteReference",
+  group: "inline",
+  inline: true,
+  atom: true,
+  addAttributes() {
+    return Object.fromEntries(
+      [
+        ["label", "data-endnote-ref"],
+        ["number", "data-endnote-number"],
+        ["occurrence", "data-endnote-occurrence"],
+      ].map(([key, attr]) => [
+        key,
+        {
+          default: key === "label" ? "" : 1,
+          parseHTML: (element: HTMLElement) => element.getAttribute(attr),
+          renderHTML: (attrs: Record<string, string>) => ({
+            [attr]: attrs[key],
+          }),
+        },
+      ]),
+    );
+  },
+  parseHTML() {
+    return [{ tag: "a[data-endnote-ref]", priority: 1100 }];
+  },
+  renderHTML({ node, HTMLAttributes }) {
+    const { label, number, occurrence } = node.attrs;
+    return [
+      "a",
+      mergeAttributes(HTMLAttributes, {
+        id: `${noteId(label)}-ref-${occurrence}`,
+        href: browserAnchorPath(`#${noteId(label)}`),
+        "aria-label": `Endnote ${number}`,
+        tabindex: "0",
+        contenteditable: "false",
+      }),
+      String(number),
+    ];
+  },
+});
+
+const EndnoteDefinition = Node.create({
+  name: "endnoteDefinition",
+  group: "block",
+  content: "block+",
+  defining: true,
+  addAttributes() {
+    return Object.fromEntries(
+      [
+        ["label", "data-endnote-definition"],
+        ["number", "data-endnote-number"],
+        ["source", "data-endnote-source"],
+        ["original", "data-endnote-original"],
+      ].map(([key, attr]) => [
+        key,
+        {
+          default: "",
+          parseHTML: (element: HTMLElement) => element.getAttribute(attr),
+          renderHTML: (attrs: Record<string, string>) => ({
+            [attr]: attrs[key],
+          }),
+        },
+      ]),
+    );
+  },
+  parseHTML() {
+    return [
+      {
+        tag: "div[data-endnote-definition]",
+        contentElement: ".endnote-body",
+        priority: 1100,
+      },
+    ];
+  },
+  renderHTML({ node, HTMLAttributes }) {
+    const { label, number } = node.attrs;
+    return [
+      "div",
+      mergeAttributes(HTMLAttributes, {
+        id: noteId(label),
+        role: "doc-endnote",
+      }),
+      [
+        "span",
+        { class: "endnote-label", contenteditable: "false" },
+        `${number}.`,
+      ],
+      ["div", { class: "endnote-body" }, 0],
+      [
+        "a",
+        {
+          href: browserAnchorPath(`#${noteId(label)}-ref-1`),
+          class: "endnote-backlink",
+          "aria-label": `Back to reference ${number}`,
+          tabindex: "0",
+          contenteditable: "false",
+        },
+        "↩",
+      ],
+    ];
+  },
+});
+
+// Decorations keep generated reading targets outside the saved document and
+// inside ProseMirror's DOM ownership, including silent comparison replacements.
+const HeadingTargets = Extension.create({
+  name: "headingTargets",
+  addProseMirrorPlugins() {
+    return [
+      new Plugin({
+        props: {
+          decorations(state) {
+            const used = new Set<string>();
+            const decorations: Decoration[] = [];
+            state.doc.descendants((node, pos) => {
+              if (node.type.name !== "heading") return;
+              const slug =
+                node.textContent
+                  .toLowerCase()
+                  .trim()
+                  .replace(/[^\p{L}\p{N}\s_-]/gu, "")
+                  .replace(/\s+/g, "-") || "section";
+              let id = slug;
+              let suffix = 1;
+              while (used.has(id)) id = `${slug}-${suffix++}`;
+              used.add(id);
+              decorations.push(
+                Decoration.node(pos, pos + node.nodeSize, { id }),
+              );
+            });
+            return DecorationSet.create(state.doc, decorations);
+          },
+        },
+      }),
+    ];
+  },
+});
+
 // Display projections share a source-block identity even when their layout differs.
 const ComparisonReadingAnchor = Extension.create({
   name: "comparisonReadingAnchor",
@@ -817,6 +958,7 @@ export function createEditorExtensions(placeholder: string) {
       autolink: true,
       openOnClick: false,
       linkOnPaste: true,
+      HTMLAttributes: { target: null, tabindex: "0" },
     }),
     MarkdownCode,
     Table.configure({
@@ -833,6 +975,9 @@ export function createEditorExtensions(placeholder: string) {
     CommentRef,
     CriticChange,
     RawMarkdownBlock,
+    EndnoteReference,
+    EndnoteDefinition,
+    HeadingTargets,
     MarkdownCodeBlock,
     CommentHighlight,
     CriticChangeHighlight,

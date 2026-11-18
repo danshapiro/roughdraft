@@ -1,5 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
-import { marked } from "marked";
+import { type marked, Marked } from "marked";
+import { endnoteExtension, noteKey } from "./endnotes";
 import type {
   ComparisonDecision,
   ComparisonReviewData,
@@ -33,6 +34,8 @@ interface Snapshot {
   boundaries: Set<number>;
   metadata: { from: number; to: number }[];
   references: string;
+  endnotes: string;
+  endnoteNumbers: Map<string, number>;
 }
 
 interface UnitPart {
@@ -93,7 +96,14 @@ function snapshot(text: string): Snapshot {
   const { normalized, offsets } = normalizeWithOffsets(
     text.slice(bodyStart, bodyEnd),
   );
-  const tokens = marked.lexer(normalized);
+  const endnoteNumbers = new Map<string, number>();
+  const tokens = new Marked(endnoteExtension(endnoteNumbers)).lexer(normalized);
+  for (const token of tokens) {
+    if (token.type !== "endnoteDefinition") continue;
+    const key = noteKey(token.label as string);
+    if (!endnoteNumbers.has(key))
+      endnoteNumbers.set(key, endnoteNumbers.size + 1);
+  }
   let cursor = 0;
   for (const token of tokens) {
     // Marked omits reference definitions from its token array. Locate each
@@ -119,6 +129,11 @@ function snapshot(text: string): Snapshot {
     boundaries,
     metadata,
     references: referenceDefinitions(tokens.links),
+    endnotes: tokens
+      .filter((token) => token.type === "endnoteDefinition")
+      .map((token) => token.raw)
+      .join("\n"),
+    endnoteNumbers,
   };
 }
 
@@ -202,18 +217,42 @@ function parseBody(
 ): JSONContent[] {
   if (!source.trim()) return [];
   const parsed = criticMarkdownToEditorState(
-    `${CONTEXT_PREFIX}${source}\n\n${context.references}\n`,
+    `${CONTEXT_PREFIX}${source}\n\n${context.references}\n\n\uE000endnote-context\uE001\n\n${context.endnotes}\n`,
     options,
   );
   for (const [id, comment] of parsed.comments) comments.set(id, comment);
-  const content = (parsed.doc.content?.slice(1) ?? []).filter(
+  const projected = parsed.doc.content?.slice(1) ?? [];
+  const contextStart = projected.findIndex(
+    (node) =>
+      node.type === "paragraph" &&
+      node.content?.some(
+        (child) => child.text === "\uE000endnote-context\uE001",
+      ),
+  );
+  const content = (
+    contextStart < 0 ? projected : projected.slice(0, contextStart)
+  ).filter(
     (node) => node.type !== "paragraph" || Boolean(node.content?.length),
   );
+  const numberEndnotes = (node: JSONContent): JSONContent => ({
+    ...node,
+    ...(["endnoteReference", "endnoteDefinition"].includes(node.type ?? "")
+      ? {
+          attrs: {
+            ...node.attrs,
+            number:
+              context.endnoteNumbers.get(noteKey(node.attrs?.label ?? "")) ??
+              node.attrs?.number,
+          },
+        }
+      : {}),
+    ...(node.content ? { content: node.content.map(numberEndnotes) } : {}),
+  });
   // Reference definitions and whitespace are real source changes but have no
   // rendered prose. Keep their decision visible without turning ordinary
   // Markdown hunks into source-code panels.
   return content.length || !showInvisible
-    ? content
+    ? content.map(numberEndnotes)
     : [codeBlock(source, "text")];
 }
 
@@ -277,13 +316,30 @@ function nodeSize(node: JSONContent): number {
     node.type === "image" ||
     node.type === "horizontalRule" ||
     node.type === "hardBreak" ||
-    node.type === "rawMarkdownBlock"
+    node.type === "rawMarkdownBlock" ||
+    node.type === "endnoteReference"
   )
     return 1;
   return (
     2 +
     (node.content ?? []).reduce((total, child) => total + nodeSize(child), 0)
   );
+}
+
+// Each display unit is parsed separately. Reference IDs must still be unique
+// across the composed document, including both visible sides of a change.
+function uniqueEndnoteReferences(content: JSONContent[]): JSONContent[] {
+  const occurrences = new Map<string, number>();
+  const visit = (node: JSONContent): JSONContent => {
+    if (node.type === "endnoteReference") {
+      const key = noteKey(node.attrs?.label ?? "");
+      const occurrence = (occurrences.get(key) ?? 0) + 1;
+      occurrences.set(key, occurrence);
+      return { ...node, attrs: { ...node.attrs, occurrence } };
+    }
+    return node.content ? { ...node, content: node.content.map(visit) } : node;
+  };
+  return content.map(visit);
 }
 
 function plainText(content: JSONContent[]): string {
@@ -383,7 +439,9 @@ export function buildComparisonPreviewDocument(
   });
   return {
     type: "doc",
-    content: content.length ? content : [{ type: "paragraph" }],
+    content: content.length
+      ? uniqueEndnoteReferences(content)
+      : [{ type: "paragraph" }],
   };
 }
 
@@ -657,7 +715,9 @@ export function buildComparisonDocument(
   return {
     doc: {
       type: "doc",
-      content: content.length ? content : [{ type: "paragraph" }],
+      content: content.length
+        ? uniqueEndnoteReferences(content)
+        : [{ type: "paragraph" }],
     },
     groups,
     suggestions,

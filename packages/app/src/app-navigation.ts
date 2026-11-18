@@ -1,3 +1,5 @@
+import { browserPath, browserRoutePath } from "./browser-base-path";
+
 interface RequestedPathState {
   rawPath: string | null;
   projectPath: string | null;
@@ -25,7 +27,7 @@ function getRawPathFromLocation(): string | null {
   const queryPath = searchParams.get("path")?.trim();
   if (queryPath) return queryPath;
 
-  const normalizedPathname = normalizePathSeparators(window.location.pathname);
+  const normalizedPathname = normalizePathSeparators(browserRoutePath());
   if (isReservedAppPath(normalizedPathname)) return null;
 
   if (normalizedPathname !== "/" && !normalizedPathname.startsWith("/api")) {
@@ -159,7 +161,7 @@ export function buildLocationForLinkedMarkdownDocument({
   const targetPath = decodeURI(targetUrl.pathname);
   const url = new URL(window.location.href);
 
-  url.pathname = "/";
+  url.pathname = browserPath("/");
   url.search = "";
   url.searchParams.set("path", targetPath);
   url.hash = linkedPath.hash;
@@ -173,15 +175,17 @@ function buildLocationForPath(path?: string | null) {
 
   if (nextPath) {
     if (!nextPath.startsWith("/") && !nextPath.includes("\\")) {
-      url.pathname = nextPath.startsWith("/") ? nextPath : `/${nextPath}`;
+      url.pathname = browserPath(
+        nextPath.startsWith("/") ? nextPath : `/${nextPath}`,
+      );
       url.searchParams.delete("path");
     } else {
-      url.pathname = "/";
+      url.pathname = browserPath("/");
       url.searchParams.set("path", nextPath);
     }
   } else {
     url.searchParams.delete("path");
-    url.pathname = "/";
+    url.pathname = browserPath("/");
   }
 
   return `${url.pathname}${url.search}${url.hash}`;

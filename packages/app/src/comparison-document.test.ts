@@ -206,6 +206,47 @@ describe("precise rendered differences", () => {
 });
 
 describe("rendered comparison document", () => {
+  it("renders globally numbered endnotes across separate display units without duplicating definitions", () => {
+    const input = review([
+      { before: "# Notes\n\nFirst[^second].\n\n" },
+      { before: "Old[^first].\n\n", after: "New[^first].\n\n" },
+      {
+        before:
+          "Again[^second].\n\n[^first]: The **first** definition.\n\n[^second]: The second definition.\n",
+      },
+    ]);
+    const frozen = JSON.stringify(input);
+    for (const doc of [
+      buildComparisonDocument(input).doc,
+      buildComparisonPreviewDocument(input),
+    ]) {
+      const element = document.createElement("div");
+      element.innerHTML = html(doc);
+      const refs = Array.from(element.querySelectorAll("[data-endnote-ref]")); // selector-check-ignore: semantic rendered endnote output is the behavior under test.
+      expect(refs.length).toBeGreaterThanOrEqual(3);
+      expect(
+        refs
+          .filter((node) => node.getAttribute("data-endnote-ref") === "second")
+          .map((node) => node.textContent),
+      ).toEqual(["1", "1"]);
+      expect(
+        refs
+          .filter((node) => node.getAttribute("data-endnote-ref") === "first")
+          .every((node) => node.textContent === "2"),
+      ).toBe(true);
+      expect(new Set(refs.map((node) => node.id)).size).toBe(refs.length);
+      expect(
+        element.querySelectorAll("[data-endnote-definition]"), // selector-check-ignore: semantic rendered endnote output is the behavior under test.
+      ).toHaveLength(2);
+      expect(
+        element.querySelector('[data-endnote-definition="first"] strong') // selector-check-ignore: semantic rendered endnote output is the behavior under test.
+          ?.textContent,
+      ).toBe("first");
+      expect(element.textContent).not.toContain("endnote-context");
+    }
+    expect(JSON.stringify(input)).toBe(frozen);
+  });
+
   it("uses native headings, paragraphs and change marks with persisted IDs", () => {
     const input = review([
       { before: "# Instructions\n\n" },

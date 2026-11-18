@@ -1,5 +1,5 @@
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ReviewEventQueue } from "./review-events";
 
 function eventInput(documentPath = "/tmp/project/draft.md") {
@@ -18,6 +18,78 @@ function eventInput(documentPath = "/tmp/project/draft.md") {
 }
 
 describe("ReviewEventQueue", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does not register a cancelled watcher or consume retained completion", async () => {
+    const queue = new ReviewEventQueue();
+    const emitted = queue.emit(eventInput());
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(queue.wait({ signal: controller.signal })).resolves.toEqual({
+      timedOut: true,
+      events: [],
+      nextSequence: 2,
+    });
+
+    expect(queue.waiterCount()).toBe(0);
+    await expect(queue.wait()).resolves.toMatchObject({
+      timedOut: false,
+      events: [emitted.event],
+    });
+  });
+
+  it("releases a disconnected watcher without waiting for its timeout", async () => {
+    const queue = new ReviewEventQueue();
+    const controller = new AbortController();
+    const waiting = queue.wait({ signal: controller.signal });
+    expect(queue.waiterCount()).toBe(1);
+
+    controller.abort();
+
+    await expect(waiting).resolves.toMatchObject({
+      timedOut: true,
+      events: [],
+    });
+    expect(queue.waiterCount()).toBe(0);
+    expect(queue.waiterCountForDocument(eventInput().documentPath)).toBe(0);
+    const emitted = queue.emit(eventInput());
+    expect(emitted.delivered).toBe(false);
+    await expect(queue.wait()).resolves.toMatchObject({
+      timedOut: false,
+      events: [emitted.event],
+    });
+  });
+
+  it("cancels a pending event batch without losing the retained event", async () => {
+    vi.useFakeTimers();
+    const queue = new ReviewEventQueue();
+    const controller = new AbortController();
+    const waiting = queue.wait({
+      signal: controller.signal,
+      timeoutMs: 1_000,
+      batchWindowMs: 50,
+    });
+    const emitted = queue.emit(eventInput());
+    expect(emitted.delivered).toBe(true);
+
+    controller.abort();
+    await vi.runAllTimersAsync();
+
+    await expect(waiting).resolves.toMatchObject({
+      timedOut: true,
+      events: [],
+    });
+    expect(queue.waiterCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await expect(queue.wait()).resolves.toMatchObject({
+      timedOut: false,
+      events: [emitted.event],
+    });
+  });
+
   it("queues events in creation order", async () => {
     const queue = new ReviewEventQueue();
 

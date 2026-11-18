@@ -307,7 +307,7 @@ describe("file comparison reviews", () => {
     );
     expect(fs.readFileSync(target, "utf8")).toBe(before);
   });
-  it("keeps the mounted inode on EBUSY and truncates replaced contents without changing mode", async () => {
+  it("rejects EBUSY atomic publication without altering the mounted original", async () => {
     const review = (await create("proposal", { afterText: "# Short" }))
       .body as Comparison;
     const selected = await request(api())
@@ -331,8 +331,8 @@ describe("file comparison reviews", () => {
     const applied = await request(api())
       .post(`/api/comparisons/${review.id}/apply`)
       .send({ revision: selected.body.revision });
-    expect(applied.status).toBe(200);
-    expect(fs.readFileSync(target, "utf8")).toBe("# Short");
+    expect(applied.status).toBe(500);
+    expect(fs.readFileSync(target, "utf8")).toBe(before);
     expect(fs.statSync(target).ino).toBe(inode);
     expect(fs.statSync(target).mode & 0o777).toBe(0o640);
   });

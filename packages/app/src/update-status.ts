@@ -1,3 +1,5 @@
+import { browserPath } from "./browser-base-path";
+
 export interface UpdateStatus {
   packageName: string;
   currentVersion: string | null;
@@ -8,7 +10,7 @@ export interface UpdateStatus {
 
 export async function fetchUpdateStatus(): Promise<UpdateStatus | null> {
   try {
-    const response = await fetch("/api/update-status");
+    const response = await fetch(browserPath("/api/update-status"));
     if (!response.ok) return null;
 
     const payload = (await response.json()) as Partial<UpdateStatus>;

@@ -1,4 +1,9 @@
 import {
+  browserPath,
+  browserRoutePath,
+  browserNavigationUrl,
+} from "./browser-base-path";
+import {
   ArrowLeft,
   Braces,
   Check,
@@ -498,7 +503,7 @@ export function Homepage({
         <div className="mt-10 w-screen max-w-none -translate-x-6 overflow-hidden border-y border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-[0_20px_60px_rgba(15,23,42,0.12)] dark:shadow-[0_20px_60px_rgba(0,0,0,0.4)] min-[1000px]:mx-auto min-[1000px]:w-full min-[1000px]:max-w-[1500px] min-[1000px]:translate-x-0 min-[1000px]:rounded-lg min-[1000px]:border">
           <img
             data-testid="homepage-sneak-peek-image"
-            src="/sneak-peek.png"
+            src={browserPath("/sneak-peek.png")}
             alt="Roughdraft markdown review workspace"
             className="block aspect-[1728/1117] w-full object-cover"
           />
@@ -1160,7 +1165,7 @@ export function RoughdraftFlavoredMarkdownPage() {
           nativeButton={false}
           variant="ghost"
           render={
-            <a href="/">
+            <a href={browserPath("/")}>
               <ArrowLeft className="size-4" aria-hidden="true" />
               Back to Roughdraft
             </a>
@@ -1205,7 +1210,7 @@ export function RoughdraftFlavoredMarkdownPage() {
             ({ description, href, title }) => (
               <a
                 className="group rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-5 shadow-[0_10px_30px_rgba(15,23,42,0.05)] dark:shadow-[0_10px_30px_rgba(0,0,0,0.3)] transition hover:border-slate-300 dark:hover:border-slate-600 hover:shadow-[0_14px_34px_rgba(15,23,42,0.08)] dark:hover:shadow-[0_14px_34px_rgba(0,0,0,0.4)]"
-                href={href}
+                href={href.startsWith("/") ? browserPath(href) : href}
                 key={title}
                 target="_blank"
                 rel="noreferrer"
@@ -1487,8 +1492,8 @@ function DocumentApp() {
   const initialRequestedPathState = getRequestedPathState();
   const [requestedPathState] = useState(initialRequestedPathState);
   const isRoughdraftFlavoredMarkdownRoute =
-    window.location.pathname === ROUGHDRAFT_FLAVORED_MARKDOWN_PATH;
-  const isPreviewRoute = window.location.pathname === PREVIEW_PATH;
+    browserRoutePath() === ROUGHDRAFT_FLAVORED_MARKDOWN_PATH;
+  const isPreviewRoute = browserRoutePath() === PREVIEW_PATH;
   const [backend, setBackend] = useState<StorageBackend | null>(null);
   const [documentPage, setDocumentPage] = useState<Page | null>(null);
   const [activeDocumentPath, setActiveDocumentPath] = useState<string | null>(
@@ -1554,7 +1559,10 @@ function DocumentApp() {
   }, []);
 
   useEffect(() => {
-    const sourceUrl = new URL("/api/open-requests", window.location.origin);
+    const sourceUrl = new URL(
+      browserPath("/api/open-requests"),
+      window.location.origin,
+    );
     if (requestedPathState.rawPath) {
       sourceUrl.searchParams.set("path", requestedPathState.rawPath);
     }
@@ -1567,7 +1575,7 @@ function DocumentApp() {
         };
         if (typeof payload.url !== "string" || !payload.url.trim()) return;
 
-        const nextUrl = new URL(payload.url, window.location.origin);
+        const nextUrl = new URL(browserNavigationUrl(payload.url));
         window.focus();
         if (nextUrl.href !== window.location.href) {
           window.location.assign(nextUrl.href);

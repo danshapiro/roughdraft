@@ -1,3 +1,4 @@
+import { browserPath } from "./browser-base-path";
 import type { StorageBackend } from "./storage";
 import { ApiBackend } from "./api-backend";
 import { LocalStorageBackend } from "./local-storage-backend";
@@ -21,7 +22,7 @@ export async function detectBackend(): Promise<StorageBackend> {
   let statusPayload: StatusPayload | null = null;
 
   try {
-    const res = await fetch("/api/status");
+    const res = await fetch(browserPath("/api/status"));
     if (res.ok) {
       statusPayload = (await res.json()) as StatusPayload;
     }

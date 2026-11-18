@@ -212,6 +212,13 @@ These are real product states, but they are awkward to capture deterministically
 
 The most reliable long-term solution is a dedicated screenshot harness route or Playwright component harness that renders `DocumentWorkspace` with controlled backend, disk, remote, watcher, and save states. Keep the production-route screenshots for broad layout coverage and use the harness for rare operational states.
 ## Maintenance Checklist
+
+The shared editor also needs desktop and narrow-screen captures of document
+link hover/focus previews (destination, excerpt and Open link), website link
+previews, formatted multiline endnote previews, repeated references and their
+jump/return controls. Capture these in Editing, Suggesting and Viewing, plus
+Before/Diff/After comparison views. Use only disposable fixture documents.
+
 - Add a row when a new route, dialog, popover, banner, editor mode, or empty/error state ships.
   
 - Add or update a fixture when a new Markdown/Roughdraft Format feature changes rendering.

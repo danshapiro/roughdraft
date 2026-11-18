@@ -47,6 +47,7 @@ import {
 } from "./editor-extensions";
 import { cn } from "./lib/utils";
 import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
+import { LinkAffordances } from "./LinkAffordances";
 import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
 import { toHtml } from "./markdown";
 import type { Page, StorageBackend } from "./storage";
@@ -120,6 +121,7 @@ interface RichTextEditorSurfaceProps {
   onEditorReady?: (editor: Editor | null) => void;
   onCommentRailPresenceChange?: (hasCommentRailSpace: boolean) => void;
   controlledReview?: ControlledDocumentReview;
+  beforeNavigate?: () => Promise<boolean>;
 }
 
 interface CodeEditorSurfaceProps {
@@ -626,6 +628,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   onEditorReady,
   onCommentRailPresenceChange,
   controlledReview,
+  beforeNavigate,
 }: RichTextEditorSurfaceProps) {
   const editorRef = useRef<Editor | null>(null);
   const controlledReviewRef = useRef(controlledReview);
@@ -1291,10 +1294,29 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           return true;
         },
       },
-      onUpdate: ({ editor: currentEditor }) => {
+      onUpdate: ({ editor: currentEditor, transaction }) => {
         if (controlledReviewRef.current) return;
         if (suppressNextMarkdownUpdateRef.current) {
           suppressNextMarkdownUpdateRef.current = false;
+          return;
+        }
+
+        const before = transaction.before;
+        const after = currentEditor.state.doc;
+        const trailing = after.lastChild;
+        // StarterKit adds an empty typing paragraph after an endnote, table or
+        // other final block. This reading-only normalization must not serialize
+        // the source; actual edits still pass through the ordinary save path.
+        if (
+          before.eq(after) ||
+          (after.childCount === before.childCount + 1 &&
+            trailing?.type.name === "paragraph" &&
+            trailing.content.size === 0 &&
+            after.content
+              .cut(0, after.content.size - trailing.nodeSize)
+              .eq(before.content))
+        ) {
+          refreshCriticChanges();
           return;
         }
 
@@ -2274,7 +2296,13 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
                 }
               >
                 <div data-testid="rich-text-editor">
-                  <EditorContent editor={editor} />
+                  <LinkAffordances
+                    editor={editor}
+                    backend={backend}
+                    beforeNavigate={beforeNavigate}
+                  >
+                    <EditorContent editor={editor} />
+                  </LinkAffordances>
                 </div>
               </EditorContextMenu>
             </div>
@@ -2688,6 +2716,7 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       focusRequestKey={focusRequestKey}
       sourceMarkdown={effectiveRichTextSourceMarkdown}
       onMarkdownChange={handleMarkdownChange}
+      beforeNavigate={async () => (await flushSave()).status === "saved"}
       interactionMode={interactionMode}
       onCommentRailPresenceChange={onCommentRailPresenceChange}
       backend={backend}

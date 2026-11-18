@@ -7,6 +7,7 @@ export default defineConfig(() => {
   const apiPort = parseInt(process.env.API_PORT || "3001", 10);
 
   return {
+    base: "./",
     plugins: [tailwindcss(), react()],
     resolve: {
       alias: {

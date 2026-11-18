@@ -2,6 +2,7 @@ import type { JSONContent } from "@tiptap/core";
 import { diffArrays } from "diff";
 import type { ControlledReviewBlockHighlight } from "./controlled-review";
 import type { CriticChangeAttrs, CriticChangeKind } from "./critic-markup";
+import { noteKey } from "./endnotes";
 
 export interface RenderedComparisonDifference {
   content: JSONContent[];
@@ -23,12 +24,14 @@ const POSITIONAL_CHILDREN = new Set([
   "tableCell",
   "tableHeader",
   "blockquote",
+  "endnoteDefinition",
 ]);
 const ATOMS = new Set([
   "image",
   "horizontalRule",
   "hardBreak",
   "rawMarkdownBlock",
+  "endnoteReference",
 ]);
 const TABLE_PARTS = new Set(["table", "tableRow", "tableCell", "tableHeader"]);
 
@@ -52,6 +55,22 @@ function semanticMarks(node: JSONContent) {
     .sort();
 }
 
+function semanticAttributes(node: JSONContent) {
+  if (node.type === "endnoteDefinition") {
+    const {
+      source: _source,
+      original: _original,
+      ...attributes
+    } = node.attrs ?? {};
+    return attributes;
+  }
+  if (node.type === "endnoteReference") {
+    const { occurrence: _occurrence, ...attributes } = node.attrs ?? {};
+    return attributes;
+  }
+  return node.attrs ?? {};
+}
+
 function tableStructure(node: JSONContent): unknown {
   return {
     type: node.type,
@@ -70,6 +89,8 @@ function visibleText(node: JSONContent): string {
   if (node.type === "horizontalRule") return "Horizontal rule";
   if (node.type === "hardBreak") return "\n";
   if (node.type === "rawMarkdownBlock") return "Markdown block";
+  if (node.type === "endnoteReference")
+    return `Endnote ${node.attrs?.number ?? node.attrs?.label ?? ""}`;
   return (node.content ?? [])
     .map(visibleText)
     .join(TEXT_BLOCKS.has(node.type ?? "") ? "" : "\n");
@@ -166,7 +187,7 @@ export function diffRenderedComparison(
     if (key === undefined) {
       key = canonical({
         type: node.type,
-        attrs: node.attrs ?? {},
+        attrs: semanticAttributes(node),
         text: node.text,
         marks: semanticMarks(node),
         content: (node.content ?? []).map(semanticKey),
@@ -253,6 +274,10 @@ export function diffRenderedComparison(
       left.type === "text"
     )
       return false;
+    if (left.type === "endnoteDefinition")
+      return (
+        noteKey(left.attrs?.label ?? "") === noteKey(right.attrs?.label ?? "")
+      );
     if (
       left.type === "heading" &&
       canonical(left.attrs) !== canonical(right.attrs)
@@ -359,16 +384,18 @@ export function diffRenderedComparison(
             next.type ?? "",
           ),
     };
-    if (canonical(previous.attrs ?? {}) !== canonical(next.attrs ?? {})) {
+    const previousAttributes = semanticAttributes(previous);
+    const nextAttributes = semanticAttributes(next);
+    if (canonical(previousAttributes) !== canonical(nextAttributes)) {
       changed = true;
       const keys = [
         ...new Set([
-          ...Object.keys(previous.attrs ?? {}),
-          ...Object.keys(next.attrs ?? {}),
+          ...Object.keys(previousAttributes),
+          ...Object.keys(nextAttributes),
         ]),
       ].filter(
         (key) =>
-          canonical(previous.attrs?.[key]) !== canonical(next.attrs?.[key]),
+          canonical(previousAttributes[key]) !== canonical(nextAttributes[key]),
       );
       const describe = (node: JSONContent) =>
         `${node.type} attributes: ${keys.map((key) => `${key}=${canonical(node.attrs?.[key])}`).join(", ")}`;

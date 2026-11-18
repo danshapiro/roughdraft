@@ -1,3 +1,4 @@
+import { browserPath } from "./browser-base-path";
 import { ArrowRight } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import { Button } from "./components/ui/button";
@@ -128,7 +129,7 @@ export function RoughdraftFormatDemo() {
             , to support full comment threads, and suggesting changes. Read the{" "}
             <a
               className="font-bold text-slate-950 underline decoration-slate-300 underline-offset-4 hover:decoration-slate-950 dark:text-slate-50 dark:decoration-slate-600 dark:hover:decoration-slate-50"
-              href="/roughdraft-flavored-markdown"
+              href={browserPath("/roughdraft-flavored-markdown")}
             >
               spec
             </a>

@@ -8,7 +8,12 @@ import {
   appendRoughdraftDocumentComment,
   extractRoughdraftReviewIndex,
 } from "@roughdraft/rfm";
-import express, { type Express, type Request, type Response } from "express";
+import express, {
+  type Express,
+  type Request,
+  type Response,
+  type NextFunction,
+} from "express";
 import {
   hasNonLoopbackHost,
   ROUGHDRAFT_DEFAULT_PORT,
@@ -16,6 +21,7 @@ import {
   resolveBindHosts,
 } from "./network.js";
 import { ReviewEventQueue } from "./review-events.js";
+import { atomicWrite, FileChangedError } from "./atomic-write.js";
 import { comparisonRouter } from "./comparisons.js";
 import { resolveUpdateStatus } from "./update-status.js";
 
@@ -61,6 +67,9 @@ interface ProjectTreeListing {
 interface CreateAppOptions {
   port?: number;
   projectDir?: string;
+  assetRoot?: string;
+  browserBasePath?: string | ((request: Request) => string);
+  allowFileBindMountWrites?: boolean;
   serverRoot?: string;
   homeDir?: string;
   staticDirPath?: string;
@@ -228,6 +237,37 @@ function ensureProjectPath(
   }
 
   return absolute;
+}
+
+function assetPathWithinRoot(
+  projectDir: string,
+  relativePath: string,
+  assetRoot?: string,
+): string | null {
+  if (!assetRoot) return ensureProjectPath(projectDir, relativePath);
+
+  const root = path.resolve(assetRoot);
+  const absolute = path.resolve(projectDir, relativePath.replace(/^\.?\//, ""));
+  const contains = (base: string, target: string) => {
+    const relative = path.relative(base, target);
+    return (
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative)
+    );
+  };
+  if (!contains(root, absolute)) return null;
+
+  try {
+    const realRoot = fs.realpathSync(root);
+    const realAsset = fs.realpathSync(absolute);
+    if (!contains(realRoot, realAsset) || !fs.statSync(realAsset).isFile()) {
+      return null;
+    }
+    return realAsset;
+  } catch {
+    return null;
+  }
 }
 
 function pageFilePathFromId(projectDir: string, id: string): string | null {
@@ -460,6 +500,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       options.comparisonsDir ??
         process.env.ROUGHDRAFT_COMPARISONS_DIR ??
         path.join(homeDir, ".roughdraft", "comparisons"),
+      { allowFileBindMountWrites: options.allowFileBindMountWrites },
     ),
   );
 
@@ -661,6 +702,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
+    const currentVersion = fileVersionFromFile(target.absolutePath);
     const markdown = fs.readFileSync(target.absolutePath, "utf-8");
     const persistedMarkdown = overallComment
       ? appendRoughdraftDocumentComment(markdown, {
@@ -669,7 +711,13 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         })
       : markdown;
     if (persistedMarkdown !== markdown) {
-      fs.writeFileSync(target.absolutePath, persistedMarkdown);
+      atomicWrite(target.absolutePath, persistedMarkdown, {
+        allowBusyFallback: options.allowFileBindMountWrites,
+        beforePublish: () => {
+          if (fileVersionFromFile(target.absolutePath) !== currentVersion)
+            throw new FileChangedError();
+        },
+      });
     }
 
     const index = extractRoughdraftReviewIndex(persistedMarkdown);
@@ -701,15 +749,23 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const afterSequence =
       typeof req.body?.afterSequence === "number" ? req.body.afterSequence : 0;
 
-    const result = await reviewEvents.wait({
-      documentPath: target.absolutePath,
-      afterSequence: fromNow ? reviewEvents.latestSequence() : afterSequence,
-      timeoutMs:
-        timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined,
-      batchWindowMs: batchWindowSeconds * 1000,
-    });
-
-    res.json(result);
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    res.once("close", cancel);
+    if (res.destroyed) cancel();
+    try {
+      const result = await reviewEvents.wait({
+        documentPath: target.absolutePath,
+        afterSequence: fromNow ? reviewEvents.latestSequence() : afterSequence,
+        timeoutMs:
+          timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined,
+        batchWindowMs: batchWindowSeconds * 1000,
+        signal: controller.signal,
+      });
+      if (!controller.signal.aborted) res.json(result);
+    } finally {
+      res.off("close", cancel);
+    }
   });
 
   app.get("/api/review-events/status", (req, res) => {
@@ -739,7 +795,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
     const { content } = req.body as { content: string };
-    fs.writeFileSync(filePath, content);
+    atomicWrite(filePath, content, {
+      allowBusyFallback: options.allowFileBindMountWrites,
+    });
     res.json({ id, title: titleFromContent(content, id), content });
   });
 
@@ -775,7 +833,22 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
-    fs.writeFileSync(absolutePath, content);
+    try {
+      atomicWrite(absolutePath, content, {
+        allowBusyFallback: options.allowFileBindMountWrites,
+        beforePublish: () => {
+          if (fileVersionFromFile(absolutePath) !== currentVersion)
+            throw new FileChangedError();
+        },
+      });
+    } catch (error) {
+      if (!(error instanceof FileChangedError)) throw error;
+      res.status(409).json({
+        error: "Markdown file changed on disk",
+        current: markdownPageFromFile(relativePath, absolutePath),
+      });
+      return;
+    }
     res.json(markdownPageFromFile(relativePath, absolutePath));
   });
 
@@ -790,7 +863,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const id = nextUntitledId(projectDir);
     const content = bodyContent || `# ${title || "Untitled"}\n`;
     const filePath = path.join(projectDir, `${id}.md`);
-    fs.writeFileSync(filePath, content);
+    atomicWrite(filePath, content, {
+      allowBusyFallback: options.allowFileBindMountWrites,
+    });
 
     res.status(201).json(markdownPageFromFile(`${id}.md`, filePath));
   });
@@ -1198,7 +1273,11 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
 
     const relativePath =
       typeof req.query.path === "string" ? req.query.path : "";
-    const absolutePath = ensureProjectPath(projectDir, relativePath);
+    const absolutePath = assetPathWithinRoot(
+      projectDir,
+      relativePath,
+      options.assetRoot,
+    );
 
     if (!absolutePath || !fs.existsSync(absolutePath)) {
       res.status(404).json({ error: "File not found" });
@@ -1229,7 +1308,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
 
     const buffer = Buffer.from(payload.dataBase64, "base64");
     fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-    fs.writeFileSync(absolutePath, buffer);
+    atomicWrite(absolutePath, buffer, {
+      allowBusyFallback: options.allowFileBindMountWrites,
+    });
 
     res.status(201).json({
       markdownPath: `./${relativePath}`,
@@ -1240,11 +1321,37 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
 
   // --- Static files & SPA fallback ---
 
-  app.use(express.static(staticDirPath));
-
-  app.get("/{*splat}", (_req, res) => {
-    res.sendFile(path.join(staticDirPath, "index.html"));
-  });
+  const sendIndex = (req: Request, res: Response, next: NextFunction) => {
+    const configured =
+      typeof options.browserBasePath === "function"
+        ? options.browserBasePath(req)
+        : (options.browserBasePath ?? "/");
+    if (
+      !configured.startsWith("/") ||
+      configured.startsWith("//") ||
+      /[\\"'<>?#\s]/.test(configured)
+    ) {
+      next(new Error("Browser base path must be an absolute URL path"));
+      return;
+    }
+    const base = configured.endsWith("/") ? configured : `${configured}/`;
+    fs.readFile(
+      path.join(staticDirPath, "index.html"),
+      "utf8",
+      (error, html) => {
+        if (error) {
+          next(error);
+          return;
+        }
+        res
+          .type("html")
+          .send(html.replace(/<head>/i, `<head><base href="${base}">`));
+      },
+    );
+  };
+  app.get(["/", "/index.html"], sendIndex);
+  app.use(express.static(staticDirPath, { index: false }));
+  app.get("/{*splat}", sendIndex);
 
   return { app, port };
 }
@@ -1273,6 +1380,8 @@ export async function createServer(
   const { app } = createApp({
     port,
     projectDir,
+    allowFileBindMountWrites:
+      process.env.ROUGHDRAFT_ALLOW_FILE_BIND_MOUNT_WRITES === "1",
     remoteDocumentToken:
       remoteDocumentToken.length > 0 ? remoteDocumentToken : undefined,
   });

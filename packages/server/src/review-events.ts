@@ -26,6 +26,7 @@ export interface WaitForReviewEventsOptions {
   afterSequence?: number;
   timeoutMs?: number;
   batchWindowMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface WaitForReviewEventsResult {
@@ -39,13 +40,14 @@ interface Waiter {
   resolve: (result: WaitForReviewEventsResult) => void;
   timeout: NodeJS.Timeout | null;
   batchTimeout: NodeJS.Timeout | null;
+  cancelListener: (() => void) | null;
 }
 
 const DEFAULT_BATCH_WINDOW_MS = 250;
 const MAX_RETAINED_EVENTS = 100;
 
 type NormalizedWaitOptions = Required<
-  Omit<WaitForReviewEventsOptions, "documentPath" | "timeoutMs">
+  Omit<WaitForReviewEventsOptions, "documentPath" | "timeoutMs" | "signal">
 > & {
   documentPath?: string;
   timeoutMs?: number;
@@ -93,6 +95,9 @@ export class ReviewEventQueue {
     options: WaitForReviewEventsOptions = {},
   ): Promise<WaitForReviewEventsResult> {
     const normalized = normalizeWaitOptions(options);
+    if (options.signal?.aborted) {
+      return Promise.resolve(resultForEvents([], true, this.nextSequence));
+    }
     const existing = this.matchingEvents(normalized);
 
     if (existing.length > 0) {
@@ -106,6 +111,7 @@ export class ReviewEventQueue {
         options: normalized,
         resolve,
         batchTimeout: null,
+        cancelListener: null,
         timeout:
           normalized.timeoutMs !== undefined
             ? setTimeout(() => {
@@ -115,6 +121,13 @@ export class ReviewEventQueue {
       };
 
       this.waiters.add(waiter);
+      if (options.signal) {
+        const cancel = () => this.resolveWaiter(waiter, true);
+        options.signal.addEventListener("abort", cancel, { once: true });
+        waiter.cancelListener = () =>
+          options.signal?.removeEventListener("abort", cancel);
+        if (options.signal.aborted) cancel();
+      }
       appendSlog("review-events.wait", {
         documentPath: normalized.documentPath ?? null,
         afterSequence: normalized.afterSequence,
@@ -161,6 +174,7 @@ export class ReviewEventQueue {
     if (!this.waiters.has(waiter)) return;
 
     this.waiters.delete(waiter);
+    waiter.cancelListener?.();
     if (waiter.timeout) {
       clearTimeout(waiter.timeout);
     }

@@ -1,3 +1,4 @@
+import { browserPath } from "./browser-base-path";
 import {
   MarkdownFileConflictError,
   type BackendInfo,
@@ -41,7 +42,7 @@ export class RemoteBackend implements StorageBackend {
     const headers: Record<string, string> =
       token.length > 0 ? { Authorization: `Bearer ${token}` } : {};
     const response = await fetch(
-      `/api/remote-document/${encodeURIComponent(sessionId)}`,
+      browserPath(`/api/remote-document/${encodeURIComponent(sessionId)}`),
       { headers },
     );
     if (!response.ok) {
@@ -101,7 +102,7 @@ export class RemoteBackend implements StorageBackend {
       throw new Error("Remote backend missing session id");
     }
     const response = await fetch(
-      `/api/remote-document/${encodeURIComponent(sessionId)}`,
+      browserPath(`/api/remote-document/${encodeURIComponent(sessionId)}`),
       { headers: this.authHeaders() },
     );
     if (!response.ok) {
@@ -124,7 +125,7 @@ export class RemoteBackend implements StorageBackend {
       throw new Error("Remote backend missing session id");
     }
     const response = await fetch(
-      `/api/remote-document/${encodeURIComponent(sessionId)}`,
+      browserPath(`/api/remote-document/${encodeURIComponent(sessionId)}`),
       {
         method: "PUT",
         headers: {
@@ -171,7 +172,9 @@ export class RemoteBackend implements StorageBackend {
     // parameter. The server accepts both `Authorization: Bearer` and ?token=
     // for the SSE endpoint specifically.
     const eventsUrl = new URL(
-      `/api/remote-document/${encodeURIComponent(sessionId)}/events`,
+      browserPath(
+        `/api/remote-document/${encodeURIComponent(sessionId)}/events`,
+      ),
       window.location.origin,
     );
     eventsUrl.searchParams.set("role", "viewer");

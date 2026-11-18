@@ -2,6 +2,7 @@ import { getSchema, type JSONContent } from "@tiptap/core";
 import { TableMap } from "@tiptap/pm/tables";
 import { describe, expect, it } from "vitest";
 import { createEditorExtensions } from "./editor-extensions";
+import { criticMarkdownToEditorState } from "./critic-markup";
 import { diffRenderedComparison } from "./rendered-comparison-diff";
 
 const change = {
@@ -58,6 +59,137 @@ function table(cellType = "tableHeader", cellAttrs = {}): JSONContent {
 }
 
 describe("native rendered structure alignment", () => {
+  it("measures note references as inline atoms when highlighting later inserted content", () => {
+    const reference: JSONContent = {
+      type: "endnoteReference",
+      attrs: { label: "source", number: 1, occurrence: 1 },
+    };
+    const before: JSONContent = {
+      type: "paragraph",
+      content: [
+        { type: "text", text: "See" },
+        reference,
+        { type: "text", text: " context" },
+      ],
+    };
+    const after: JSONContent = {
+      ...before,
+      content: [
+        { type: "text", text: "See" },
+        reference,
+        { type: "hardBreak" },
+        { type: "text", text: " context" },
+      ],
+    };
+    const result = diffRenderedComparison([before], [after], change);
+    const doc = validDocument(result.content);
+    const breakPosition: number[] = [];
+    doc.descendants((node, position) => {
+      if (node.type.name === "hardBreak") breakPosition.push(position);
+    });
+    expect(result.blockHighlights).toEqual([
+      {
+        from: breakPosition[0],
+        to: breakPosition[0] + 1,
+        kind: "addition",
+        changeId: change.changeId,
+      },
+    ]);
+  });
+
+  it("describes changed note references and preserves their separate identity", () => {
+    const previous: JSONContent = {
+      type: "paragraph",
+      content: [
+        { type: "text", text: "See" },
+        {
+          type: "endnoteReference",
+          attrs: { label: "old", number: 1, occurrence: 1 },
+        },
+      ],
+    };
+    const next: JSONContent = {
+      type: "paragraph",
+      content: [
+        { type: "text", text: "See" },
+        {
+          type: "endnoteReference",
+          attrs: { label: "new", number: 2, occurrence: 1 },
+        },
+      ],
+    };
+    const result = diffRenderedComparison([previous], [next], change);
+    expect(
+      nodes(result.content)
+        .filter((node) => node.type === "endnoteReference")
+        .map((node) => node.attrs?.label),
+    ).toEqual(["old", "new"]);
+    expect(result.oldText).toContain("Endnote 1");
+    expect(result.newText).toContain("Endnote 2");
+    const doc = validDocument(result.content);
+    for (const highlight of result.blockHighlights)
+      expect(doc.nodeAt(highlight.from)?.type.name).toBe("endnoteReference");
+  });
+
+  it("diffs note-body prose without exposing serialized rendering metadata", () => {
+    const parse = (word: string) =>
+      criticMarkdownToEditorState(
+        `Text[^source].\n\n[^source]: The ${word} note.\n`,
+      ).doc.content ?? [];
+    const result = diffRenderedComparison(parse("old"), parse("new"), change);
+    expect(markedText(result.content)).toEqual(["old", "new"]);
+    expect(result.oldText).toBe("old");
+    expect(result.newText).toBe("new");
+    expect(
+      nodes(result.content).filter((node) => node.type === "endnoteDefinition"),
+    ).toHaveLength(1);
+    validDocument(result.content);
+  });
+
+  it("keeps one definition per label when replacing all of its prose", () => {
+    const parse = (label: string, body: string) =>
+      criticMarkdownToEditorState(`[^${label}]: ${body}\n`).doc.content ?? [];
+    const result = diffRenderedComparison(
+      parse("source", "Almonds bananas cherries."),
+      parse("source", "Doors windows roofs."),
+      change,
+    );
+    expect(
+      nodes(result.content).filter((node) => node.type === "endnoteDefinition"),
+    ).toHaveLength(1);
+    const projection = (excluded: string[]) =>
+      nodes(result.content)
+        .filter(
+          (node) =>
+            node.type === "text" &&
+            !node.marks?.some(
+              (mark) =>
+                mark.type === "criticChange" &&
+                excluded.includes(mark.attrs?.kind),
+            ),
+        )
+        .map((node) => node.text)
+        .join("");
+    expect(projection(["addition", "substitution-new"])).toBe(
+      "Almonds bananas cherries.",
+    );
+    expect(projection(["deletion", "substitution-old"])).toBe(
+      "Doors windows roofs.",
+    );
+    validDocument(result.content);
+    const relabeled = diffRenderedComparison(
+      parse("old", "Same note."),
+      parse("new", "Same note."),
+      change,
+    );
+    expect(
+      nodes(relabeled.content)
+        .filter((node) => node.type === "endnoteDefinition")
+        .map((node) => node.attrs?.label),
+    ).toEqual(["old", "new"]);
+    validDocument(relabeled.content);
+  });
+
   it("merges a changed paragraph when another paragraph is inserted beside it", () => {
     const result = diffRenderedComparison(
       [paragraph("Please read old guidance before starting.")],

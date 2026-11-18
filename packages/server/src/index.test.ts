@@ -46,6 +46,34 @@ describe("createApp", () => {
     expect(fs.readFileSync(filePath, "utf-8")).toBe("# Draft\n");
   });
 
+  it("serves built HTML with a per-request browser base for reverse proxies", async () => {
+    fs.writeFileSync(
+      path.join(projectDir, "index.html"),
+      '<!doctype html><html><head></head><body><script src="./assets/app.js"></script></body></html>',
+    );
+    fs.mkdirSync(path.join(projectDir, "assets"));
+    fs.writeFileSync(
+      path.join(projectDir, "assets/app.js"),
+      "window.loaded = true;",
+    );
+    const { app } = createApp({
+      homeDir,
+      staticDirPath: projectDir,
+      browserBasePath: (req) => req.get("x-forwarded-prefix") ?? "/",
+    });
+    for (const route of ["/", "/index.html", "/notes/draft.md"]) {
+      const response = await request(app)
+        .get(route)
+        .set("x-forwarded-prefix", "/editors/alice/");
+      expect(response.status).toBe(200);
+      expect(response.text).toContain('<base href="/editors/alice/">');
+    }
+    expect((await request(app).get("/assets/app.js")).text).toBe(
+      "window.loaded = true;",
+    );
+    expect((await request(app).get("/")).text).toContain('<base href="/">');
+  });
+
   it("reads nested markdown files inside the project", async () => {
     const nestedDir = path.join(projectDir, "notes");
     fs.mkdirSync(nestedDir, { recursive: true });

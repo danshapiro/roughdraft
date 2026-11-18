@@ -53,6 +53,8 @@ export interface StorageBackend {
   info: BackendInfo;
   canManageProjects: boolean;
   getMarkdownFile(relativePath: string): Promise<Page>;
+  /** Read a linked file without switching the active document's project. */
+  getMarkdownFileAtPath?(absolutePath: string): Promise<Page>;
   saveMarkdownFile(
     relativePath: string,
     content: string,

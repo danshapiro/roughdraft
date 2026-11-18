@@ -3,6 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { diffLines } from "diff";
 import { Router, type Request, type Response } from "express";
+import {
+  atomicWrite,
+  syncDirectory,
+  syncExistingFile,
+} from "./atomic-write.js";
 
 export type ComparisonMode = "proposal" | "applied" | "compare";
 export type ComparisonDecision = "pending" | "before" | "after";
@@ -193,46 +198,6 @@ function snapshot(filename: string): FileSnapshot {
     );
   }
 }
-function atomicWrite(
-  filename: string,
-  text: string,
-  mode = 0o600,
-  beforeRename?: () => void,
-  allowBusyFallback = false,
-): void {
-  const temporary = path.join(
-    path.dirname(filename),
-    `.${path.basename(filename)}.${crypto.randomUUID()}.tmp`,
-  );
-  try {
-    fs.writeFileSync(temporary, text, { encoding: "utf8", mode, flag: "wx" });
-    fs.chmodSync(temporary, mode);
-    beforeRename?.();
-    try {
-      fs.renameSync(temporary, filename);
-    } catch (error) {
-      // Linux cannot rename over an individual file bind mount. Recheck the
-      // destination before the only supported non-atomic write path.
-      if (
-        !allowBusyFallback ||
-        (error as NodeJS.ErrnoException).code !== "EBUSY"
-      )
-        throw error;
-      beforeRename?.();
-      const descriptor = fs.openSync(filename, "r+");
-      try {
-        fs.writeFileSync(descriptor, text, "utf8");
-        // r+ retains the mounted inode; truncate old tails on that same inode.
-        fs.ftruncateSync(descriptor, Buffer.byteLength(text, "utf8"));
-      } finally {
-        fs.closeSync(descriptor);
-      }
-      log("bind-mount-write", { targetPath: filename, nonAtomic: true });
-    }
-  } finally {
-    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
-  }
-}
 export function comparisonSegments(
   before: string,
   after: string,
@@ -286,14 +251,31 @@ export function comparisonSegments(
 }
 
 class ComparisonStore {
-  constructor(private directory: string) {}
+  constructor(
+    private directory: string,
+    private options: { allowFileBindMountWrites?: boolean } = {},
+  ) {}
   private filename(id: string): string {
     if (!/^[a-f0-9-]{36}$/.test(id))
       throw new ComparisonError(404, "Comparison not found");
     return path.join(this.directory, `${id}.json`);
   }
   private save(review: StoredComparison): void {
-    fs.mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    const firstCreated = fs.mkdirSync(this.directory, {
+      recursive: true,
+      mode: 0o700,
+    });
+    if (firstCreated) {
+      const existingParent = path.dirname(path.resolve(firstCreated));
+      for (
+        let directory = path.resolve(this.directory);
+        ;
+        directory = path.dirname(directory)
+      ) {
+        syncDirectory(directory);
+        if (directory === existingParent) break;
+      }
+    }
     atomicWrite(this.filename(review.id), `${JSON.stringify(review)}\n`);
   }
   load(id: string): StoredComparison {
@@ -316,16 +298,19 @@ class ComparisonStore {
         /* Missing/changed destinations stay open and conflicted. */
       }
       if (wroteExpectedOutput) {
+        syncExistingFile(review.targetPath);
         review.status = "applied";
         review.completion = review.pendingApply.completion;
         review.revision++;
-        log("recovered", {
-          id: review.id,
-          fileWritten: review.completion.fileWritten,
-        });
       }
       delete review.pendingApply;
       this.save(review);
+      if (wroteExpectedOutput) {
+        log("recovered", {
+          id: review.id,
+          fileWritten: review.completion?.fileWritten,
+        });
+      }
     }
     return review;
   }
@@ -552,21 +537,15 @@ class ComparisonStore {
     if (completion.fileWritten) {
       review.pendingApply = { outputHash: hash(output), completion };
       this.save(review);
-      try {
-        atomicWrite(
-          current.path,
-          output,
-          current.mode,
-          () => {
-            this.destination(review);
-          },
-          true,
-        );
-      } catch (error) {
-        delete review.pendingApply;
-        this.save(review);
-        throw error;
-      }
+      // The intent is durable before publication. Preserve it on failure:
+      // recovery inspects the destination and never replays an uncertain write.
+      atomicWrite(current.path, output, {
+        mode: current.mode,
+        allowBusyFallback: this.options.allowFileBindMountWrites,
+        beforePublish: () => {
+          this.destination(review);
+        },
+      });
     }
     delete review.pendingApply;
     review.status = "applied";
@@ -686,9 +665,12 @@ class ComparisonStore {
   }
 }
 
-export function comparisonRouter(directory: string): Router {
+export function comparisonRouter(
+  directory: string,
+  options: { allowFileBindMountWrites?: boolean } = {},
+): Router {
   const router = Router();
-  const store = new ComparisonStore(directory);
+  const store = new ComparisonStore(directory, options);
   const handle =
     (action: (request: Request, response: Response) => void) =>
     (req: Request, res: Response) => {
