@@ -1,4 +1,5 @@
 import { generateHTML, generateJSON, type JSONContent } from "@tiptap/core";
+import { extractRoughdraftReviewIndex } from "@roughdraft/rfm";
 import {
   Marked,
   type RendererThis,
@@ -12,6 +13,7 @@ import { endnoteExtension } from "../endnotes";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   createEditorExtensions,
+  readCriticBlockChange,
   type CriticChangeAttrs,
   type CriticChangeKind,
 } from "../editor-extensions";
@@ -57,10 +59,12 @@ interface CriticStandaloneCommentToken {
 }
 
 interface CriticChangeToken {
-  type: "criticChange";
+  type: "criticChange" | "criticBlockChange";
   raw: string;
   change: CriticChangeAttrs;
   commentIds: string[];
+  prefix?: string;
+  suffix?: string;
   tokens?: Token[];
   oldTokens?: Token[];
   newTokens?: Token[];
@@ -798,6 +802,7 @@ function tokenizeCriticChange(
   existingChanges: Iterable<Pick<CriticChangeAttrs, "changeId">>,
   existingComments: Iterable<Pick<CriticComment, "id">>,
   endmatter?: ParsedEndmatter,
+  block = false,
 ):
   | {
       token: CriticChangeToken;
@@ -827,7 +832,7 @@ function tokenizeCriticChange(
         raw: additionMatch[0] + metadata.raw + trailingComments.raw,
         change,
         commentIds: trailingComments.comments.map((comment) => comment.id),
-        tokens: lexer.inlineTokens(text),
+        tokens: block ? lexer.blockTokens(text) : lexer.inlineTokens(text),
       },
       comments: trailingComments.comments,
     };
@@ -856,7 +861,7 @@ function tokenizeCriticChange(
         raw: deletionMatch[0] + metadata.raw + trailingComments.raw,
         change,
         commentIds: trailingComments.comments.map((comment) => comment.id),
-        tokens: lexer.inlineTokens(text),
+        tokens: block ? lexer.blockTokens(text) : lexer.inlineTokens(text),
       },
       comments: trailingComments.comments,
     };
@@ -888,8 +893,12 @@ function tokenizeCriticChange(
         raw: substitutionMatch[0] + metadata.raw + trailingComments.raw,
         change,
         commentIds: trailingComments.comments.map((comment) => comment.id),
-        oldTokens: lexer.inlineTokens(oldText),
-        newTokens: lexer.inlineTokens(newText),
+        oldTokens: block
+          ? lexer.blockTokens(oldText)
+          : lexer.inlineTokens(oldText),
+        newTokens: block
+          ? lexer.blockTokens(newText)
+          : lexer.inlineTokens(newText),
       },
       comments: trailingComments.comments,
     };
@@ -1005,6 +1014,21 @@ function renderCriticCodeBlock(
   return `<pre><code${classAttr}>${content}</code></pre>\n`;
 }
 
+function commentBelongsToChange(
+  id: string,
+  changeId: string,
+  comments: Map<string, CriticComment>,
+) {
+  const visited = new Set<string>();
+  let parent: string | null | undefined = id;
+  while (parent && !visited.has(parent)) {
+    if (parent === changeId) return true;
+    visited.add(parent);
+    parent = comments.get(parent)?.parentCommentId;
+  }
+  return false;
+}
+
 function addCriticCommentRule(
   service: TurndownService,
   comments: Map<string, CriticComment>,
@@ -1027,6 +1051,23 @@ function addCriticCommentRule(
         commentIds = JSON.parse(commentIdsText) as string[];
       } catch {
         return content;
+      }
+
+      const block = (node as HTMLElement).closest<HTMLElement>(
+        "[data-critic-block]",
+      );
+      const owner = block ? readCriticBlockChange(block) : null;
+      if (owner && block) {
+        // Suggestion replies belong to the owning block, not each marked text
+        // fragment. Independent comments inside that block retain their anchor.
+        const attached = getElementCommentIds(block);
+        commentIds = commentIds.filter(
+          (id) =>
+            !attached.includes(id) &&
+            !commentBelongsToChange(id, owner.changeId, comments),
+        );
+        if (commentIds.length === 0) return content;
+        return `{==${content}==}${serializeCommentBlocks(commentIds, comments, useEndmatter)}`;
       }
 
       const criticChangeElement = (node as HTMLElement).querySelector(
@@ -1088,6 +1129,8 @@ function addCriticCodeBlockRule(service: TurndownService) {
 }
 
 function getElementChangeAttrs(element: HTMLElement): CriticChangeAttrs | null {
+  const blockChange = readCriticBlockChange(element);
+  if (blockChange) return blockChange;
   const kind = element.getAttribute("data-critic-change-kind");
   const changeId = element.getAttribute("data-critic-change-id");
   const createdAt = element.getAttribute("data-critic-change-at");
@@ -1120,11 +1163,9 @@ function isPairedSubstitutionElement(
   kind: CriticChangeKind,
   changeId: string,
 ) {
-  return (
-    element instanceof HTMLElement &&
-    element.getAttribute("data-critic-change-kind") === kind &&
-    element.getAttribute("data-critic-change-id") === changeId
-  );
+  if (!(element instanceof HTMLElement)) return false;
+  const change = getElementChangeAttrs(element);
+  return change?.kind === kind && change.changeId === changeId;
 }
 
 function getElementCommentIds(element: HTMLElement): string[] {
@@ -1211,7 +1252,7 @@ function serializeCriticChangeElement(
       change.changeId,
     )
   ) {
-    const replacement = service.turndown(nextElement.innerHTML).trim();
+    const replacement = service.turndown(nextElement).trim();
     return `{~~${content}~>${replacement}~~}${metadata}${commentBlocks}`;
   }
 
@@ -1236,6 +1277,14 @@ function addCriticChangeRule(
       (node as HTMLElement).hasAttribute("data-critic-change-kind"),
     replacement(content, node) {
       const element = node as HTMLElement;
+      const block = element.closest<HTMLElement>("[data-critic-block]");
+      if (
+        block &&
+        readCriticBlockChange(block)?.changeId ===
+          getElementChangeAttrs(element)?.changeId
+      ) {
+        return content;
+      }
       return serializeCriticChangeElement(
         service,
         element,
@@ -1246,6 +1295,104 @@ function addCriticChangeRule(
       );
     },
   });
+  service.addRule("criticBlockChange", {
+    filter: (node) =>
+      node.nodeName === "DIV" &&
+      (node as HTMLElement).hasAttribute("data-critic-block"),
+    replacement(content, node) {
+      const element = node as HTMLElement;
+      const owner = getElementChangeAttrs(element);
+      const replyIds = [
+        ...element.querySelectorAll<HTMLElement>("[data-comment-ids]"),
+      ]
+        .flatMap(getElementCommentIds)
+        .filter(
+          (id) => owner && commentBelongsToChange(id, owner.changeId, comments),
+        );
+      const serialized = serializeCriticChangeElement(
+        service,
+        element,
+        content.trim(),
+        comments,
+        replyIds,
+        useEndmatter,
+      );
+      if (!serialized) return "";
+      const next = isPairedSubstitutionElement(
+        element.nextElementSibling,
+        "substitution-new",
+        getElementChangeAttrs(element)?.changeId ?? "",
+      )
+        ? element.nextElementSibling?.nextElementSibling
+        : element.nextElementSibling;
+      const prefix = element.previousElementSibling?.hasAttribute(
+        "data-critic-boundary",
+      )
+        ? ""
+        : "\n\n";
+      const suffix = next?.hasAttribute("data-critic-boundary") ? "" : "\n\n";
+      return prefix + serialized + suffix;
+    },
+  });
+  service.addRule("criticChangeBoundary", {
+    filter: (node) =>
+      node.nodeName === "DIV" &&
+      (node as HTMLElement).hasAttribute("data-critic-boundary"),
+    replacement(content, node) {
+      const { source, side } = JSON.parse(
+        (node as HTMLElement).getAttribute("data-critic-boundary") ?? "{}",
+      );
+      const boundaryContent = content.trim();
+      const leading = source?.match(/^\s*/)?.[0] ?? "";
+      const trailing = source?.match(/\s*$/)?.[0] ?? "";
+      return (
+        (side === "prefix" ? "\n\n" : "") +
+        leading +
+        boundaryContent +
+        trailing +
+        (side === "suffix" ? "\n\n" : "")
+      );
+    },
+  });
+}
+
+function isMultilineChange(src: string): boolean {
+  const match =
+    src.match(criticAdditionPattern) ??
+    src.match(criticDeletionPattern) ??
+    src.match(criticSubstitutionPattern);
+  return Boolean(match?.slice(1).some((text) => text?.includes("\n")));
+}
+
+function markBlockChangeContent(
+  node: JSONContent,
+  inherited?: CriticChangeAttrs,
+  parentType?: string,
+): JSONContent {
+  const change =
+    node.type === "criticChangeBlock"
+      ? (node.attrs?.change as CriticChangeAttrs)
+      : inherited;
+  return {
+    ...node,
+    ...(node.type === "text" && change && parentType !== "codeBlock"
+      ? {
+          marks: [
+            ...(node.marks ?? []).filter(
+              (mark) => mark.type !== "criticChange",
+            ),
+            { type: "criticChange", attrs: change },
+          ],
+        }
+      : {}),
+    ...(node.content
+      ? {
+          content: node.content.map((child) =>
+            markBlockChangeContent(child, change, node.type),
+          ),
+        }
+      : {}),
+  };
 }
 
 function createCriticMarked(
@@ -1265,6 +1412,71 @@ function createCriticMarked(
 
   parser.use({
     extensions: [
+      {
+        name: "criticBlockChange",
+        level: "block",
+        tokenizer(this: TokenizerThis, src: string) {
+          let offset = 0;
+          if (!isMultilineChange(src)) {
+            // Only the current paragraph can introduce a partial selection.
+            // The shared scanner skips code examples and escaped markers.
+            const firstParagraphEnd = src.search(/\n[ \t]*\n/);
+            const paragraph =
+              firstParagraphEnd < 0 ? src : src.slice(0, firstParagraphEnd);
+            if (!/\{(?:\+\+|--|~~)/.test(paragraph)) return undefined;
+            const first = extractRoughdraftReviewIndex(src).items.find(
+              (item) =>
+                item.kind === "suggestion" &&
+                isMultilineChange(src.slice(item.offset)),
+            );
+            if (
+              !first ||
+              (firstParagraphEnd >= 0 && first.offset > firstParagraphEnd)
+            )
+              return undefined;
+            offset = first.offset;
+          }
+          const result = tokenizeCriticChange(
+            this.lexer,
+            src.slice(offset),
+            changes.values(),
+            comments.values(),
+            endmatter,
+            true,
+          );
+          if (!result) return undefined;
+          for (const comment of result.comments)
+            comments.set(comment.id, comment);
+          changes.set(result.token.change.changeId, result.token.change);
+          const after = src.slice(offset + result.token.raw.length);
+          const suffix = after.match(/^[^\r\n]+/)?.[0] ?? "";
+          return {
+            ...result.token,
+            type: "criticBlockChange",
+            raw: src.slice(0, offset) + result.token.raw + suffix,
+            prefix: src.slice(0, offset),
+            suffix,
+          };
+        },
+        renderer(this: RendererThis, token: Tokens.Generic) {
+          const change = token as CriticChangeToken;
+          const renderBlock = (kind: CriticChangeKind, tokens: Token[]) =>
+            `<div data-critic-block="${escapeHtml(JSON.stringify({ ...change.change, kind }))}" data-comment-ids="${escapeHtml(JSON.stringify(change.commentIds))}">${this.parser.parse(tokens)}</div>\n`;
+          const renderBoundary = (side: "prefix" | "suffix", source: string) =>
+            source
+              ? `<div data-critic-boundary="${escapeHtml(JSON.stringify({ changeId: change.change.changeId, side, source }))}">${parser.parse(source)}</div>\n`
+              : "";
+          return (
+            renderBoundary("prefix", change.prefix ?? "") +
+            (change.change.kind === "substitution-old"
+              ? renderBlock("substitution-old", change.oldTokens ?? []) +
+                renderBlock("substitution-new", change.newTokens ?? [])
+              : renderBlock(change.change.kind, change.tokens ?? [])) +
+            renderBoundary("suffix", change.suffix ?? "")
+          );
+        },
+        childTokens: ["tokens", "oldTokens", "newTokens"],
+      } satisfies TokenizerAndRendererExtension,
       {
         name: "criticCommentAnchor",
         level: "inline",
@@ -1420,7 +1632,13 @@ export function criticMarkdownToRenderedHtml(
     options,
     parsedEndmatter,
   );
-  const html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
+  let html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
+  if (html.includes("data-critic-block=")) {
+    html = generateHTML(
+      markBlockChangeContent(generateJSON(html, extensions)),
+      extensions,
+    );
+  }
   addEndmatterFeedback(comments, parsedEndmatter);
 
   return { html, comments, changes, frontmatter, endmatter };
@@ -1439,7 +1657,9 @@ export function criticMarkdownToEditorState(
   const parsedEndmatter = parseReviewEndmatter(endmatter);
   const { parser, comments } = createCriticMarked(options, parsedEndmatter);
   const html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
-  const doc = generateJSON(html, extensions) as JSONContent & {
+  const doc = markBlockChangeContent(
+    generateJSON(html, extensions),
+  ) as JSONContent & {
     yamlFrontmatter?: string;
     yamlEndmatter?: string;
   };
@@ -1459,6 +1679,10 @@ function collectCriticChangesFromDoc(
 ): Map<string, CriticChangeAttrs> {
   const changes = new Map<string, CriticChangeAttrs>();
   const visit = (node: JSONContent) => {
+    if (node.type === "criticChangeBlock" && node.attrs?.change) {
+      const change = node.attrs.change as CriticChangeAttrs;
+      changes.set(change.changeId, change);
+    }
     for (const mark of node.marks ?? []) {
       if (mark.type !== "criticChange") continue;
 
