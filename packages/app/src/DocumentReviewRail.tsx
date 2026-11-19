@@ -85,6 +85,7 @@ interface DocumentReviewRailProps {
     disabled: boolean;
     acceptLabel: string;
     rejectLabel: string;
+    allowDeleteThread?: boolean;
   };
 }
 
@@ -701,7 +702,9 @@ export function DocumentReviewRail({
               ) : null}
               <CommentEditorList
                 readOnly={reviewControls?.disabled}
-                allowDeleteThread={!reviewControls}
+                allowDeleteThread={
+                  reviewControls?.allowDeleteThread ?? !reviewControls
+                }
                 comments={suggestionThreadComments}
                 variant="rail"
                 selectedCommentId={

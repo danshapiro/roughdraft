@@ -49,6 +49,8 @@ export interface CriticChangeAttrs {
   createdAt: string;
 }
 
+export const explicitReviewEdit = "roughdraftExplicitReviewEdit";
+
 export const SUGGESTED_PARAGRAPH_SENTINEL = "\u2060";
 
 const CommentRef = Mark.create({
@@ -378,7 +380,7 @@ const CriticChange = Mark.create({
             }
           }
 
-          if (dispatch) dispatch(tr);
+          if (dispatch) dispatch(tr.setMeta(explicitReviewEdit, true));
           return true;
         },
       rejectCriticChange:
@@ -416,7 +418,7 @@ const CriticChange = Mark.create({
             }
           }
 
-          if (dispatch) dispatch(tr);
+          if (dispatch) dispatch(tr.setMeta(explicitReviewEdit, true));
           return true;
         },
     };

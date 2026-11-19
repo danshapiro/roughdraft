@@ -23,3 +23,9 @@ Within a source group, rendered nodes are aligned so unchanged blocks and inline
 Comparison records must be preserved along with other application data. They contain source text and review comments, so their filesystem access follows the application's local-file trust model. They are not a global document index, collaboration service, or version-control database.
 
 Agents can consume the complete record through the comparison API or CLI JSON output, including whether a file was actually written. CLI waiting polls durable completion rather than relying on an in-memory event. A timeout never implies approval. Source preparation, commits, skill installation, and deployments remain explicit operations outside the comparison review.
+
+## Single editor amendment
+
+New file drafts and comparisons use the same editable document. A frozen reference and a destination are independent and optional. The stored draft includes the annotated editor document, the Markdown for Save or export, content-bound Keep choices, and separately submitted comments. Matching rendered ranges are derived from the editable document; reference highlights are decorations and never serialize. Pending suggestions are excluded from the file projection until kept.
+
+Save writes the current projection after a destination version check. Save As requires inspection and explicit replacement of existing files. Send freezes a feedback snapshot and reports whether it matches the saved destination. It does not write or grant write permission. Automatic recovery and in-session undo are separate; document history does not undo submitted comments. Existing comparison records and their original read-only UI remain supported.

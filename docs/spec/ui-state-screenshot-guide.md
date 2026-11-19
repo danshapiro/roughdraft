@@ -223,3 +223,7 @@ The most reliable long-term solution is a dedicated screenshot harness route or 
 - Capture both rich-text and code editor for document states that affect the editor surface or review rail.
   
 - Keep screenshots in `.context/` unless the run is intentionally being committed as visual documentation.
+
+## Single editor
+
+Capture the rendered editor with no reference, a comparison with an unreviewed change, and a pending suggestion overlapping a reference change. In each state, include the compact header at a scrolled position. Capture the Markdown view at that same passage, then the Save As replacement confirmation and an external-destination conflict with the draft still visible. Include a sent feedback snapshot followed by a further edit; Save remains available independently.

@@ -11,6 +11,18 @@ export interface RenderedComparisonDifference {
   changed: boolean;
 }
 
+export interface RenderedSourceDifference {
+  oldFrom: number;
+  oldTo: number;
+  newFrom: number;
+  newTo: number;
+  structural: boolean;
+  oldText: string;
+  newText: string;
+}
+
+type DifferenceObserver = (difference: RenderedSourceDifference) => void;
+
 const TEXT_BLOCKS = new Set(["paragraph", "heading", "codeBlock"]);
 const POSITIONAL_CHILDREN = new Set([
   "bulletList",
@@ -43,12 +55,27 @@ function canonical(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
+function semanticAttributes(
+  type: string | undefined,
+  attrs: JSONContent["attrs"],
+) {
+  const source = attrs?.dataMarkdownSrc;
+  if (!source) return attrs ?? {};
+  // A relative asset is resolved differently in each frozen input's folder.
+  // Assess the Markdown destination, not its generated preview URL.
+  if (type === "link") return { ...attrs, href: source };
+  if (type === "image") return { ...attrs, src: source };
+  return attrs;
+}
+
 function semanticMarks(node: JSONContent) {
   return (node.marks ?? [])
     .filter(
       (mark) => mark.type !== "criticChange" && mark.type !== "commentRef",
     )
-    .map(canonical)
+    .map((mark) =>
+      canonical({ ...mark, attrs: semanticAttributes(mark.type, mark.attrs) }),
+    )
     .sort();
 }
 
@@ -155,6 +182,7 @@ export function diffRenderedComparison(
   before: JSONContent[],
   after: JSONContent[],
   change: CriticChangeAttrs,
+  onDifference?: DifferenceObserver,
 ): RenderedComparisonDifference {
   const oldSummary: string[] = [];
   const newSummary: string[] = [];
@@ -166,7 +194,7 @@ export function diffRenderedComparison(
     if (key === undefined) {
       key = canonical({
         type: node.type,
-        attrs: node.attrs ?? {},
+        attrs: semanticAttributes(node.type, node.attrs),
         text: node.text,
         marks: semanticMarks(node),
         content: (node.content ?? []).map(semanticKey),
@@ -321,45 +349,59 @@ export function diffRenderedComparison(
     }
     return matches.reverse();
   };
-  const mergeInline = (previous: JSONContent[], next: JSONContent[]) => {
-    const parts = diffArrays(textTokens(previous), textTokens(next), {
-      comparator: equal,
-    });
-    const result: JSONContent[] = [];
-    for (let index = 0; index < parts.length; index++) {
-      const part = parts[index];
-      if (!part.added && !part.removed) {
-        result.push(...part.value);
-        continue;
-      }
-      const oldNodes: JSONContent[] = [];
-      const newNodes: JSONContent[] = [];
-      while (
-        index < parts.length &&
-        (parts[index].added || parts[index].removed)
-      ) {
-        (parts[index].removed ? oldNodes : newNodes).push(
-          ...parts[index].value,
-        );
-        index++;
-      }
-      index--;
-      result.push(...replace(oldNodes, newNodes, false));
-    }
-    return joinText(result);
+  const offsets = (nodes: JSONContent[], start: number) => {
+    const positions = [start];
+    for (const node of nodes)
+      positions.push(positions[positions.length - 1] + nodeSize(node));
+    return positions;
   };
-  const mergeNode = (previous: JSONContent, next: JSONContent): JSONContent => {
+  const report = (
+    previous: JSONContent[],
+    next: JSONContent[],
+    oldFrom: number,
+    newFrom: number,
+    structural: boolean,
+    observe?: DifferenceObserver,
+  ) => {
+    if (!observe) return;
+    const formatting =
+      previous.length > 0 &&
+      next.length > 0 &&
+      previous.map(visibleText).join("") === next.map(visibleText).join("");
+    observe({
+      oldFrom,
+      oldTo: offsets(previous, oldFrom)[previous.length],
+      newFrom,
+      newTo: offsets(next, newFrom)[next.length],
+      structural,
+      oldText: previous.length ? summary(previous, formatting) : "",
+      newText: next.length ? summary(next, formatting) : "",
+    });
+  };
+  const mergeNode = (
+    previous: JSONContent,
+    next: JSONContent,
+    oldFrom: number,
+    newFrom: number,
+    observe?: DifferenceObserver,
+  ): JSONContent => {
+    const changedAttributes =
+      canonical(previous.attrs ?? {}) !== canonical(next.attrs ?? {});
+    const inline = TEXT_BLOCKS.has(next.type ?? "");
+    const oldChildren = previous.content ?? [];
+    const newChildren = next.content ?? [];
     const rendered = {
       ...next,
-      content: TEXT_BLOCKS.has(next.type ?? "")
-        ? mergeInline(previous.content ?? [], next.content ?? [])
-        : mergeChildren(
-            previous.content ?? [],
-            next.content ?? [],
-            next.type ?? "",
-          ),
+      content: mergeChildren(
+        inline ? textTokens(oldChildren) : oldChildren,
+        inline ? textTokens(newChildren) : newChildren,
+        next.type ?? "",
+        oldFrom + 1,
+        newFrom + 1,
+        changedAttributes ? undefined : observe,
+      ),
     };
-    if (canonical(previous.attrs ?? {}) !== canonical(next.attrs ?? {})) {
+    if (changedAttributes) {
       changed = true;
       const keys = [
         ...new Set([
@@ -375,6 +417,15 @@ export function diffRenderedComparison(
       oldSummary.push(describe(previous));
       newSummary.push(describe(next));
       nodeHighlights.set(rendered, "substitution-new");
+      observe?.({
+        oldFrom,
+        oldTo: oldFrom + nodeSize(previous),
+        newFrom,
+        newTo: newFrom + nodeSize(next),
+        structural: true,
+        oldText: describe(previous),
+        newText: describe(next),
+      });
     }
     return rendered;
   };
@@ -382,13 +433,22 @@ export function diffRenderedComparison(
     previous: JSONContent[],
     next: JSONContent[],
     parent: string,
+    oldFrom: number,
+    newFrom: number,
+    observe?: DifferenceObserver,
   ): JSONContent[] => {
     const parts = diffArrays(previous, next, { comparator: equal });
     const result: JSONContent[] = [];
+    const inline = TEXT_BLOCKS.has(parent);
+    let oldPosition = oldFrom;
+    let newPosition = newFrom;
     for (let index = 0; index < parts.length; index++) {
       const part = parts[index];
       if (!part.added && !part.removed) {
         result.push(...part.value);
+        const width = offsets(part.value, 0)[part.value.length];
+        oldPosition += width;
+        newPosition += width;
         continue;
       }
       const oldNodes: JSONContent[] = [];
@@ -403,16 +463,46 @@ export function diffRenderedComparison(
         index++;
       }
       index--;
+      const oldOffsets = offsets(oldNodes, oldPosition);
+      const newOffsets = offsets(newNodes, newPosition);
+      oldPosition = oldOffsets[oldNodes.length];
+      newPosition = newOffsets[newNodes.length];
+      const replaceRange = (
+        oldStart: number,
+        oldEnd: number,
+        newStart: number,
+        newEnd: number,
+      ) => {
+        const oldSlice = oldNodes.slice(oldStart, oldEnd);
+        const newSlice = newNodes.slice(newStart, newEnd);
+        report(
+          oldSlice,
+          newSlice,
+          oldOffsets[oldStart],
+          newOffsets[newStart],
+          !inline,
+          observe,
+        );
+        result.push(...replace(oldSlice, newSlice, !inline));
+      };
+      const mergeAt = (oldIndex: number, newIndex: number) =>
+        mergeNode(
+          oldNodes[oldIndex],
+          newNodes[newIndex],
+          oldOffsets[oldIndex],
+          newOffsets[newIndex],
+          observe,
+        );
       const positional = POSITIONAL_CHILDREN.has(parent);
-      if (
+      if (inline) {
+        replaceRange(0, oldNodes.length, 0, newNodes.length);
+      } else if (
         oldNodes.length === newNodes.length &&
         oldNodes.every((node, offset) =>
           canMerge(node, newNodes[offset], positional),
         )
       ) {
-        result.push(
-          ...oldNodes.map((node, offset) => mergeNode(node, newNodes[offset])),
-        );
+        result.push(...oldNodes.map((_, offset) => mergeAt(offset, offset)));
       } else {
         let oldStart = 0;
         let newStart = 0;
@@ -422,30 +512,18 @@ export function diffRenderedComparison(
           positional,
         )) {
           if (oldIndex > oldStart || newIndex > newStart)
-            result.push(
-              ...replace(
-                oldNodes.slice(oldStart, oldIndex),
-                newNodes.slice(newStart, newIndex),
-                true,
-              ),
-            );
-          result.push(mergeNode(oldNodes[oldIndex], newNodes[newIndex]));
+            replaceRange(oldStart, oldIndex, newStart, newIndex);
+          result.push(mergeAt(oldIndex, newIndex));
           oldStart = oldIndex + 1;
           newStart = newIndex + 1;
         }
         if (oldStart < oldNodes.length || newStart < newNodes.length)
-          result.push(
-            ...replace(
-              oldNodes.slice(oldStart),
-              newNodes.slice(newStart),
-              true,
-            ),
-          );
+          replaceRange(oldStart, oldNodes.length, newStart, newNodes.length);
       }
     }
-    return result;
+    return inline ? joinText(result) : result;
   };
-  const content = mergeChildren(before, after, "doc");
+  const content = mergeChildren(before, after, "doc", 0, 0, onDifference);
   const blockHighlights: ControlledReviewBlockHighlight[] = [];
   const measure = (nodes: JSONContent[], offset: number) => {
     let position = offset;

@@ -18,6 +18,7 @@ import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
 import type { ControlledDocumentReview } from "./controlled-review";
 import { RichTextEditorSurface } from "./PageCard";
+import { RevisionEditor } from "./RevisionEditor";
 import "./ComparisonReview.css";
 
 type ComparisonView = "diff" | ComparisonPreviewVersion;
@@ -558,6 +559,9 @@ export function ComparisonReview({ id }: { id: string }) {
         </p>
       </main>
     );
+  if (review.editor === "unified")
+    return <RevisionEditor key={review.id} initial={review} />;
+
   const changes = review.segments.filter(
     (segment) => segment.kind === "change",
   );

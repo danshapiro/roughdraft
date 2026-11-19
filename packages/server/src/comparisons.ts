@@ -4,7 +4,7 @@ import path from "node:path";
 import { diffLines } from "diff";
 import { Router, type Request, type Response } from "express";
 
-export type ComparisonMode = "proposal" | "applied" | "compare";
+export type ComparisonMode = "proposal" | "applied" | "compare" | "document";
 export type ComparisonDecision = "pending" | "before" | "after";
 export interface ComparisonSegment {
   id: string;
@@ -33,6 +33,20 @@ export interface ComparisonReviewComment {
   parentCommentId?: string | null;
   scope?: "document";
 }
+export interface EditorDraft {
+  markdown: string;
+  cleanMarkdown?: string;
+  decisions: Record<string, "kept">;
+}
+export interface EditorFeedback {
+  draft: EditorDraft;
+  reference: { label: string; markdown: string } | null;
+  destinationPath: string | null;
+  saved: boolean;
+  comment: string;
+  reviewComments: ComparisonReviewComment[];
+  sentAt: string;
+}
 export interface Comparison {
   id: string;
   revision: number;
@@ -49,10 +63,22 @@ export interface Comparison {
   status: "open" | "completed" | "applied";
   completion: ComparisonCompletion | null;
   targetChanged: boolean;
+  editor?: "unified";
+  draft?: EditorDraft | null;
+  destinationPath?: string | null;
+  savedPath?: string | null;
+  savedText?: string | null;
+  feedback?: EditorFeedback | null;
 }
 interface StoredComparison extends Omit<Comparison, "targetChanged"> {
   targetVersion: string | null;
   pendingApply?: { outputHash: string; completion: ComparisonCompletion };
+  destinationVersion?: string | null;
+  pendingSave?: {
+    path: string;
+    draft: EditorDraft;
+    reviewComments: ComparisonReviewComment[];
+  };
 }
 interface FileSnapshot {
   path: string;
@@ -100,6 +126,7 @@ function objectBody(value: unknown): Record<string, unknown> {
 function reviewCommentsField(
   value: unknown,
   review: StoredComparison,
+  allowDraftAnchors = false,
 ): ComparisonReviewComment[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value))
@@ -121,7 +148,7 @@ function reviewCommentsField(
       !id ||
       ids.has(id) ||
       !changeId ||
-      !anchors.has(changeId) ||
+      (!allowDraftAnchors && !anchors.has(changeId)) ||
       content === undefined ||
       !createdAt ||
       !Number.isFinite(Date.parse(createdAt))
@@ -193,12 +220,65 @@ function snapshot(filename: string): FileSnapshot {
     );
   }
 }
+function draftField(body: Record<string, unknown>): EditorDraft {
+  const markdown = stringField(body, "markdown");
+  if (markdown === undefined)
+    throw new ComparisonError(400, "markdown is required");
+  const cleanMarkdown = stringField(body, "cleanMarkdown");
+  const entries = Object.entries(objectBody(body.decisions));
+  if (entries.some(([key, value]) => !key || value !== "kept"))
+    throw new ComparisonError(400, "decisions must map change IDs to kept");
+  return {
+    markdown,
+    ...(cleanMarkdown !== undefined ? { cleanMarkdown } : {}),
+    decisions: Object.fromEntries(entries.map(([id]) => [id, "kept"] as const)),
+  };
+}
+function cleanDraft(draft: EditorDraft): string {
+  return draft.cleanMarkdown ?? draft.markdown;
+}
+function inspectDestination(filename: string): {
+  path: string;
+  current: FileSnapshot | null;
+} {
+  if (
+    !path.isAbsolute(filename) ||
+    path.extname(filename).toLowerCase() !== ".md"
+  )
+    throw new ComparisonError(400, "Choose an absolute path ending in .md");
+  let candidate: string;
+  try {
+    candidate = path.join(
+      fs.realpathSync(path.dirname(filename)),
+      path.basename(filename),
+    );
+    if (!fs.statSync(path.dirname(candidate)).isDirectory())
+      throw new Error("The parent is not a directory");
+  } catch (error) {
+    throw new ComparisonError(
+      400,
+      `Choose a Markdown file in an existing directory: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    fs.lstatSync(candidate);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return { path: candidate, current: null };
+    throw error;
+  }
+  const current = snapshot(candidate);
+  if (path.extname(current.path).toLowerCase() !== ".md")
+    throw new ComparisonError(400, "The destination must be a Markdown file");
+  return { path: current.path, current };
+}
 function atomicWrite(
   filename: string,
   text: string,
   mode = 0o600,
   beforeRename?: () => void,
   allowBusyFallback = false,
+  mustCreate = false,
 ): void {
   const temporary = path.join(
     path.dirname(filename),
@@ -208,6 +288,19 @@ function atomicWrite(
     fs.writeFileSync(temporary, text, { encoding: "utf8", mode, flag: "wx" });
     fs.chmodSync(temporary, mode);
     beforeRename?.();
+    if (mustCreate) {
+      try {
+        fs.linkSync(temporary, filename);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST")
+          throw new ComparisonError(
+            409,
+            "The destination was created before saving. Review it before replacing it.",
+          );
+        throw error;
+      }
+    }
     try {
       fs.renameSync(temporary, filename);
     } catch (error) {
@@ -327,26 +420,105 @@ class ComparisonStore {
       delete review.pendingApply;
       this.save(review);
     }
+    if (review.pendingSave) {
+      const intent = review.pendingSave;
+      let current: FileSnapshot | null = null;
+      try {
+        current = snapshot(intent.path);
+      } catch {
+        /* Recovery never writes to an unavailable or changed destination. */
+      }
+      if (
+        current?.path === intent.path &&
+        current.text === cleanDraft(intent.draft)
+      ) {
+        this.recordSave(review, intent.draft, intent.reviewComments, current);
+        log("draft-save-recovered", {
+          id: review.id,
+          destinationPath: current.path,
+        });
+      } else {
+        // A crash before the write (or an external edit afterward) must not
+        // lose the draft from the Save request. Never mark it saved blindly.
+        review.draft = intent.draft;
+        review.reviewComments = intent.reviewComments;
+        review.revision++;
+      }
+      delete review.pendingSave;
+      this.save(review);
+    }
     return review;
   }
   view(review: StoredComparison): Comparison {
-    const { targetVersion, pendingApply: _pendingApply, ...result } = review;
+    const {
+      targetVersion,
+      destinationVersion,
+      pendingApply: _pendingApply,
+      pendingSave: _pendingSave,
+      ...result
+    } = review;
     let targetChanged = false;
-    if (review.targetPath && review.status === "open") {
+    const filename =
+      review.editor === "unified" ? review.destinationPath : review.targetPath;
+    if (filename && (review.editor === "unified" || review.status === "open")) {
       try {
-        targetChanged = snapshot(review.targetPath).version !== targetVersion;
+        const current = snapshot(filename);
+        targetChanged =
+          current.path !== filename ||
+          current.version !==
+            (review.editor === "unified" ? destinationVersion : targetVersion);
       } catch {
         targetChanged = true;
       }
     }
     return { ...result, targetChanged };
   }
+  openDocument(body: Record<string, unknown>): StoredComparison {
+    const targetPath = stringField(body, "targetPath");
+    const input = { mode: "document", editor: "unified", targetPath };
+    if (targetPath === undefined) return this.create(input);
+    const { path: filename, current: disk } = inspectDestination(targetPath);
+    const index = path.join(this.directory, `document-${hash(filename)}.index`);
+    try {
+      const current = this.load(fs.readFileSync(index, "utf8"));
+      if (current.mode === "document" && current.destinationPath === filename) {
+        const draft = current.draft;
+        const hasWork =
+          current.feedback ||
+          current.reviewComments.length ||
+          (draft &&
+            (draft.markdown !== current.savedText ||
+              cleanDraft(draft) !== current.savedText));
+        // Opening the source again should show external changes if there is
+        // no unfinished draft or feedback to protect. Existing links stay valid.
+        if (!disk || disk.version === current.destinationVersion || hasWork)
+          return current;
+      }
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code !== "ENOENT" &&
+        !(error instanceof ComparisonError && error.status === 404)
+      )
+        throw error;
+    }
+    const review = this.create(input);
+    atomicWrite(index, review.id);
+    return review;
+  }
   create(body: Record<string, unknown>): StoredComparison {
     const mode = body.mode;
-    if (mode !== "proposal" && mode !== "applied" && mode !== "compare")
+    const editor = body.editor;
+    if (editor !== undefined && editor !== "unified")
+      throw new ComparisonError(400, "editor must be unified");
+    if (
+      mode !== "proposal" &&
+      mode !== "applied" &&
+      mode !== "compare" &&
+      mode !== "document"
+    )
       throw new ComparisonError(
         400,
-        "mode must be proposal, applied, or compare",
+        "mode must be proposal, applied, compare, or document",
       );
     const targetInput = stringField(body, "targetPath");
     if (mode === "compare" && targetInput !== undefined)
@@ -354,25 +526,40 @@ class ComparisonStore {
         400,
         "A comparison has no destination; convert it to a proposal to choose a destination",
       );
-    if (mode !== "compare" && !targetInput)
+    if (mode !== "compare" && mode !== "document" && !targetInput)
       throw new ComparisonError(400, "targetPath is required");
-    const target = targetInput ? snapshot(targetInput) : null;
+    if (mode === "document" && editor !== "unified")
+      throw new ComparisonError(
+        400,
+        "Document sessions require the unified editor",
+      );
+    const target = targetInput
+      ? mode === "document"
+        ? inspectDestination(targetInput).current
+        : snapshot(targetInput)
+      : null;
+    if (targetInput && !target)
+      throw new ComparisonError(404, "Markdown file not found");
     const beforePath = stringField(body, "beforePath");
     const afterPath = stringField(body, "afterPath");
     const beforeText =
-      stringField(body, "beforeText") ??
-      (beforePath
-        ? snapshot(beforePath).text
-        : mode === "proposal"
-          ? target?.text
-          : undefined);
+      mode === "document"
+        ? ""
+        : (stringField(body, "beforeText") ??
+          (beforePath
+            ? snapshot(beforePath).text
+            : mode === "proposal"
+              ? target?.text
+              : undefined));
     const afterText =
-      stringField(body, "afterText") ??
-      (afterPath
-        ? snapshot(afterPath).text
-        : mode === "applied"
-          ? target?.text
-          : undefined);
+      mode === "document"
+        ? (target?.text ?? "")
+        : (stringField(body, "afterText") ??
+          (afterPath
+            ? snapshot(afterPath).text
+            : mode === "applied"
+              ? target?.text
+              : undefined));
     if (beforeText === undefined || afterText === undefined)
       throw new ComparisonError(
         400,
@@ -380,6 +567,7 @@ class ComparisonStore {
       );
     if (
       target &&
+      mode !== "document" &&
       target.text !== (mode === "proposal" ? beforeText : afterText)
     )
       throw new ComparisonError(
@@ -392,7 +580,11 @@ class ComparisonStore {
       mode,
       title:
         stringField(body, "title") ??
-        (target ? path.basename(target.path) : "Compare versions"),
+        (target
+          ? path.basename(target.path)
+          : mode === "document"
+            ? "Untitled"
+            : "Compare versions"),
       beforeLabel:
         stringField(body, "beforeLabel") ??
         beforePath ??
@@ -407,11 +599,23 @@ class ComparisonStore {
       targetVersion: target?.version ?? null,
       beforeText,
       afterText,
-      segments: comparisonSegments(beforeText, afterText),
+      segments:
+        mode === "document" ? [] : comparisonSegments(beforeText, afterText),
       comment: "",
       reviewComments: [],
       status: "open",
       completion: null,
+      ...(editor === "unified"
+        ? {
+            editor,
+            draft: null,
+            destinationPath: target?.path ?? null,
+            destinationVersion: target?.version ?? null,
+            savedPath: target?.path ?? null,
+            savedText: target?.text ?? null,
+            feedback: null,
+          }
+        : {}),
     };
     this.save(review);
     log("created", {
@@ -434,6 +638,11 @@ class ComparisonStore {
       );
     if (review.status !== "open")
       throw new ComparisonError(409, "This review is already finished");
+    if (review.editor === "unified")
+      throw new ComparisonError(
+        400,
+        "Use the editor draft, save, and feedback operations for this review",
+      );
   }
   decisions(
     review: StoredComparison,
@@ -489,6 +698,178 @@ class ComparisonStore {
     review.reviewComments = reviewComments ?? review.reviewComments;
     review.revision++;
     this.save(review);
+    return review;
+  }
+  private requireEditor(review: StoredComparison): void {
+    if (review.editor !== "unified")
+      throw new ComparisonError(
+        400,
+        "This review uses the original comparison editor",
+      );
+  }
+  private editorUpdate(
+    review: StoredComparison,
+    body: Record<string, unknown>,
+  ) {
+    this.requireEditor(review);
+    if (body.revision !== review.revision)
+      throw new ComparisonError(
+        409,
+        "This draft changed in another browser. Reload the saved draft before continuing.",
+      );
+    return {
+      draft: draftField(body),
+      reviewComments:
+        reviewCommentsField(body.reviewComments, review, true) ??
+        review.reviewComments,
+    };
+  }
+  recoverDraft(
+    review: StoredComparison,
+    body: Record<string, unknown>,
+  ): StoredComparison {
+    const { draft, reviewComments } = this.editorUpdate(review, body);
+    review.draft = draft;
+    review.reviewComments = reviewComments;
+    review.revision++;
+    this.save(review);
+    return review;
+  }
+  inspect(review: StoredComparison, filename: string | undefined) {
+    this.requireEditor(review);
+    const requested = filename ?? review.destinationPath;
+    if (!requested)
+      throw new ComparisonError(400, "Choose a destination first");
+    const { path: inspected, current } = inspectDestination(requested);
+    return {
+      path: inspected,
+      version: current?.version ?? null,
+      markdown: current?.text ?? null,
+    };
+  }
+  private recordSave(
+    review: StoredComparison,
+    draft: EditorDraft,
+    reviewComments: ComparisonReviewComment[],
+    current: FileSnapshot,
+  ): void {
+    review.draft = draft;
+    review.reviewComments = reviewComments;
+    review.destinationPath = current.path;
+    review.destinationVersion = current.version;
+    review.savedPath = current.path;
+    review.savedText = cleanDraft(draft);
+    review.revision++;
+  }
+  saveDraft(
+    review: StoredComparison,
+    body: Record<string, unknown>,
+  ): StoredComparison {
+    const { draft, reviewComments } = this.editorUpdate(review, body);
+    const requested = stringField(body, "path");
+    const filename = requested ?? review.destinationPath;
+    if (!filename) throw new ComparisonError(400, "Choose a destination first");
+    if (
+      requested !== undefined &&
+      body.expectedVersion !== null &&
+      typeof body.expectedVersion !== "string"
+    )
+      throw new ComparisonError(
+        400,
+        "Inspect the destination before saving to it",
+      );
+    const { path: resolved, current } = inspectDestination(filename);
+    const version = current?.version ?? null;
+    const sameDestination =
+      requested === undefined ||
+      resolved === review.destinationPath ||
+      path.resolve(filename) === review.destinationPath;
+    const errorMessage =
+      "The destination changed on disk. Inspect it or use Save As to save somewhere else.";
+    if (
+      (requested !== undefined && body.expectedVersion !== version) ||
+      (sameDestination &&
+        (resolved !== review.destinationPath ||
+          version !== review.destinationVersion))
+    )
+      throw new ComparisonError(409, errorMessage);
+
+    if (current?.text === cleanDraft(draft)) {
+      this.recordSave(review, draft, reviewComments, current);
+      this.save(review);
+      return review;
+    }
+    review.pendingSave = { path: resolved, draft, reviewComments };
+    this.save(review);
+    try {
+      atomicWrite(
+        resolved,
+        cleanDraft(draft),
+        current?.mode,
+        () => {
+          const latest = inspectDestination(filename);
+          if (
+            latest.path !== resolved ||
+            (latest.current?.version ?? null) !== version
+          )
+            throw new ComparisonError(409, errorMessage);
+        },
+        current !== null,
+        current === null,
+      );
+    } catch (error) {
+      delete review.pendingSave;
+      this.save(review);
+      throw error;
+    }
+    const saved = snapshot(resolved);
+    if (saved.path !== resolved || saved.text !== cleanDraft(draft))
+      throw new ComparisonError(409, errorMessage);
+    this.recordSave(review, draft, reviewComments, saved);
+    delete review.pendingSave;
+    this.save(review);
+    log("draft-saved", { id: review.id, destinationPath: resolved });
+    return review;
+  }
+  sendFeedback(
+    review: StoredComparison,
+    body: Record<string, unknown>,
+  ): StoredComparison {
+    const { draft, reviewComments } = this.editorUpdate(review, body);
+    const comment = stringField(body, "comment") ?? review.comment;
+    const sentAt = new Date().toISOString();
+    const destinationPath = review.destinationPath ?? null;
+    const saved =
+      destinationPath !== null &&
+      review.savedPath === destinationPath &&
+      review.savedText === cleanDraft(draft) &&
+      !this.view(review).targetChanged;
+    review.draft = draft;
+    review.reviewComments = reviewComments;
+    review.comment = comment;
+    review.feedback = {
+      draft,
+      reference:
+        review.mode === "document"
+          ? null
+          : { label: review.beforeLabel, markdown: review.beforeText },
+      destinationPath,
+      saved,
+      comment,
+      reviewComments,
+      sentAt,
+    };
+    review.status = "completed";
+    review.completion = {
+      fileWritten: false,
+      targetPath: destinationPath,
+      accepted: Object.keys(draft.decisions).length,
+      reverted: 0,
+      completedAt: sentAt,
+    };
+    review.revision++;
+    this.save(review);
+    log("feedback-sent", { id: review.id, destinationPath, saved });
     return review;
   }
   private destination(review: StoredComparison): FileSnapshot {
@@ -713,6 +1094,41 @@ export function comparisonRouter(directory: string): Router {
     "/",
     handle((req, res) => {
       res.status(201).json(store.view(store.create(objectBody(req.body))));
+    }),
+  );
+  router.post(
+    "/document",
+    handle((req, res) => {
+      res
+        .status(201)
+        .json(store.view(store.openDocument(objectBody(req.body))));
+    }),
+  );
+  router.get(
+    "/:id/destination",
+    handle((req, res) => {
+      const filename = req.query.path;
+      if (filename !== undefined && typeof filename !== "string")
+        throw new ComparisonError(400, "path must be a string");
+      res.json(store.inspect(load(req), filename));
+    }),
+  );
+  router.post(
+    "/:id/draft",
+    handle((req, res) => {
+      res.json(store.view(store.recoverDraft(load(req), objectBody(req.body))));
+    }),
+  );
+  router.post(
+    "/:id/save",
+    handle((req, res) => {
+      res.json(store.view(store.saveDraft(load(req), objectBody(req.body))));
+    }),
+  );
+  router.post(
+    "/:id/send",
+    handle((req, res) => {
+      res.json(store.view(store.sendFeedback(load(req), objectBody(req.body))));
     }),
   );
   router.get(

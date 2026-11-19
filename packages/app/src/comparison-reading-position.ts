@@ -113,6 +113,25 @@ export function useComparisonReadingPosition(
         low = middle + 1;
       else high = middle;
     }
+    // If the reading line falls in the gap between paragraphs, keep the
+    // preceding line. Anchoring the next paragraph would let the one the
+    // reader just saw drift by the difference in spacing between views.
+    if (
+      low > 0 &&
+      (!candidates[low] ||
+        wordRange(candidates[low]).getBoundingClientRect().top > line)
+    ) {
+      const previous = wordRange(candidates[low - 1]).getBoundingClientRect();
+      if (previous.top >= headerBottom) {
+        low--;
+        while (
+          low > 0 &&
+          wordRange(candidates[low - 1]).getBoundingClientRect().bottom >
+            previous.top
+        )
+          low--;
+      }
+    }
     const word = candidates[low];
     pending.current = {
       viewKey,
