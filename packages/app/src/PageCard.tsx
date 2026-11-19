@@ -1,4 +1,5 @@
-import type { JSONContent } from "@tiptap/core";
+import { Extension, type JSONContent } from "@tiptap/core";
+import { closeHistory, isHistoryTransaction } from "@tiptap/pm/history";
 import type {
   Mark as ProseMirrorMark,
   Node as ProseMirrorNode,
@@ -43,6 +44,7 @@ import {
   commentHighlightPluginKey,
   createEditorExtensions,
   criticChangeHighlightPluginKey,
+  explicitReviewEdit,
   readCriticBlockChange,
   SUGGESTED_PARAGRAPH_SENTINEL,
 } from "./editor-extensions";
@@ -52,6 +54,7 @@ import { LinkAffordances } from "./LinkAffordances";
 import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
 import { toHtml, splitYamlDocumentMetadata } from "./markdown";
 import { resolveSuggestionSource } from "./resolve-suggestion";
+import { acceptedDocument } from "./revision-markdown";
 import type { Page, StorageBackend } from "./storage";
 import { useCommentAnchorLayout } from "./useCommentAnchorLayout";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
@@ -124,7 +127,26 @@ interface RichTextEditorSurfaceProps {
   onCommentRailPresenceChange?: (hasCommentRailSpace: boolean) => void;
   controlledReview?: ControlledDocumentReview;
   beforeNavigate?: () => Promise<boolean>;
+  editableReview?: EditableReviewSurface;
 }
+
+interface EditableReviewSurface {
+  suggestions: CriticChangeRailItem[];
+  decisions: string[];
+  comments: ReadonlyMap<string, CriticComment>;
+  onCommentsChange: (comments: Map<string, CriticComment>) => void;
+  // Return true to handle or defer the action; false uses the native command.
+  onAccept: (changeId: string, applyNative: () => void) => boolean;
+  onReject: (changeId: string, applyNative: () => void) => boolean;
+  onBlockedSuggestionEdit: () => void;
+}
+
+const ReviewDecisions = Extension.create({
+  name: "reviewDecisions",
+  addGlobalAttributes: () => [
+    { types: ["doc"], attributes: { kept: { default: [], rendered: false } } },
+  ],
+});
 
 interface CodeEditorSurfaceProps {
   markdown: string;
@@ -307,6 +329,7 @@ function addCommentIdsToAnchor(
   editor: Editor | null,
   anchorCommentId: string,
   commentIdsToAdd: string[],
+  separateHistory = false,
 ): string[] | null {
   if (!editor) return null;
 
@@ -346,7 +369,9 @@ function addCommentIdsToAnchor(
 
   if (!found) return null;
 
-  editor.view.dispatch(tr);
+  editor.view.dispatch(
+    separateHistory ? tr.setMeta("addToHistory", false) : tr,
+  );
   return nextCommentIds;
 }
 
@@ -416,6 +441,7 @@ function getDocumentCriticChangeRailItems(
   editor: Editor | null,
   comments: ReadonlyMap<string, CriticComment>,
   suppliedSuggestions?: CriticChangeRailItem[],
+  mergeNative = false,
 ): CriticChangeRailItem[] {
   if (!editor) return [];
 
@@ -465,7 +491,7 @@ function getDocumentCriticChangeRailItems(
   }
 
   editor.state.doc.descendants((node) => {
-    if (suppliedSuggestions) return;
+    if (suppliedSuggestions && !mergeNative) return false;
     const blockChange =
       node.type.name === "criticChangeBlock"
         ? (node.attrs.change as CriticChangeAttrs)
@@ -574,6 +600,7 @@ function addCommentIdsToCriticChange(
   editor: Editor | null,
   changeId: string,
   commentIdsToAdd: string[],
+  separateHistory = false,
 ) {
   if (!editor) return false;
 
@@ -617,7 +644,9 @@ function addCommentIdsToCriticChange(
 
   if (!found) return false;
 
-  editor.view.dispatch(tr);
+  editor.view.dispatch(
+    separateHistory ? tr.setMeta("addToHistory", false) : tr,
+  );
   return true;
 }
 
@@ -645,6 +674,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   onCommentRailPresenceChange,
   controlledReview,
   beforeNavigate,
+  editableReview,
 }: RichTextEditorSurfaceProps) {
   const editorRef = useRef<Editor | null>(null);
   const controlledReviewRef = useRef(controlledReview);
@@ -654,6 +684,9 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   } | null>(null);
   controlledReviewRef.current = controlledReview;
   const isControlled = Boolean(controlledReview);
+  const editableReviewRef = useRef(editableReview);
+  editableReviewRef.current = editableReview;
+  const isEditableReview = Boolean(editableReview);
   const hoveredChangeIdRef = useRef<string | null>(null);
   const hoveredCommentIdRef = useRef<string | null>(null);
   const [isWideReview, setIsWideReview] = useState(() =>
@@ -662,13 +695,17 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       : true,
   );
   useEffect(() => {
-    if (!isControlled || typeof window.matchMedia !== "function") return;
+    if (
+      (!isControlled && !isEditableReview) ||
+      typeof window.matchMedia !== "function"
+    )
+      return;
     const query = window.matchMedia("(min-width: 1100px)");
     const update = () => setIsWideReview(query.matches);
     update();
     query.addEventListener("change", update);
     return () => query.removeEventListener("change", update);
-  }, [isControlled]);
+  }, [isControlled, isEditableReview]);
   const criticChangeFrameRef = useRef<number | null>(null);
   const interactionModeRef = useRef<DocumentInteractionMode>(interactionMode);
   const commentsRef = useRef<Map<string, CriticComment>>(new Map());
@@ -704,8 +741,9 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         projectPath: backend.info.projectPath,
         currentDocumentPath: activeDocumentPath,
         href: path,
+        unified: isEditableReview,
       }),
-    [activeDocumentPath, backend],
+    [activeDocumentPath, backend, isEditableReview],
   );
 
   const parsedContent = useMemo(
@@ -717,7 +755,11 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     [resolveFileUrl, resolveLinkUrl, sourceMarkdown],
   );
   const [localComments, setComments] = useState<Map<string, CriticComment>>(
-    () => controlledReview?.comments ?? parsedContent.comments,
+    () =>
+      controlledReview?.comments ??
+      (editableReview
+        ? new Map(editableReview.comments)
+        : parsedContent.comments),
   );
   // The controlled map and a newly selected reply arrive in the same render.
   // Reading a delayed local copy would clear that reply as "missing" and
@@ -725,6 +767,23 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const comments = controlledReview?.comments ?? localComments;
   const suppliedSuggestions = controlledReview?.suggestions;
   const reviewSuggestions = useMemo(() => {
+    if (isEditableReview) {
+      return criticChanges.map((suggestion) => {
+        const rootIds = [...comments.values()]
+          .filter((comment) => comment.parentCommentId === suggestion.changeId)
+          .map((comment) => comment.id);
+        return {
+          ...suggestion,
+          commentIds: [
+            ...new Set([
+              ...suggestion.commentIds.filter((id) => comments.has(id)),
+              ...rootIds,
+              ...rootIds.flatMap((id) => getCommentDescendantIds(id, comments)),
+            ]),
+          ],
+        };
+      });
+    }
     if (!suppliedSuggestions) return criticChanges;
     const measured = new Map(
       criticChanges.map((change) => [change.changeId, change]),
@@ -742,7 +801,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           }
         : suggestion;
     });
-  }, [suppliedSuggestions, criticChanges]);
+  }, [suppliedSuggestions, criticChanges, isEditableReview, comments]);
   const frontmatterRef = useRef<string | null>(parsedContent.frontmatter);
   const endmatterRef = useRef<string | null>(parsedContent.endmatter);
 
@@ -780,6 +839,24 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     },
     [onMarkdownChange],
   );
+
+  const lastReviewComments = useRef(editableReview?.comments);
+  useEffect(() => {
+    if (
+      !editableReview?.comments ||
+      editableReview.comments === lastReviewComments.current
+    )
+      return;
+    lastReviewComments.current = editableReview.comments;
+    const next = new Map(editableReview.comments);
+    // Unsubmitted comment editors retain their local drafts.
+    for (const [id, comment] of commentsRef.current) {
+      if (!comment.content.trim() && !next.has(id)) next.set(id, comment);
+    }
+    commentsRef.current = next;
+    setComments(next);
+    emitMarkdownChange(undefined, next);
+  }, [editableReview?.comments, emitMarkdownChange]);
 
   const insertFiles = useCallback(
     async (files: File[]) => {
@@ -825,7 +902,9 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         getDocumentCriticChangeRailItems(
           editorRef.current,
           commentsRef.current,
-          controlledReviewRef.current?.suggestions,
+          controlledReviewRef.current?.suggestions ??
+            editableReviewRef.current?.suggestions,
+          Boolean(editableReviewRef.current),
         ),
       );
     });
@@ -841,13 +920,21 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
 
   const editor = useEditor(
     {
-      extensions: createEditorExtensions("Start writing..."),
-      content: controlledReview?.doc ?? parsedContent.doc,
+      extensions: [
+        ...createEditorExtensions("Start writing..."),
+        ...(isEditableReview ? [ReviewDecisions] : []),
+      ],
+      content:
+        controlledReview?.doc ??
+        (editableReview
+          ? { ...parsedContent.doc, attrs: { kept: editableReview.decisions } }
+          : parsedContent.doc),
       immediatelyRender: false,
       shouldRerenderOnTransaction: false,
       editorProps: {
         attributes: {
           class: "tiptap min-h-[70vh]",
+          ...(isEditableReview ? { "data-comparison-anchor": "unit-0" } : {}),
         },
         handleDrop: (_view, event) => {
           const files = Array.from(event.dataTransfer?.files ?? []);
@@ -1357,6 +1444,36 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   }, [editor, interactionMode, isControlled]);
 
   useEffect(() => {
+    if (!editor || !isEditableReview) return;
+    const guardKey = new PluginKey("roughdraftSuggestionGuard");
+    const guard = new Plugin({
+      key: guardKey,
+      filterTransaction: (tr, state) => {
+        if (
+          !tr.docChanged ||
+          interactionModeRef.current !== "suggesting" ||
+          tr.getMeta(explicitReviewEdit) ||
+          isHistoryTransaction(tr)
+        )
+          return true;
+        const before = acceptedDocument(state.doc.toJSON());
+        const after = acceptedDocument(tr.doc.toJSON());
+        if (JSON.stringify(before) === JSON.stringify(after)) return true;
+        editableReviewRef.current?.onBlockedSuggestionEdit();
+        return false;
+      },
+    });
+    editor.registerPlugin(guard);
+    return () => {
+      editor.unregisterPlugin(guardKey);
+    };
+  }, [editor, isEditableReview]);
+
+  useEffect(() => {
+    if (editableReview?.suggestions) refreshCriticChanges();
+  }, [editableReview?.suggestions, refreshCriticChanges]);
+
+  useEffect(() => {
     if (!editor || !isControlled) return;
     editor.registerPlugin(
       new Plugin({
@@ -1479,7 +1596,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     useCommentAnchorLayout(editor, comments.size > 0);
 
   const reviewCommentGroups = useMemo(() => {
-    if (!isControlled) return commentGroups;
+    if (!isControlled && !isEditableReview) return commentGroups;
     const suggestionIds = new Set(
       reviewSuggestions.flatMap((change) => change.commentIds),
     );
@@ -1504,7 +1621,14 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         anchorBottom: anchor?.anchorBottom ?? contentHeight + 48,
       };
     });
-  }, [isControlled, commentGroups, comments, reviewSuggestions, contentHeight]);
+  }, [
+    isControlled,
+    isEditableReview,
+    commentGroups,
+    comments,
+    reviewSuggestions,
+    contentHeight,
+  ]);
 
   useEffect(() => {
     if (!editor || !isControlled) return;
@@ -1539,7 +1663,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   }, [activeChangeIds]);
 
   useEffect(() => {
-    if (!editor || isControlled) return;
+    if (!editor || isControlled || isEditableReview) return;
 
     frontmatterRef.current = parsedContent.frontmatter;
     endmatterRef.current = parsedContent.endmatter;
@@ -1558,7 +1682,13 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     }
 
     refreshCriticChanges();
-  }, [editor, isControlled, parsedContent, refreshCriticChanges]);
+  }, [
+    editor,
+    isControlled,
+    isEditableReview,
+    parsedContent,
+    refreshCriticChanges,
+  ]);
 
   useLayoutEffect(() => {
     if (!editor || !controlledReview?.doc) {
@@ -1759,11 +1889,9 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     );
 
     suppressNextMarkdownUpdateRef.current = true;
-    currentEditor
-      .chain()
-      .focus()
-      .setCommentRef({ commentIds: [...existingIds, comment.id] })
-      .run();
+    const chain = currentEditor.chain().focus();
+    if (editableReviewRef.current) chain.setMeta("addToHistory", false);
+    chain.setCommentRef({ commentIds: [...existingIds, comment.id] }).run();
     if (suppressNextMarkdownUpdateRef.current) {
       suppressNextMarkdownUpdateRef.current = false;
     }
@@ -1917,6 +2045,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       setNewCommentDraftIds((current) =>
         current.filter((currentCommentId) => currentCommentId !== commentId),
       );
+      editableReviewRef.current?.onCommentsChange(nextComments);
       emitMarkdownChange(undefined, nextComments);
     },
     [emitMarkdownChange],
@@ -1959,11 +2088,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         currentEditor,
         commentId,
         [comment.id],
+        Boolean(editableReviewRef.current),
       );
       if (suppressNextMarkdownUpdateRef.current) {
         suppressNextMarkdownUpdateRef.current = false;
       }
-      if (!nextAnchorCommentIds) return;
+      if (!nextAnchorCommentIds && !editableReviewRef.current) return;
 
       const nextComments = new Map(commentsRef.current);
       nextComments.set(comment.id, comment);
@@ -1972,6 +2102,8 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       setSelectedCommentId(comment.id);
       setHoveredCommentId(null);
       setPendingFocusCommentId(comment.id);
+      if (editableReviewRef.current)
+        setNewCommentDraftIds((ids) => [...ids, comment.id]);
       requestAnimationFrame(() => {
         measureLayout();
       });
@@ -2024,6 +2156,35 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       const currentEditor = editorRef.current;
       if (!currentEditor) return;
 
+      const live = editableReviewRef.current;
+      const applyNative = () => {
+        if (currentEditor.isDestroyed) return;
+        const command =
+          decision === "accept" ? "acceptCriticChange" : "rejectCriticChange";
+        currentEditor.view.dispatch(closeHistory(currentEditor.state.tr));
+        currentEditor.commands[command](changeId);
+        currentEditor.view.dispatch(closeHistory(currentEditor.state.tr));
+      };
+      const finishDecision = () => {
+        setSelectedChangeId((current) =>
+          current === changeId ? null : current,
+        );
+        setHoveredChangeId((current) =>
+          current === changeId ? null : current,
+        );
+        refreshCriticChanges();
+      };
+      if (live) {
+        const apply = () => {
+          applyNative();
+          finishDecision();
+        };
+        const handle = decision === "accept" ? live.onAccept : live.onReject;
+        if (!handle(changeId, apply)) apply();
+        else finishDecision();
+        return;
+      }
+
       const resolvedSource = resolveSuggestionSource(
         currentMarkdownRef.current,
         changeId,
@@ -2040,12 +2201,6 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
             : chain.rejectCriticChange(changeId).run();
         if (!changed) return;
         const nextComments = removeSuggestionComments(changeId, currentEditor);
-        setSelectedChangeId((current) =>
-          current === changeId ? null : current,
-        );
-        setHoveredChangeId((current) =>
-          current === changeId ? null : current,
-        );
         if (resolvedSource !== null) {
           currentMarkdownRef.current = resolvedSource;
           endmatterRef.current =
@@ -2054,7 +2209,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         } else {
           emitMarkdownChange(currentEditor.getJSON(), nextComments);
         }
-        refreshCriticChanges();
+        finishDecision();
       } finally {
         resolvingSuggestionRef.current = false;
       }
@@ -2098,11 +2253,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         currentEditor,
         changeId,
         [comment.id],
+        Boolean(editableReviewRef.current),
       );
       if (suppressNextMarkdownUpdateRef.current) {
         suppressNextMarkdownUpdateRef.current = false;
       }
-      if (!didAddCommentId) {
+      if (!didAddCommentId && !editableReviewRef.current) {
         return;
       }
 
@@ -2114,6 +2270,8 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       setSelectedCommentId(comment.id);
       setHoveredCommentId(null);
       setPendingFocusCommentId(comment.id);
+      if (editableReviewRef.current)
+        setNewCommentDraftIds((ids) => [...ids, comment.id]);
       refreshCriticChanges();
       requestAnimationFrame(() => {
         measureLayout();
@@ -2145,11 +2303,13 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       commentsRef.current = nextComments;
       setComments(nextComments);
 
-      const chain = currentEditor.chain().focus();
-      for (const id of commentIdsToDelete) {
-        chain.removeCommentId(id);
+      if (editableReviewRef.current) {
+        editableReviewRef.current.onCommentsChange(nextComments);
+      } else {
+        const chain = currentEditor.chain().focus();
+        for (const id of commentIdsToDelete) chain.removeCommentId(id);
+        chain.run();
       }
-      chain.run();
       setSelectedCommentId((current) =>
         current && deletedIds.has(current) ? null : current,
       );
@@ -2229,7 +2389,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
 
   const hasReviewRail = comments.size > 0 || reviewSuggestions.length > 0;
   // Comparison versions share one reading column, even without visible cards.
-  const hasReviewColumn = isControlled || hasReviewRail;
+  const hasReviewColumn = isControlled || isEditableReview || hasReviewRail;
   const documentShellRef =
     useReviewLayoutShiftAnimation<HTMLDivElement>(hasReviewColumn);
   const activeComments = activeCommentIds
@@ -2256,7 +2416,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const contentInsetClass = layout === "embedded-demo" ? "pb-0" : "pb-24";
   const fallbackClass = cn(
     "document-comment-fallback mb-4",
-    isControlled || layout === "embedded-demo"
+    isControlled || isEditableReview || layout === "embedded-demo"
       ? "hidden"
       : "min-[1100px]:hidden",
   );
@@ -2264,7 +2424,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     "document-comment-rail",
     layout === "embedded-demo"
       ? "block px-4 pb-4 min-[900px]:p-0"
-      : isControlled
+      : isControlled || isEditableReview
         ? "review-layout-rail block pb-6"
         : "review-layout-rail hidden min-[1100px]:block",
   );
@@ -2353,7 +2513,8 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         <DocumentReviewRail
           className={reviewRailClass}
           layout={
-            layout === "embedded-demo" || (isControlled && !isWideReview)
+            layout === "embedded-demo" ||
+            ((isControlled || isEditableReview) && !isWideReview)
               ? "flow"
               : "anchored"
           }
@@ -2365,7 +2526,25 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
                   acceptLabel: controlledReview.acceptLabel,
                   rejectLabel: controlledReview.rejectLabel,
                 }
-              : undefined
+              : isEditableReview
+                ? {
+                    canDecide: true,
+                    disabled: false,
+                    acceptLabel: (id) =>
+                      editableReview?.suggestions.some(
+                        (item) => item.changeId === id,
+                      )
+                        ? "Keep change: use New wording"
+                        : "Keep suggested edit",
+                    rejectLabel: (id) =>
+                      editableReview?.suggestions.some(
+                        (item) => item.changeId === id,
+                      )
+                        ? "Revert change: use Old wording"
+                        : "Revert suggested edit",
+                    allowDeleteThread: true,
+                  }
+                : undefined
           }
           testId="document-review-rail"
           commentGroups={reviewCommentGroups}

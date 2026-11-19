@@ -143,10 +143,12 @@ export function buildLocationForLinkedMarkdownDocument({
   projectPath,
   currentDocumentPath,
   href,
+  unified,
 }: {
   projectPath?: string | null;
   currentDocumentPath?: string | null;
   href: string;
+  unified?: boolean;
 }): string | null {
   if (!projectPath || !currentDocumentPath) return null;
 
@@ -164,6 +166,7 @@ export function buildLocationForLinkedMarkdownDocument({
   url.pathname = browserPath("/");
   url.search = "";
   url.searchParams.set("path", targetPath);
+  if (unified) url.searchParams.set("editor", "unified");
   url.hash = linkedPath.hash;
 
   return `${url.pathname}${url.search}${url.hash}`;

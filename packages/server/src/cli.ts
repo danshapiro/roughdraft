@@ -853,7 +853,10 @@ function printHelp(log: (message: string) => void) {
   log("  roughdraft <path>");
   log("");
   log("Commands:");
-  log("  open <path>        Open a Markdown file and wait for Done Reviewing");
+  log("  edit [path]        Open the editor or start an untitled draft");
+  log(
+    "  open <path>        Open an inline CriticMarkup session and wait for Done Reviewing",
+  );
   log(
     "  propose TARGET --after CANDIDATE  Review edits before writing the target",
   );

@@ -11,8 +11,9 @@ describe("file comparison reviews", () => {
   let target: string;
   const before = "# Policy\r\n\r\nold first\r\nunchanged\r\nold last";
   const after = "# Policy\r\n\r\nnew first\r\nunchanged\r\nnew last";
-  const api = () =>
+  const api = (documentRoot?: string) =>
     createApp({
+      assetRoot: documentRoot,
       homeDir: root,
       comparisonsDir: path.join(root, "comparisons"),
       staticDirPath: root,
@@ -31,6 +32,14 @@ describe("file comparison reviews", () => {
         afterText: after,
         ...extra,
       });
+  const chooseOriginal = async () => {
+    const review = (await create("proposal", { editor: "unified" })).body;
+    const selected = await request(api())
+      .post(`/api/comparisons/${review.id}/base`)
+      .send({ revision: review.revision, choice: "old" });
+    expect(selected.status).toBe(200);
+    return selected.body;
+  };
 
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "roughdraft-comparison-"));
@@ -40,6 +49,656 @@ describe("file comparison reviews", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("starts a comparison unbound and binds the selected unchanged input without writing", async () => {
+    const candidate = path.join(root, "Candidate.md");
+    fs.writeFileSync(candidate, after);
+    const review = (
+      await create("proposal", { editor: "unified", afterPath: candidate })
+    ).body;
+    const route = `/api/comparisons/${review.id}`;
+    expect(review).toMatchObject({
+      destinationPath: null,
+      baseOptions: { old: target, new: candidate },
+    });
+    const originalInode = fs.statSync(target).ino;
+    const selected = await request(api()).post(`${route}/base`).send({
+      revision: review.revision,
+      choice: "old",
+      markdown: "# Annotated old version",
+      cleanMarkdown: before,
+      decisions: {},
+    });
+    expect(selected.status).toBe(200);
+    expect(selected.body).toMatchObject({
+      baseVersion: "old",
+      destinationPath: target,
+      savedText: before,
+      draft: { markdown: "# Annotated old version" },
+      targetChanged: false,
+    });
+    expect(fs.statSync(target).ino).toBe(originalInode);
+    expect(fs.readFileSync(target, "utf8")).toBe(before);
+    const conflicting = await request(api()).post(`${route}/base`).send({
+      revision: review.revision,
+      choice: "new",
+    });
+    expect(conflicting.status).toBe(409);
+    expect(fs.readFileSync(candidate, "utf8")).toBe(after);
+  });
+
+  it("rejects edited or historical input paths and seeds a fresh copy without overwriting files", async () => {
+    const historical = path.join(root, "Historical.md");
+    fs.writeFileSync(historical, before);
+    fs.writeFileSync(target, after);
+    const review = (
+      await create("applied", { editor: "unified", beforePath: historical })
+    ).body;
+    const route = `/api/comparisons/${review.id}`;
+    const select = (fields: object) =>
+      request(api())
+        .post(`${route}/base`)
+        .send({
+          revision: review.revision,
+          ...fields,
+        });
+    expect(review).toMatchObject({ baseOptions: { old: null, new: target } });
+    expect((await select({ choice: "old" })).status).toBe(400);
+    fs.writeFileSync(target, "An external version");
+    expect((await select({ choice: "new" })).status).toBe(409);
+    expect((await select({ choice: "copy", path: historical })).status).toBe(
+      409,
+    );
+    const output = path.join(root, "New base.md");
+    const copied = await select({ choice: "copy", path: output });
+    expect(copied.status).toBe(200);
+    expect(copied.body).toMatchObject({
+      baseVersion: "old",
+      destinationPath: output,
+      savedText: before,
+    });
+    expect(fs.readFileSync(output, "utf8")).toBe(before);
+    expect(fs.readFileSync(historical, "utf8")).toBe(before);
+    expect(fs.readFileSync(target, "utf8")).toBe("An external version");
+  });
+
+  it.each([
+    false,
+    true,
+  ])("creates an empty base preserving review work (prior interruption: %s)", async (interrupted) => {
+    const opened = await request(api())
+      .post("/api/comparisons/document")
+      .send({});
+    expect(opened.status).toBe(201);
+    const route = `/api/comparisons/${opened.body.id}`;
+    const output = path.join(root, "Untitled.md");
+    const proposed = "{++proposed paragraph++}";
+    const comment = {
+      id: "comment",
+      changeId: "document",
+      createdAt: "2026-11-19T12:00:00.000Z",
+      content: "Keep the conversation with the new file.",
+      scope: "document",
+    };
+    const createBase = (revision: number) =>
+      request(api())
+        .post(`${route}/base`)
+        .send({
+          revision,
+          choice: "copy",
+          path: output,
+          markdown: proposed,
+          cleanMarkdown: "",
+          decisions: {},
+          reviewComments: [comment],
+        });
+    let revision = opened.body.revision;
+    if (interrupted) {
+      vi.spyOn(fs, "linkSync").mockImplementationOnce(() => {
+        throw Object.assign(new Error("new file publish interrupted"), {
+          code: "EIO",
+        });
+      });
+      expect((await createBase(revision)).status).toBe(500);
+      expect(fs.existsSync(output)).toBe(false);
+      const recovered = await request(api()).get(route);
+      expect(recovered.body).toMatchObject({
+        destinationPath: null,
+        draft: { markdown: proposed, cleanMarkdown: "" },
+        reviewComments: [comment],
+      });
+      revision = recovered.body.revision;
+    }
+    const copied = await createBase(revision);
+    expect(copied.status).toBe(200);
+    expect(copied.body).toMatchObject({
+      destinationPath: output,
+      savedPath: output,
+      savedText: "",
+      draft: { markdown: proposed, cleanMarkdown: "" },
+      reviewComments: [comment],
+    });
+    expect(fs.readFileSync(output, "utf8")).toBe("");
+    const reopened = await request(api())
+      .post("/api/comparisons/document")
+      .send({ targetPath: output });
+    expect(reopened.body).toMatchObject({
+      id: opened.body.id,
+      draft: { markdown: proposed },
+      reviewComments: [comment],
+    });
+    const rejected = await request(api())
+      .post(`${route}/save`)
+      .send({
+        revision: copied.body.revision,
+        markdown: "",
+        cleanMarkdown: "",
+        decisions: {},
+        reviewComments: [comment],
+      });
+    expect(rejected.status).toBe(200);
+    expect(fs.readFileSync(output, "utf8")).toBe("");
+    expect((await request(api()).get(route)).body).toMatchObject({
+      draft: { markdown: "", cleanMarkdown: "" },
+      reviewComments: [comment],
+    });
+  });
+
+  it("confines hosted sidecar sources and destinations to the document root", async () => {
+    const documentRoot = path.join(root, "documents");
+    const outsideDir = path.join(root, "documents-other");
+    fs.mkdirSync(documentRoot);
+    fs.mkdirSync(outsideDir);
+    const inside = path.join(documentRoot, "Inside.md");
+    const outside = path.join(outsideDir, "Outside.md");
+    const symlink = path.join(documentRoot, "Link.md");
+    const directoryLink = path.join(documentRoot, "Other");
+    fs.writeFileSync(inside, before);
+    fs.writeFileSync(outside, "outside document");
+    fs.symlinkSync(outside, symlink);
+    fs.symlinkSync(outsideDir, directoryLink);
+    const hosted = request(api(documentRoot));
+    const reads = vi.spyOn(fs, "readFileSync");
+    for (const targetPath of [outside, symlink]) {
+      const opened = await hosted
+        .post("/api/comparisons/document")
+        .send({ targetPath });
+      expect(opened.status).toBe(403);
+      const compared = await hosted.post("/api/comparisons").send({
+        mode: "compare",
+        editor: "unified",
+        beforePath: inside,
+        afterPath: targetPath,
+      });
+      expect(compared.status).toBe(403);
+    }
+    expect(reads.mock.calls.some(([filename]) => filename === outside)).toBe(
+      false,
+    );
+    reads.mockRestore();
+    const opened = await hosted
+      .post("/api/comparisons/document")
+      .send({ targetPath: inside });
+    expect(opened.status).toBe(201);
+    const route = `/api/comparisons/${opened.body.id}`;
+    const escaped = path.join(directoryLink, "New.md");
+    expect(
+      (await hosted.get(`${route}/destination`).query({ path: escaped }))
+        .status,
+    ).toBe(403);
+    const saved = await hosted.post(`${route}/save`).send({
+      revision: opened.body.revision,
+      path: escaped,
+      expectedVersion: null,
+      markdown: "copy",
+      decisions: {},
+    });
+    expect(saved.status).toBe(403);
+    expect(fs.existsSync(path.join(outsideDir, "New.md"))).toBe(false);
+    expect(fs.readFileSync(inside, "utf8")).toBe(before);
+    expect(fs.readFileSync(outside, "utf8")).toBe("outside document");
+  });
+
+  it("recovers an editable draft without writing and saves only accepted Markdown", async () => {
+    const review = await chooseOriginal();
+    const route = `/api/comparisons/${review.id}`;
+    const payload = {
+      markdown: "# Draft\r\n\r\n{++pending++}",
+      cleanMarkdown: "# Draft\r\n",
+      decisions: { "kept-content": "kept" },
+    };
+    const recovered = await request(api())
+      .post(`${route}/draft`)
+      .send({ revision: review.revision, ...payload });
+    expect(recovered.status).toBe(200);
+    expect(fs.readFileSync(target, "utf8")).toBe(before);
+    expect((await request(api()).get(route)).body).toMatchObject({
+      draft: payload,
+      savedText: before,
+      savedPath: target,
+    });
+    const saved = await request(api())
+      .post(`${route}/save`)
+      .send({ revision: recovered.body.revision, ...payload });
+    expect(saved.status).toBe(200);
+    expect(saved.body).toMatchObject({
+      status: "open",
+      draft: payload,
+      beforeText: before,
+      afterText: after,
+      destinationPath: target,
+      savedPath: target,
+      savedText: payload.cleanMarkdown,
+      targetChanged: false,
+      completion: null,
+    });
+    expect(fs.readFileSync(target, "utf8")).toBe(payload.cleanMarkdown);
+    expect(fs.statSync(target).mode & 0o777).toBe(0o640);
+  });
+
+  it("guards Save As against existing and newly created files and keeps the reference frozen", async () => {
+    const review = (
+      await request(api()).post("/api/comparisons").send({
+        mode: "compare",
+        editor: "unified",
+        beforeText: before,
+        afterText: after,
+      })
+    ).body;
+    const route = `/api/comparisons/${review.id}`;
+    const output = path.join(root, "Third file.md");
+    const payload = {
+      revision: review.revision,
+      path: output,
+      markdown: after,
+      decisions: {},
+    };
+    const inspect = () =>
+      request(api()).get(`${route}/destination`).query({ path: output });
+    expect((await inspect()).body).toEqual({
+      path: output,
+      version: null,
+      markdown: null,
+    });
+    fs.writeFileSync(output, "another author's file");
+    expect(
+      (
+        await request(api())
+          .post(`${route}/save`)
+          .send({ ...payload, expectedVersion: null })
+      ).status,
+    ).toBe(409);
+    const version = (await inspect()).body.version;
+    expect(
+      (await request(api()).post(`${route}/save`).send(payload)).status,
+    ).toBe(400);
+    expect(fs.readFileSync(output, "utf8")).toBe("another author's file");
+    const result = await request(api())
+      .post(`${route}/save`)
+      .send({ ...payload, expectedVersion: version });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      mode: "compare",
+      targetPath: null,
+      beforeText: before,
+      afterText: after,
+      destinationPath: output,
+      savedText: after,
+    });
+    expect(fs.readFileSync(output, "utf8")).toBe(after);
+    expect(fs.readFileSync(target, "utf8")).toBe(before);
+    const separate = path.join(root, "New.md");
+    const created = await request(api())
+      .post(`${route}/save`)
+      .send({
+        ...payload,
+        revision: result.body.revision,
+        path: separate,
+        expectedVersion: null,
+      });
+    expect(created.status).toBe(200);
+    expect(fs.readFileSync(separate, "utf8")).toBe(after);
+  });
+
+  it("protects externally changed files while preserving drafts, and sends frozen feedback without applying it", async () => {
+    const review = await chooseOriginal();
+    const route = `/api/comparisons/${review.id}`;
+    const initial = { markdown: "first draft", decisions: {} };
+    fs.writeFileSync(target, "external work");
+    const recovered = await request(api())
+      .post(`${route}/draft`)
+      .send({ revision: review.revision, ...initial });
+    expect(recovered.body).toMatchObject({
+      draft: initial,
+      targetChanged: true,
+    });
+    const inspected = await request(api()).get(`${route}/destination`);
+    expect(inspected.body.markdown).toBe("external work");
+    const overwrite = await request(api())
+      .post(`${route}/save`)
+      .send({
+        revision: recovered.body.revision,
+        ...initial,
+        path: target,
+        expectedVersion: inspected.body.version,
+      });
+    expect(overwrite.status).toBe(409);
+    const sent = await request(api())
+      .post(`${route}/send`)
+      .send({
+        revision: recovered.body.revision,
+        ...initial,
+        comment: "unsaved review",
+      });
+    expect(sent.status).toBe(200);
+    expect(sent.body).toMatchObject({
+      status: "completed",
+      completion: { fileWritten: false },
+      feedback: {
+        draft: initial,
+        reference: { label: "After", markdown: after },
+        destinationPath: target,
+        saved: false,
+        comment: "unsaved review",
+      },
+    });
+    const updated = await request(api()).post(`${route}/draft`).send({
+      revision: sent.body.revision,
+      markdown: "later draft",
+      decisions: {},
+    });
+    expect(updated.status).toBe(200);
+    expect(updated.body.feedback).toEqual(sent.body.feedback);
+    expect(fs.readFileSync(target, "utf8")).toBe("external work");
+  });
+
+  it("reopens ordinary drafts by source path and creates independent untitled documents", async () => {
+    const createDocument = (targetPath?: string) =>
+      request(api()).post("/api/comparisons/document").send({ targetPath });
+    const opened = await createDocument(target);
+    expect(opened.status).toBe(201);
+    expect(opened.body).toMatchObject({
+      editor: "unified",
+      mode: "document",
+      afterText: before,
+      destinationPath: target,
+    });
+    const route = `/api/comparisons/${opened.body.id}`;
+    const durable = await request(api()).post(`${route}/draft`).send({
+      revision: opened.body.revision,
+      markdown: "working document",
+      decisions: {},
+    });
+    expect(durable.status).toBe(200);
+    expect((await createDocument(target)).body).toMatchObject({
+      id: opened.body.id,
+      draft: { markdown: "working document" },
+    });
+    const blank = await createDocument();
+    expect(blank.body).toMatchObject({
+      mode: "document",
+      destinationPath: null,
+      afterText: "",
+    });
+    expect((await createDocument()).body.id).not.toBe(blank.body.id);
+  });
+
+  it.each([
+    { name: "a clean edit", annotation: "", keepReview: false },
+    {
+      name: "a pending suggestion",
+      annotation: "\n\n{++pending++}",
+      keepReview: true,
+    },
+  ])("recognizes an external change after $name", async ({
+    annotation,
+    keepReview,
+  }) => {
+    const app = request(api());
+    const open = () =>
+      app.post("/api/comparisons/document").send({ targetPath: target });
+    const source = await open();
+    const markdown = before.replaceAll("\r\n", "\n") + annotation;
+    const saved = await app
+      .post(`/api/comparisons/${source.body.id}/save`)
+      .send({
+        revision: source.body.revision,
+        markdown,
+        cleanMarkdown: before,
+        decisions: {},
+      });
+    expect(saved.status).toBe(200);
+    expect(fs.readFileSync(target, "utf8")).toBe(before);
+    fs.writeFileSync(target, "external revision");
+    const reopened = await open();
+    expect(reopened.status).toBe(201);
+    if (keepReview) {
+      expect(reopened.body).toMatchObject({
+        id: source.body.id,
+        draft: { markdown },
+        targetChanged: true,
+      });
+    } else {
+      expect(reopened.body.id).not.toBe(source.body.id);
+      expect(reopened.body).toMatchObject({
+        savedText: "external revision",
+        targetChanged: false,
+      });
+    }
+  });
+
+  it("opens the Save As review by its new name and keeps the original and displaced reviews separate", async () => {
+    const app = request(api());
+    const open = (targetPath: string) =>
+      app.post("/api/comparisons/document").send({ targetPath });
+    const copy = path.join(root, "Copy.md");
+    fs.writeFileSync(copy, after);
+    const [source, previous] = await Promise.all([open(target), open(copy)]);
+    const route = `/api/comparisons/${source.body.id}`;
+    const contact = {
+      id: "comment",
+      changeId: "document",
+      content: "This follows the copy.",
+      createdAt: "2026-11-19T12:00:00.000Z",
+      scope: "document",
+    };
+    const version = (
+      await app.get(`${route}/destination`).query({ path: copy })
+    ).body.version;
+    const inode = fs.statSync(copy).ino;
+    const saved = await app.post(`${route}/save`).send({
+      revision: source.body.revision,
+      path: copy,
+      expectedVersion: version,
+      markdown: after,
+      decisions: {},
+      reviewComments: [contact],
+    });
+    expect(saved.status).toBe(200);
+    expect(fs.statSync(copy).ino).toBe(inode);
+    expect(fs.readFileSync(target, "utf8")).toBe(before);
+    expect((await open(copy)).body).toMatchObject({
+      id: source.body.id,
+      destinationPath: copy,
+      reviewComments: [contact],
+    });
+    const reopenedSource = await open(target);
+    expect(reopenedSource.body.id).not.toBe(source.body.id);
+    expect(reopenedSource.body).toMatchObject({
+      savedText: before,
+      reviewComments: [],
+    });
+    expect(
+      (await app.get(`/api/comparisons/${previous.body.id}`)).body,
+    ).toMatchObject({
+      id: previous.body.id,
+      destinationPath: copy,
+      reviewComments: [],
+    });
+  });
+
+  it("keeps proposal sidecars separate from opening the same filename", async () => {
+    const app = request(api());
+    const review = await chooseOriginal();
+    const copy = path.join(root, "Proposed copy.md");
+    const saved = await app.post(`/api/comparisons/${review.id}/save`).send({
+      revision: review.revision,
+      path: copy,
+      expectedVersion: null,
+      markdown: after,
+      decisions: {},
+    });
+    expect(saved.status).toBe(200);
+    const opened = await app
+      .post("/api/comparisons/document")
+      .send({ targetPath: copy });
+    expect(opened.body.id).not.toBe(review.id);
+    expect(opened.body).toMatchObject({ mode: "document", savedText: after });
+  });
+
+  it("opens the moved review by its new name even after an interrupted Save As", async () => {
+    const app = request(api());
+    const open = (targetPath: string) =>
+      app.post("/api/comparisons/document").send({ targetPath });
+    const source = await open(target);
+    const route = `/api/comparisons/${source.body.id}`;
+    const copy = path.join(root, "Recovered copy.md");
+    const link = fs.linkSync.bind(fs);
+    const rename = fs.renameSync.bind(fs);
+    let published = false;
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      link(from, to);
+      if (to === copy) published = true;
+    });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (published)
+        throw Object.assign(new Error("save bookkeeping interrupted"), {
+          code: "EIO",
+        });
+      rename(from, to);
+    });
+    const saved = await app.post(`${route}/save`).send({
+      revision: source.body.revision,
+      path: copy,
+      expectedVersion: null,
+      markdown: after,
+      decisions: {},
+    });
+    expect(saved.status).toBe(500);
+    vi.restoreAllMocks();
+    const inode = fs.statSync(copy).ino;
+    const recovered = await open(copy);
+    expect(recovered.body).toMatchObject({
+      id: source.body.id,
+      destinationPath: copy,
+      savedText: after,
+      targetChanged: false,
+    });
+    expect(fs.statSync(copy).ino).toBe(inode);
+    expect((await open(target)).body.id).not.toBe(source.body.id);
+  });
+
+  it("retains filename ownership when a Save As stopped before replacing the destination", async () => {
+    const app = request(api());
+    const open = (targetPath: string) =>
+      app.post("/api/comparisons/document").send({ targetPath });
+    const copy = path.join(root, "Existing.md");
+    fs.writeFileSync(copy, after);
+    const [source, previous] = await Promise.all([open(target), open(copy)]);
+    const route = `/api/comparisons/${source.body.id}`;
+    const version = (
+      await app.get(`${route}/destination`).query({ path: copy })
+    ).body.version;
+    const rename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (to === copy)
+        throw Object.assign(new Error("file replacement interrupted"), {
+          code: "EIO",
+        });
+      rename(from, to);
+    });
+    const saved = await app.post(`${route}/save`).send({
+      revision: source.body.revision,
+      path: copy,
+      expectedVersion: version,
+      markdown: "my changed draft",
+      decisions: {},
+    });
+    expect(saved.status).toBe(500);
+    vi.restoreAllMocks();
+    expect((await open(copy)).body.id).toBe(previous.body.id);
+    expect((await open(target)).body).toMatchObject({
+      id: source.body.id,
+      destinationPath: target,
+      draft: { markdown: "my changed draft" },
+    });
+    expect(fs.readFileSync(copy, "utf8")).toBe(after);
+  });
+
+  it("recovers a successful Save after an interrupted record update without replaying it", async () => {
+    const review = await chooseOriginal();
+    const route = `/api/comparisons/${review.id}`;
+    const rename = fs.renameSync.bind(fs);
+    let targetRenamed = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (targetRenamed)
+        throw Object.assign(new Error("record update failed"), { code: "EIO" });
+      rename(source, destination);
+      if (destination === target) targetRenamed = true;
+    });
+    const payload = {
+      revision: review.revision,
+      markdown: after,
+      decisions: {},
+    };
+    expect(
+      (await request(api()).post(`${route}/save`).send(payload)).status,
+    ).toBe(500);
+    expect(fs.readFileSync(target, "utf8")).toBe(after);
+    vi.restoreAllMocks();
+    const recovered = await request(api()).get(route);
+    expect(recovered.body).toMatchObject({
+      status: "open",
+      savedText: after,
+      draft: { markdown: after },
+      targetChanged: false,
+    });
+    fs.writeFileSync(target, "newer text");
+    expect(
+      (await request(api()).post(`${route}/save`).send(payload)).status,
+    ).toBe(409);
+    expect(fs.readFileSync(target, "utf8")).toBe("newer text");
+  });
+
+  it("saves the draft on interrupted Save recovery without overwriting the externally changed file", async () => {
+    const review = await chooseOriginal();
+    const route = `/api/comparisons/${review.id}`;
+    const rename = fs.renameSync.bind(fs);
+    let targetRenamed = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (targetRenamed)
+        throw Object.assign(new Error("record update failed"), { code: "EIO" });
+      rename(source, destination);
+      if (destination === target) targetRenamed = true;
+    });
+    expect(
+      (
+        await request(api())
+          .post(`${route}/save`)
+          .send({ revision: review.revision, markdown: after, decisions: {} })
+      ).status,
+    ).toBe(500);
+    vi.restoreAllMocks();
+    fs.writeFileSync(target, "newer text");
+    const recovered = await request(api()).get(route);
+    expect(recovered.body).toMatchObject({
+      status: "open",
+      savedText: before,
+      draft: { markdown: after },
+      targetChanged: true,
+    });
+    expect(fs.readFileSync(target, "utf8")).toBe("newer text");
   });
 
   it("persists choices separately and only applies selected proposed blocks, preserving exact bytes and mode", async () => {

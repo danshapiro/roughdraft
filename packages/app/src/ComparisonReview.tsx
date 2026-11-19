@@ -22,6 +22,7 @@ import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
 import type { ControlledDocumentReview } from "./controlled-review";
 import { RichTextEditorSurface } from "./PageCard";
+import { RevisionEditor } from "./RevisionEditor";
 import "./ComparisonReview.css";
 
 type ComparisonView = "diff" | ComparisonPreviewVersion;
@@ -321,7 +322,13 @@ function NativeComparisonDocument({
   );
 }
 
-export function ComparisonReview({ id }: { id: string }) {
+export function ComparisonReview({
+  id,
+  linkedPath,
+}: {
+  id: string;
+  linkedPath?: string;
+}) {
   const [review, setReview] = useState<Comparison | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<"saved" | "saving" | "failed">(
@@ -421,9 +428,18 @@ export function ComparisonReview({ id }: { id: string }) {
 
   useEffect(() => {
     mountedRef.current = true;
-    requestComparison(id)
+    requestComparison(
+      id,
+      undefined,
+      linkedPath ? { targetPath: linkedPath } : undefined,
+    )
       .then((next) => {
         if (!mountedRef.current) return;
+        if (linkedPath) {
+          const url = new URL(window.location.href);
+          url.search = new URLSearchParams({ comparison: next.id }).toString();
+          window.history.replaceState(null, "", url);
+        }
         savedRef.current = next;
         setReview(next);
         setError(null);
@@ -434,7 +450,7 @@ export function ComparisonReview({ id }: { id: string }) {
     return () => {
       mountedRef.current = false;
     };
-  }, [id]);
+  }, [id, linkedPath]);
 
   const drain = useCallback(async () => {
     if (savingRef.current || failedRef.current || !savedRef.current) return;
@@ -566,6 +582,9 @@ export function ComparisonReview({ id }: { id: string }) {
         </p>
       </main>
     );
+  if (review.editor === "unified")
+    return <RevisionEditor key={review.id} initial={review} />;
+
   const changes = review.segments.filter(
     (segment) => segment.kind === "change",
   );

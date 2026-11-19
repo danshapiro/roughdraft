@@ -109,6 +109,7 @@ describe("comparison CLI", () => {
     const [url, init] = f.fetchImpl.mock.calls[0];
     expect(String(url)).toBe("http://localhost:7373/api/comparisons");
     expect(JSON.parse(String(init?.body))).toEqual({
+      editor: "unified",
       mode: "proposal",
       targetPath: target,
       afterPath: candidate,
@@ -137,6 +138,7 @@ describe("comparison CLI", () => {
       ),
     ).toBe(0);
     expect(JSON.parse(String(f.fetchImpl.mock.calls[0][1]?.body))).toEqual({
+      editor: "unified",
       mode: "applied",
       targetPath: target,
       beforePath: before,
@@ -151,6 +153,7 @@ describe("comparison CLI", () => {
       ),
     ).toBe(0);
     expect(JSON.parse(String(f.fetchImpl.mock.calls[1][1]?.body))).toEqual({
+      editor: "unified",
       mode: "compare",
       beforePath: before,
       afterPath: target,

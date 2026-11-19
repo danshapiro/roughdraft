@@ -83,8 +83,9 @@ interface DocumentReviewRailProps {
   reviewControls?: {
     canDecide: boolean;
     disabled: boolean;
-    acceptLabel: string;
-    rejectLabel: string;
+    acceptLabel: string | ((id: string) => string);
+    rejectLabel: string | ((id: string) => string);
+    allowDeleteThread?: boolean;
   };
 }
 
@@ -624,7 +625,11 @@ export function DocumentReviewRail({
                   [
                     {
                       key: "accept",
-                      label: reviewControls?.acceptLabel ?? "Accept suggestion",
+                      label:
+                        typeof reviewControls?.acceptLabel === "function"
+                          ? reviewControls.acceptLabel(suggestion.changeId)
+                          : (reviewControls?.acceptLabel ??
+                            "Accept suggestion"),
                       icon: <Check className="size-3.5" />,
                       compact: true,
                       onClick: (event) => {
@@ -634,7 +639,11 @@ export function DocumentReviewRail({
                     },
                     {
                       key: "reject",
-                      label: reviewControls?.rejectLabel ?? "Reject suggestion",
+                      label:
+                        typeof reviewControls?.rejectLabel === "function"
+                          ? reviewControls.rejectLabel(suggestion.changeId)
+                          : (reviewControls?.rejectLabel ??
+                            "Reject suggestion"),
                       tone: "danger",
                       icon: <X className="size-3.5" />,
                       compact: true,
@@ -701,7 +710,9 @@ export function DocumentReviewRail({
               ) : null}
               <CommentEditorList
                 readOnly={reviewControls?.disabled}
-                allowDeleteThread={!reviewControls}
+                allowDeleteThread={
+                  reviewControls?.allowDeleteThread ?? !reviewControls
+                }
                 comments={suggestionThreadComments}
                 variant="rail"
                 selectedCommentId={

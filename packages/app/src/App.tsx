@@ -1481,10 +1481,13 @@ export function PreviewPage() {
 }
 
 export function App() {
-  const comparisonId = new URLSearchParams(window.location.search).get(
-    "comparison",
-  );
+  const query = new URLSearchParams(window.location.search);
+  const comparisonId = query.get("comparison");
   if (comparisonId) return <ComparisonReview id={comparisonId} />;
+  const linkedPath = query.get("path");
+  if (linkedPath && query.get("editor") === "unified") {
+    return <ComparisonReview id="document" linkedPath={linkedPath} />;
+  }
   return <DocumentApp />;
 }
 
