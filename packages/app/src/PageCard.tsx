@@ -43,13 +43,15 @@ import {
   commentHighlightPluginKey,
   createEditorExtensions,
   criticChangeHighlightPluginKey,
+  readCriticBlockChange,
   SUGGESTED_PARAGRAPH_SENTINEL,
 } from "./editor-extensions";
 import { cn } from "./lib/utils";
 import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
 import { LinkAffordances } from "./LinkAffordances";
 import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
-import { toHtml } from "./markdown";
+import { toHtml, splitYamlDocumentMetadata } from "./markdown";
+import { resolveSuggestionSource } from "./resolve-suggestion";
 import type { Page, StorageBackend } from "./storage";
 import { useCommentAnchorLayout } from "./useCommentAnchorLayout";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
@@ -436,12 +438,14 @@ function getDocumentCriticChangeRailItems(
   }
 
   const changeElements = editorElement.querySelectorAll<HTMLElement>(
-    ".critic-change[data-critic-change-id]",
+    ".critic-change[data-critic-change-id], .critic-change-block[data-critic-block]",
   );
   const editorRect = editorElement.getBoundingClientRect();
 
   for (const element of changeElements) {
-    const changeId = element.dataset.criticChangeId;
+    const changeId =
+      element.dataset.criticChangeId ??
+      readCriticBlockChange(element)?.changeId;
     if (!changeId) continue;
 
     const rect = element.getBoundingClientRect();
@@ -461,16 +465,23 @@ function getDocumentCriticChangeRailItems(
   }
 
   editor.state.doc.descendants((node) => {
-    if (suppliedSuggestions || !node.isText || !node.text) return;
-
+    if (suppliedSuggestions) return;
+    const blockChange =
+      node.type.name === "criticChangeBlock"
+        ? (node.attrs.change as CriticChangeAttrs)
+        : null;
+    if (!blockChange && (!node.isText || !node.text)) return;
     const changeMark = node.marks.find(
       (mark) =>
         mark.type.name === "criticChange" &&
         typeof mark.attrs.changeId === "string",
     );
-    if (!changeMark) return;
-
-    const change = changeMark.attrs as CriticChangeAttrs;
+    const change =
+      blockChange ?? (changeMark?.attrs as CriticChangeAttrs | undefined);
+    if (!change) return;
+    const text = blockChange
+      ? node.textBetween(0, node.content.size, "\n")
+      : node.text;
     const changeId = change.changeId;
     const kind =
       change.kind === "substitution-new" ? "substitution-old" : change.kind;
@@ -494,9 +505,9 @@ function getDocumentCriticChangeRailItems(
     existing.kind = kind;
 
     if (change.kind === "addition" || change.kind === "substitution-new") {
-      existing.newText += node.text;
+      existing.newText += text;
     } else {
-      existing.oldText += node.text;
+      existing.oldText += text;
     }
 
     for (const mark of node.marks) {
@@ -508,7 +519,12 @@ function getDocumentCriticChangeRailItems(
       ];
     }
 
+    if (blockChange)
+      existing.commentIds = [
+        ...new Set([...existing.commentIds, ...(node.attrs.commentIds ?? [])]),
+      ];
     changes.set(changeId, existing);
+    if (blockChange) return false;
   });
 
   for (const change of changes.values()) {
@@ -657,6 +673,8 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const interactionModeRef = useRef<DocumentInteractionMode>(interactionMode);
   const commentsRef = useRef<Map<string, CriticComment>>(new Map());
   const suppressNextMarkdownUpdateRef = useRef(false);
+  const resolvingSuggestionRef = useRef(false);
+  const currentMarkdownRef = useRef(sourceMarkdown);
   const lastFocusRequestKeyRef = useRef<string | null>(null);
   const selectedCommentIdRef = useRef<string | null>(null);
   const selectedChangeIdRef = useRef<string | null>(null);
@@ -749,16 +767,16 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       const currentDoc = doc ?? currentEditor?.getJSON();
       if (!currentDoc) return;
 
-      onMarkdownChange(
-        editorStateToCriticMarkdown(
-          currentDoc,
-          nextComments ?? commentsRef.current,
-          {
-            frontmatter: frontmatterRef.current,
-            endmatter: endmatterRef.current,
-          },
-        ),
+      const nextMarkdown = editorStateToCriticMarkdown(
+        currentDoc,
+        nextComments ?? commentsRef.current,
+        {
+          frontmatter: frontmatterRef.current,
+          endmatter: endmatterRef.current,
+        },
       );
+      currentMarkdownRef.current = nextMarkdown;
+      onMarkdownChange(nextMarkdown);
     },
     [onMarkdownChange],
   );
@@ -1295,7 +1313,8 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         },
       },
       onUpdate: ({ editor: currentEditor, transaction }) => {
-        if (controlledReviewRef.current) return;
+        if (controlledReviewRef.current || resolvingSuggestionRef.current)
+          return;
         if (suppressNextMarkdownUpdateRef.current) {
           suppressNextMarkdownUpdateRef.current = false;
           return;
@@ -1992,46 +2011,69 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     [],
   );
 
-  const acceptSuggestion = useCallback(
-    (changeId: string) => {
+  const decideSuggestion = useCallback(
+    (changeId: string, decision: "accept" | "reject") => {
       const controlled = controlledReviewRef.current;
       if (controlled) {
-        if (controlled.canDecide && !controlled.disabled)
-          controlled.onAccept(changeId);
+        if (controlled.canDecide && !controlled.disabled) {
+          if (decision === "accept") controlled.onAccept(changeId);
+          else controlled.onReject(changeId);
+        }
         return;
       }
       const currentEditor = editorRef.current;
       if (!currentEditor) return;
 
-      currentEditor.chain().focus().acceptCriticChange(changeId).run();
-      const nextComments = removeSuggestionComments(changeId, currentEditor);
-      setSelectedChangeId((current) => (current === changeId ? null : current));
-      setHoveredChangeId((current) => (current === changeId ? null : current));
-      emitMarkdownChange(currentEditor.getJSON(), nextComments);
-      refreshCriticChanges();
+      const resolvedSource = resolveSuggestionSource(
+        currentMarkdownRef.current,
+        changeId,
+        decision,
+      );
+      // Commands and reply cleanup can each dispatch an update. Save the final
+      // document once, after both have completed, to avoid competing autosaves.
+      resolvingSuggestionRef.current = true;
+      try {
+        const chain = currentEditor.chain().focus();
+        const changed =
+          decision === "accept"
+            ? chain.acceptCriticChange(changeId).run()
+            : chain.rejectCriticChange(changeId).run();
+        if (!changed) return;
+        const nextComments = removeSuggestionComments(changeId, currentEditor);
+        setSelectedChangeId((current) =>
+          current === changeId ? null : current,
+        );
+        setHoveredChangeId((current) =>
+          current === changeId ? null : current,
+        );
+        if (resolvedSource !== null) {
+          currentMarkdownRef.current = resolvedSource;
+          endmatterRef.current =
+            splitYamlDocumentMetadata(resolvedSource).endmatter;
+          onMarkdownChange(resolvedSource);
+        } else {
+          emitMarkdownChange(currentEditor.getJSON(), nextComments);
+        }
+        refreshCriticChanges();
+      } finally {
+        resolvingSuggestionRef.current = false;
+      }
     },
-    [emitMarkdownChange, refreshCriticChanges, removeSuggestionComments],
+    [
+      emitMarkdownChange,
+      onMarkdownChange,
+      refreshCriticChanges,
+      removeSuggestionComments,
+    ],
   );
 
+  const acceptSuggestion = useCallback(
+    (changeId: string) => decideSuggestion(changeId, "accept"),
+    [decideSuggestion],
+  );
   const rejectSuggestion = useCallback(
-    (changeId: string) => {
-      const controlled = controlledReviewRef.current;
-      if (controlled) {
-        if (controlled.canDecide && !controlled.disabled)
-          controlled.onReject(changeId);
-        return;
-      }
-      const currentEditor = editorRef.current;
-      if (!currentEditor) return;
-
-      currentEditor.chain().focus().rejectCriticChange(changeId).run();
-      const nextComments = removeSuggestionComments(changeId, currentEditor);
-      setSelectedChangeId((current) => (current === changeId ? null : current));
-      setHoveredChangeId((current) => (current === changeId ? null : current));
-      emitMarkdownChange(currentEditor.getJSON(), nextComments);
-      refreshCriticChanges();
-    },
-    [emitMarkdownChange, refreshCriticChanges, removeSuggestionComments],
+    (changeId: string) => decideSuggestion(changeId, "reject"),
+    [decideSuggestion],
   );
 
   const replyToSuggestion = useCallback(

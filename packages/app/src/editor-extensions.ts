@@ -14,7 +14,7 @@ import type {
   Mark as ProseMirrorMark,
   Node as ProseMirrorNode,
 } from "@tiptap/pm/model";
-import { Plugin, PluginKey } from "@tiptap/pm/state";
+import { Plugin, PluginKey, type Transaction } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
 import { browserAnchorPath } from "./browser-base-path";
@@ -49,6 +49,162 @@ export interface CriticChangeAttrs {
   authorType?: "user" | "ai";
   authorId?: string | null;
   createdAt: string;
+}
+
+export function readCriticBlockChange(
+  element: HTMLElement,
+): CriticChangeAttrs | null {
+  try {
+    const change = JSON.parse(
+      element.getAttribute("data-critic-block") ?? "null",
+    );
+    return change &&
+      isCriticChangeKind(change.kind) &&
+      typeof change.changeId === "string" &&
+      typeof change.createdAt === "string"
+      ? (change as CriticChangeAttrs)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// A block-spanning suggestion owns its paragraphs/lists as a single unit. Text
+// still carries the ordinary review marks for highlighting and the review rail.
+const CriticChangeBlock = Node.create({
+  name: "criticChangeBlock",
+  group: "block",
+  content: "block+",
+  defining: true,
+  addAttributes() {
+    return {
+      commentIds: {
+        default: [],
+        parseHTML: (element) => {
+          try {
+            return JSON.parse(element.getAttribute("data-comment-ids") ?? "[]");
+          } catch {
+            return [];
+          }
+        },
+        renderHTML: () => ({}),
+      },
+      change: {
+        default: null,
+        parseHTML: (element) => readCriticBlockChange(element as HTMLElement),
+        renderHTML: () => ({}),
+      },
+    };
+  },
+  parseHTML() {
+    return [{ tag: "div[data-critic-block]" }];
+  },
+  renderHTML({ node }) {
+    return [
+      "div",
+      {
+        "data-critic-block": JSON.stringify(node.attrs.change),
+        "data-comment-ids": JSON.stringify(node.attrs.commentIds),
+        class: "critic-change-block",
+      },
+      0,
+    ];
+  },
+});
+
+// Unchanged partial paragraphs at the ends of a block-spanning selection.
+// Keeping these separate lets either version own arbitrary Markdown blocks.
+const CriticChangeBoundary = Node.create({
+  name: "criticChangeBoundary",
+  group: "block",
+  content: "block+",
+  defining: true,
+  addAttributes() {
+    return {
+      changeId: { default: null },
+      side: { default: "prefix" },
+      source: { default: "" },
+    };
+  },
+  parseHTML() {
+    return [
+      {
+        tag: "div[data-critic-boundary]",
+        preserveWhitespace: "full",
+        getAttrs: (element) => {
+          try {
+            return JSON.parse(
+              (element as HTMLElement).getAttribute("data-critic-boundary") ??
+                "null",
+            );
+          } catch {
+            return false;
+          }
+        },
+      },
+    ];
+  },
+  renderHTML({ node }) {
+    return ["div", { "data-critic-boundary": JSON.stringify(node.attrs) }, 0];
+  },
+});
+
+function resolveCriticBoundaries(
+  tr: Transaction,
+  changeId: string,
+  hasKeptContent: boolean,
+) {
+  for (const side of ["prefix", "suffix"]) {
+    let boundary: { node: ProseMirrorNode; pos: number } | undefined;
+    tr.doc.descendants((node, pos) => {
+      if (
+        node.type.name === "criticChangeBoundary" &&
+        node.attrs.changeId === changeId &&
+        node.attrs.side === side
+      ) {
+        boundary = { node, pos };
+        return false;
+      }
+    });
+    if (!boundary) continue;
+    const { node, pos } = boundary;
+    const $edge = tr.doc.resolve(side === "prefix" ? pos + node.nodeSize : pos);
+    const neighbor = side === "prefix" ? $edge.nodeAfter : $edge.nodeBefore;
+    const neighborPos =
+      side === "prefix" ? $edge.pos : $edge.pos - (neighbor?.nodeSize ?? 0);
+    const canMerge =
+      hasKeptContent ||
+      (neighbor?.type.name === "criticChangeBoundary" &&
+        neighbor.attrs.changeId === changeId);
+    if (
+      canMerge &&
+      node.childCount === 1 &&
+      node.firstChild?.isTextblock &&
+      neighbor
+    ) {
+      let target = neighbor;
+      let targetPos = neighborPos;
+      while (!target.isTextblock && target.childCount > 0) {
+        const child = side === "prefix" ? target.firstChild : target.lastChild;
+        if (!child) break;
+        if (side === "prefix") targetPos += 1;
+        else targetPos += target.nodeSize - 1 - child.nodeSize;
+        target = child;
+      }
+      if (target.isTextblock) {
+        const insertionPos =
+          targetPos + 1 + (side === "suffix" ? target.content.size : 0);
+        const mappingStart = tr.mapping.maps.length;
+        tr.delete(pos, pos + node.nodeSize);
+        tr.insert(
+          tr.mapping.slice(mappingStart).map(insertionPos),
+          node.firstChild.content,
+        );
+        continue;
+      }
+    }
+    tr.replaceWith(pos, pos + node.nodeSize, node.content);
+  }
 }
 
 export const SUGGESTED_PARAGRAPH_SENTINEL = "\u2060";
@@ -189,11 +345,26 @@ function collectCriticChangeRanges(doc: ProseMirrorNode, changeId: string) {
     to: number;
     kind: CriticChangeKind;
     mark: ProseMirrorMark;
+    block?: boolean;
   }> = [];
 
   if (!markType) return ranges;
 
   doc.descendants((node, pos) => {
+    if (
+      node.type.name === "criticChangeBlock" &&
+      node.attrs.change?.changeId === changeId
+    ) {
+      const change = node.attrs.change as CriticChangeAttrs;
+      ranges.push({
+        from: pos,
+        to: pos + node.nodeSize,
+        kind: change.kind,
+        mark: markType.create(change),
+        block: true,
+      });
+      return false;
+    }
     if (!node.isText) return;
 
     const mark = node.marks.find(
@@ -355,6 +526,19 @@ const CriticChange = Mark.create({
           const tr = state.tr;
 
           for (const range of [...ranges].reverse()) {
+            if (range.block) {
+              if (
+                range.kind === "deletion" ||
+                range.kind === "substitution-old"
+              ) {
+                tr.delete(range.from, range.to);
+              } else {
+                tr.removeMark(range.from, range.to, range.mark);
+                const block = tr.doc.nodeAt(range.from);
+                if (block) tr.replaceWith(range.from, range.to, block.content);
+              }
+              continue;
+            }
             if (
               range.kind === "deletion" ||
               range.kind === "substitution-old"
@@ -380,6 +564,14 @@ const CriticChange = Mark.create({
             }
           }
 
+          resolveCriticBoundaries(
+            tr,
+            changeId,
+            ranges.some(
+              (range) =>
+                range.kind === "addition" || range.kind === "substitution-new",
+            ),
+          );
           if (dispatch) dispatch(tr);
           return true;
         },
@@ -395,6 +587,19 @@ const CriticChange = Mark.create({
           const tr = state.tr;
 
           for (const range of [...ranges].reverse()) {
+            if (range.block) {
+              if (
+                range.kind === "addition" ||
+                range.kind === "substitution-new"
+              ) {
+                tr.delete(range.from, range.to);
+              } else {
+                tr.removeMark(range.from, range.to, range.mark);
+                const block = tr.doc.nodeAt(range.from);
+                if (block) tr.replaceWith(range.from, range.to, block.content);
+              }
+              continue;
+            }
             if (
               range.kind === "addition" ||
               range.kind === "substitution-new"
@@ -418,6 +623,14 @@ const CriticChange = Mark.create({
             }
           }
 
+          resolveCriticBoundaries(
+            tr,
+            changeId,
+            ranges.some(
+              (range) =>
+                range.kind === "deletion" || range.kind === "substitution-old",
+            ),
+          );
           if (dispatch) dispatch(tr);
           return true;
         },
@@ -974,6 +1187,8 @@ export function createEditorExtensions(placeholder: string) {
     ComparisonReadingAnchor,
     CommentRef,
     CriticChange,
+    CriticChangeBlock,
+    CriticChangeBoundary,
     RawMarkdownBlock,
     EndnoteReference,
     EndnoteDefinition,
