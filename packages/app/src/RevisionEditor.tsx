@@ -16,6 +16,7 @@ import {
   Copy,
   Download,
   MessageSquare,
+  MoreHorizontal,
   Redo2,
   Undo2,
 } from "lucide-react";
@@ -36,6 +37,11 @@ import {
 } from "./components/ui/dialog";
 import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "./components/ui/popover";
 import {
   Tooltip,
   TooltipContent,
@@ -348,6 +354,19 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const [blocked, setBlocked] = useState(false);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [compactTools, setCompactTools] = useState(
+    () => window.matchMedia("(max-width: 1023px), (pointer: coarse)").matches,
+  );
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 1023px), (pointer: coarse)");
+    const update = () => {
+      setCompactTools(query.matches);
+      setMoreOpen(false);
+    };
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
   const [saveAs, setSaveAs] = useState(false);
   const [choosingBase, setChoosingBase] = useState(false);
   const [baseChoice, setBaseChoice] = useState<BaseSelection>("copy");
@@ -879,6 +898,102 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         : destination
           ? "Saving…"
           : "No file";
+  const secondaryTools = (
+    <>
+      <div
+        className="revision-tool-group"
+        role="group"
+        aria-label="Document view"
+      >
+        <TipButton
+          tip={
+            formatted
+              ? "Show the Markdown that Save would write."
+              : "Return to the rendered editor."
+          }
+          data-testid="revision-format"
+          variant="ghost"
+          onClick={() => {
+            setMoreOpen(false);
+            captures.current();
+            if (formatted) currentDraft();
+            setFormatted(!formatted);
+          }}
+        >
+          {formatted ? "Markdown" : "Formatted"}
+        </TipButton>
+        <TipButton
+          tip="Copy the Markdown that Save would write."
+          aria-label="Copy Markdown"
+          data-testid="revision-copy"
+          variant="ghost"
+          size="icon"
+          onClick={() => {
+            const draft = currentDraft();
+            void copyRevisionMarkdown(
+              draft.cleanMarkdown ?? draft.markdown,
+            ).then(() => {
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1400);
+            }, reportError);
+          }}
+        >
+          {copied ? <Check /> : <Copy />}
+        </TipButton>
+        <TipButton
+          tip="Download the Markdown that Save would write."
+          aria-label="Download Markdown"
+          data-testid="revision-download"
+          variant="ghost"
+          size="icon"
+          onClick={() => {
+            const draft = currentDraft();
+            downloadRevisionMarkdown(
+              draft.cleanMarkdown ?? draft.markdown,
+              filename,
+            );
+          }}
+        >
+          <Download />
+        </TipButton>
+      </div>
+      <div
+        className="revision-tool-group"
+        aria-label="Save and send"
+        role="group"
+      >
+        <TipButton
+          tip="Send a snapshot and comments to the agent. This does not write a file."
+          data-testid="revision-send"
+          variant="outline"
+          disabled={busy || reviewChanged}
+          onClick={() => {
+            setMoreOpen(false);
+            setActionError("");
+            setSendOpen(true);
+          }}
+        >
+          Send feedback
+        </TipButton>
+        <TipButton
+          tip={
+            destination
+              ? "Copy the current Markdown and continue editing the copy."
+              : "Choose which Markdown file to edit."
+          }
+          data-testid="revision-save-as"
+          variant="ghost"
+          disabled={busy}
+          onClick={() => {
+            setMoreOpen(false);
+            showSaveAs();
+          }}
+        >
+          {destination || reviewChanged ? "Save As…" : "Choose a file"}
+        </TipButton>
+      </div>
+    </>
+  );
   return (
     <TooltipProvider delay={300}>
       <header
@@ -888,10 +1003,28 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       >
         <div className="revision-header-inner">
           <div className="revision-identity">
-            <h1 data-testid="revision-path">
+            <h1
+              data-testid="revision-path"
+              title={destination ?? "No file selected"}
+            >
               {destination ?? "No file selected"}
             </h1>
-            {reference !== null && <span>Comparing with {referenceLabel}</span>}
+            {reference !== null && (
+              <span className="revision-reference-label">
+                Comparing with {referenceLabel}
+              </span>
+            )}
+            <span
+              className="revision-file-status"
+              data-testid="revision-file-status"
+              title={
+                recoveryPending
+                  ? "Saving changes."
+                  : "Status of the selected Markdown file."
+              }
+            >
+              {fileState}
+            </span>
           </div>
           <div className="revision-tools">
             <div
@@ -958,62 +1091,6 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 onClick={() => editor?.commands.redo()}
               >
                 <Redo2 />
-              </TipButton>
-            </div>
-            <div
-              className="revision-tool-group"
-              role="group"
-              aria-label="Document view"
-            >
-              <TipButton
-                tip={
-                  formatted
-                    ? "Show the Markdown that Save would write."
-                    : "Return to the rendered editor."
-                }
-                data-testid="revision-format"
-                variant="ghost"
-                onClick={() => {
-                  captures.current();
-                  if (formatted) currentDraft();
-                  setFormatted(!formatted);
-                }}
-              >
-                {formatted ? "Markdown" : "Formatted"}
-              </TipButton>
-              <TipButton
-                tip="Copy the Markdown that Save would write."
-                aria-label="Copy Markdown"
-                data-testid="revision-copy"
-                variant="ghost"
-                size="icon"
-                onClick={() => {
-                  const draft = currentDraft();
-                  void copyRevisionMarkdown(
-                    draft.cleanMarkdown ?? draft.markdown,
-                  ).then(() => {
-                    setCopied(true);
-                    window.setTimeout(() => setCopied(false), 1400);
-                  }, reportError);
-                }}
-              >
-                {copied ? <Check /> : <Copy />}
-              </TipButton>
-              <TipButton
-                tip="Download the Markdown that Save would write."
-                aria-label="Download Markdown"
-                data-testid="revision-download"
-                variant="ghost"
-                size="icon"
-                onClick={() => {
-                  const draft = currentDraft();
-                  downloadRevisionMarkdown(
-                    draft.cleanMarkdown ?? draft.markdown,
-                    filename,
-                  );
-                }}
-              >
-                <Download />
               </TipButton>
             </div>
             <div
@@ -1093,51 +1170,31 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 </>
               )}
             </div>
-            <div
-              className="revision-tool-group"
-              aria-label="Save and send"
-              role="group"
-            >
-              <TipButton
-                tip={
-                  recoveryPending
-                    ? "Saving changes."
-                    : "Status of the selected Markdown file."
-                }
-                variant="ghost"
-                data-testid="revision-file-status"
-                className="w-[5rem] pointer-events-auto cursor-default text-muted-foreground"
-                tabIndex={0}
-                aria-disabled="true"
-              >
-                {fileState}
-              </TipButton>
-              <TipButton
-                tip="Send a snapshot and comments to the agent. This does not write a file."
-                data-testid="revision-send"
-                variant="outline"
-                disabled={busy || reviewChanged}
-                onClick={() => {
-                  setActionError("");
-                  setSendOpen(true);
-                }}
-              >
-                Send feedback
-              </TipButton>
-              <TipButton
-                tip={
-                  destination
-                    ? "Copy the current Markdown and continue editing the copy."
-                    : "Choose which Markdown file to edit."
-                }
-                data-testid="revision-save-as"
-                variant="ghost"
-                disabled={busy}
-                onClick={showSaveAs}
-              >
-                {destination || reviewChanged ? "Save As…" : "Choose a file"}
-              </TipButton>
-            </div>
+            {compactTools ? (
+              <Popover open={moreOpen} onOpenChange={setMoreOpen}>
+                <PopoverTrigger
+                  render={
+                    <Button
+                      variant="outline"
+                      aria-label="More actions"
+                      data-testid="revision-more"
+                    />
+                  }
+                >
+                  <MoreHorizontal />
+                  More
+                </PopoverTrigger>
+                <PopoverContent
+                  className="revision-more-actions"
+                  data-testid="revision-more-actions"
+                  aria-label="More actions"
+                >
+                  {secondaryTools}
+                </PopoverContent>
+              </Popover>
+            ) : (
+              secondaryTools
+            )}
           </div>
         </div>
       </header>
@@ -1262,7 +1319,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           setChoosingBase(open);
         }}
       >
-        <DialogContent>
+        <DialogContent data-testid="revision-base-dialog">
           <DialogTitle>Choose a file</DialogTitle>
           <DialogDescription className="sr-only">
             Edits and review choices save to this file as you work.

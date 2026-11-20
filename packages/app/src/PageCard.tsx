@@ -2645,7 +2645,10 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           <div className={contentInsetClass}>
             <div
               data-testid="document-content-card"
-              className={cn(contentCardClass, "px-10 py-10 sm:px-14 sm:py-14")}
+              className={cn(
+                contentCardClass,
+                "document-content-card px-10 py-10 sm:px-14 sm:py-14",
+              )}
             >
               <EditorContextMenu
                 editor={isControlled ? null : editor}

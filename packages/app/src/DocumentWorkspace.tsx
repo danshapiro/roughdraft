@@ -713,7 +713,7 @@ export function DocumentWorkspace({
   return (
     <div
       className={cn(
-        "min-h-0 flex-1 overflow-y-auto px-8 pb-8 sm:px-12",
+        "document-workspace min-h-0 flex-1 overflow-y-auto px-8 pb-8 sm:px-12",
         conflictNotice ? "pt-40 sm:pt-28" : "pt-10",
       )}
     >
@@ -1037,7 +1037,7 @@ export function DocumentWorkspace({
                       <button
                         type="button"
                         data-testid="document-file-menu-trigger"
-                        className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-full px-1 py-0.5 text-[0.8rem] font-medium tracking-[0.01em] text-stone-400 outline-none transition hover:text-stone-500 focus-visible:ring-2 focus-visible:ring-stone-300/70 dark:text-slate-400 dark:hover:text-slate-300 dark:focus-visible:ring-slate-600/70"
+                        className="document-file-trigger inline-flex min-w-0 max-w-full items-center gap-1 rounded-full px-1 py-0.5 text-[0.8rem] font-medium tracking-[0.01em] text-stone-400 outline-none transition hover:text-stone-500 focus-visible:ring-2 focus-visible:ring-stone-300/70 dark:text-slate-400 dark:hover:text-slate-300 dark:focus-visible:ring-slate-600/70"
                         title={documentFilenameLabel}
                         aria-label="Document file actions"
                       >
@@ -1054,7 +1054,7 @@ export function DocumentWorkspace({
                   <PopoverContent
                     aria-label="Document file actions"
                     data-testid="document-file-menu"
-                    className="w-56 p-1"
+                    className="document-file-menu w-56 p-1"
                     align="start"
                     sideOffset={4}
                   >
@@ -1087,7 +1087,7 @@ export function DocumentWorkspace({
                     </div>
                   </PopoverContent>
                 </Popover>
-                <div className="ml-auto inline-flex h-[1.25rem] shrink-0 items-center">
+                <div className="document-mode-control ml-auto inline-flex h-[1.25rem] shrink-0 items-center">
                   <Select<DocumentInteractionMode>
                     value={documentInteractionMode}
                     onValueChange={(value) => {
@@ -1104,11 +1104,12 @@ export function DocumentWorkspace({
                         {activeDocumentInteractionMode?.label}
                       </span>
                     </SelectTrigger>
-                    <SelectContent>
+                    <SelectContent data-testid="document-mode-options">
                       {documentInteractionModeOptions.map(
                         ({ value, label, Icon }) => (
                           <SelectItem
                             key={value}
+                            data-testid={`document-mode-${value}`}
                             value={value}
                             label={label}
                             className="text-[0.8rem]"
