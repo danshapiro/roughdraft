@@ -45,6 +45,8 @@ import {
   createEditorExtensions,
   criticChangeHighlightPluginKey,
   explicitReviewEdit,
+  markdownPreviewUrlsKey,
+  markdownPreviewUrlsPlugin,
   readCriticBlockChange,
   SUGGESTED_PARAGRAPH_SENTINEL,
 } from "./editor-extensions";
@@ -54,6 +56,7 @@ import { LinkAffordances } from "./LinkAffordances";
 import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
 import { toHtml, splitYamlDocumentMetadata } from "./markdown";
 import { resolveSuggestionSource } from "./resolve-suggestion";
+import { editableMarkdownOptions } from "./revision-markdown";
 import { acceptedDocument } from "./revision-markdown";
 import type { Page, StorageBackend } from "./storage";
 import { useCommentAnchorLayout } from "./useCommentAnchorLayout";
@@ -748,11 +751,13 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
 
   const parsedContent = useMemo(
     () =>
-      criticMarkdownToEditorState(sourceMarkdown, {
-        resolveFileUrl,
-        resolveLinkUrl,
-      }),
-    [resolveFileUrl, resolveLinkUrl, sourceMarkdown],
+      criticMarkdownToEditorState(
+        sourceMarkdown,
+        isEditableReview
+          ? editableMarkdownOptions
+          : { resolveFileUrl, resolveLinkUrl },
+      ),
+    [isEditableReview, resolveFileUrl, resolveLinkUrl, sourceMarkdown],
   );
   const [localComments, setComments] = useState<Map<string, CriticComment>>(
     () =>
@@ -881,14 +886,16 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         .chain()
         .focus()
         .insertContent(
-          toHtml(markdown, {
-            resolveFileUrl,
-            resolveLinkUrl,
-          }),
+          toHtml(
+            markdown,
+            isEditableReview
+              ? editableMarkdownOptions
+              : { resolveFileUrl, resolveLinkUrl },
+          ),
         )
         .run();
     },
-    [backend, resolveFileUrl, resolveLinkUrl],
+    [backend, isEditableReview, resolveFileUrl, resolveLinkUrl],
   );
 
   const refreshCriticChanges = useCallback(() => {
@@ -1442,6 +1449,23 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   useEffect(() => {
     editor?.setEditable(!isControlled && interactionMode !== "viewing", false);
   }, [editor, interactionMode, isControlled]);
+
+  useLayoutEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    if (!isEditableReview) {
+      editor.unregisterPlugin(markdownPreviewUrlsKey);
+      return;
+    }
+    editor.registerPlugin(
+      markdownPreviewUrlsPlugin({ resolveFileUrl, resolveLinkUrl }),
+      (next, plugins) => [
+        ...plugins.filter(
+          (plugin) => plugin.spec.key !== markdownPreviewUrlsKey,
+        ),
+        next,
+      ],
+    );
+  }, [editor, isEditableReview, resolveFileUrl, resolveLinkUrl]);
 
   useEffect(() => {
     if (!editor || !isEditableReview) return;

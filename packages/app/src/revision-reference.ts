@@ -7,7 +7,10 @@ import type { EditorState, Transaction } from "@tiptap/pm/state";
 import { ReplaceStep } from "@tiptap/pm/transform";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { CriticChangeRailItem } from "./DocumentReviewRail";
-import { diffRenderedComparison } from "./rendered-comparison-diff";
+import {
+  diffRenderedComparison,
+  renderedContentIdentity,
+} from "./rendered-comparison-diff";
 import { projectAcceptedDocument } from "./revision-projection";
 
 export interface ReferenceChange {
@@ -59,7 +62,10 @@ function changeIdentity(
   before: Fragment,
   after: Fragment,
 ) {
-  const json = JSON.stringify([before.toJSON(), after.toJSON()]);
+  const json = JSON.stringify([
+    renderedContentIdentity(before.toJSON()),
+    renderedContentIdentity(after.toJSON()),
+  ]);
   // FNV-1a with a 64 bit result keeps persisted IDs short even for whole blocks.
   let hash = 14695981039346656037n;
   for (let index = 0; index < json.length; index++) {

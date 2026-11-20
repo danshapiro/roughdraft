@@ -5,9 +5,16 @@ import {
   editorStateToCriticMarkdown,
 } from "./critic-markup";
 import { createEditorExtensions } from "./editor-extensions";
+import type { MarkdownOptions } from "./markdown";
 import { projectAcceptedDocument } from "./revision-projection";
 
 const schema = getSchema(createEditorExtensions(""));
+
+// Keep the editable model independent of the current browser and file path.
+// The view resolves assets; the save path retains the original source spelling.
+export const editableMarkdownOptions: MarkdownOptions = {
+  normalizeRelativeDestinations: true,
+};
 
 export function acceptedDocument(doc: JSONContent): JSONContent {
   return {

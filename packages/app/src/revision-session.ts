@@ -70,6 +70,7 @@ interface BrowserRecovery {
   draft: RevisionDraft;
   inFlight?: { draft: RevisionDraft; selectsBase: boolean } | null;
   stale?: boolean;
+  baseVersion?: ComparisonReviewData["baseVersion"];
 }
 
 function restoreBrowserDraft(initial: ComparisonReviewData, key: string) {
@@ -95,13 +96,26 @@ function restoreBrowserDraft(initial: ComparisonReviewData, key: string) {
       ) {
         // The completed base selection is a different document projection.
         if (browser.inFlight.selectsBase) return null;
-        return { draft: browser.draft, stale: false };
+        return {
+          draft: browser.draft,
+          stale: false,
+          baseVersion: browser.baseVersion,
+        };
       }
       if (browser.revision === initial.revision && !browser.stale)
-        return { draft: browser.draft, stale: false };
+        return {
+          draft: browser.draft,
+          stale: false,
+          baseVersion: browser.baseVersion,
+        };
       // A second tab may have committed this review. Keep only this tab's
       // unsaved work, and require an explicit copy before writing again.
-      if (tabOnly) return { draft: browser.draft, stale: true };
+      if (tabOnly)
+        return {
+          draft: browser.draft,
+          stale: true,
+          baseVersion: browser.baseVersion,
+        };
     } catch {
       // The storage API may be disabled or have invalid/old records.
     }
@@ -113,11 +127,19 @@ export function useRevisionSession(
   initial: ComparisonReviewData,
   seed: RevisionDraft,
 ) {
-  const key = `roughdraft-draft:${initial.id}`;
-  const path = `/${encodeURIComponent(initial.id)}`;
-  const [session, setSession] = useState(initial);
+  const [browser] = useState(() =>
+    restoreBrowserDraft(initial, `roughdraft-draft:${initial.id}`),
+  );
+  const [session, setSession] = useState(() =>
+    browser?.stale && browser.baseVersion !== undefined
+      ? { ...initial, baseVersion: browser.baseVersion }
+      : initial,
+  );
   const server = useRef(initial);
-  const [browser] = useState(() => restoreBrowserDraft(initial, key));
+  const storageIdentity = useRef({
+    id: initial.id,
+    baseVersion: session.baseVersion ?? null,
+  });
   const [draft, setDraft] = useState(
     () => browser?.draft ?? storedDraft(initial) ?? seed,
   );
@@ -135,13 +157,29 @@ export function useRevisionSession(
   );
   const paused = useRef(initial.targetChanged || stale.current);
   const storeLocally = useCallback(() => {
-    const record = equalDraft(latest.current, storedDraft(server.current))
+    const current = server.current;
+    const previousKey = `roughdraft-draft:${storageIdentity.current.id}`;
+    if (storageIdentity.current.id !== current.id) {
+      // A fork gets its own recovery slot, even if typing continued in flight.
+      try {
+        sessionStorage.removeItem(previousKey);
+        if (localStorage.getItem(previousKey) === lastLocalRecord.current)
+          localStorage.removeItem(previousKey);
+      } catch {
+        // Recovery still works through the new sidecar.
+      }
+      lastLocalRecord.current = null;
+      storageIdentity.current.id = current.id;
+    }
+    const key = `roughdraft-draft:${current.id}`;
+    const record = equalDraft(latest.current, storedDraft(current) ?? seed)
       ? null
       : JSON.stringify({
-          revision: server.current.revision,
+          revision: current.revision,
           draft: latest.current,
           inFlight: inFlight.current,
           stale: stale.current,
+          baseVersion: storageIdentity.current.baseVersion,
         } satisfies BrowserRecovery);
     try {
       if (record) sessionStorage.setItem(key, record);
@@ -160,7 +198,7 @@ export function useRevisionSession(
     } catch {
       // A blocked browser store does not prevent server recovery.
     }
-  }, [key]);
+  }, [seed]);
 
   useEffect(() => {
     mounted.current = true;
@@ -197,6 +235,7 @@ export function useRevisionSession(
             );
         }
         const current = server.current;
+        const path = `/${encodeURIComponent(current.id)}`;
         const saveFile =
           action === "sync" &&
           !paused.current &&
@@ -204,8 +243,17 @@ export function useRevisionSession(
           (snapshot.cleanMarkdown ?? snapshot.markdown) !==
             cleanRevisionMarkdown(current.savedText ?? "");
         const endpoint =
-          action === "sync" ? (saveFile ? "save" : "draft") : action;
-        if (endpoint === "draft" && equalDraft(snapshot, storedDraft(current)))
+          action === "sync"
+            ? saveFile
+              ? "save"
+              : "draft"
+            : action === "save" && stale.current
+              ? "fork"
+              : action;
+        if (
+          endpoint === "draft" &&
+          equalDraft(snapshot, storedDraft(current) ?? seed)
+        )
           return current;
         inFlight.current = { draft: snapshot, selectsBase: action === "base" };
         storeLocally();
@@ -259,8 +307,16 @@ export function useRevisionSession(
           if (action === "save" || action === "base") {
             paused.current = false;
             stale.current = false;
+            storageIdentity.current.baseVersion = next.baseVersion ?? null;
           }
           if (mounted.current) {
+            if (next.id !== current.id) {
+              const url = new URL(window.location.href);
+              url.search = new URLSearchParams({
+                comparison: next.id,
+              }).toString();
+              window.history.replaceState(null, "", url);
+            }
             setSession(next);
             if (action === "base") setDraft(latest.current);
             setWritePaused(paused.current);
@@ -279,14 +335,11 @@ export function useRevisionSession(
       );
       return task;
     },
-    [path, storeLocally],
+    [seed, storeLocally],
   );
 
   useEffect(() => {
-    if (
-      equalDraft(draft, storedDraft(server.current)) ||
-      (draft === seed && !storedDraft(server.current))
-    ) {
+    if (equalDraft(draft, storedDraft(server.current) ?? seed)) {
       setRecoveryPending(false);
       return;
     }
@@ -315,9 +368,9 @@ export function useRevisionSession(
   const inspect = useCallback(
     (filename?: string) =>
       revisionRequest<InspectedDestination>(
-        `${path}/destination${filename ? `?${new URLSearchParams({ path: filename })}` : ""}`,
+        `/${encodeURIComponent(session.id)}/destination${filename ? `?${new URLSearchParams({ path: filename })}` : ""}`,
       ),
-    [path],
+    [session.id],
   );
 
   return {

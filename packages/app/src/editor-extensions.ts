@@ -10,9 +10,11 @@ import { TableHeader } from "@tiptap/extension-table-header";
 import { TableRow } from "@tiptap/extension-table-row";
 import TaskItem from "@tiptap/extension-task-item";
 import TaskList from "@tiptap/extension-task-list";
-import type {
-  Mark as ProseMirrorMark,
-  Node as ProseMirrorNode,
+import {
+  type DOMOutputSpec,
+  DOMSerializer,
+  type Mark as ProseMirrorMark,
+  type Node as ProseMirrorNode,
 } from "@tiptap/pm/model";
 import {
   type EditorState,
@@ -24,7 +26,12 @@ import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
 import { browserAnchorPath } from "./browser-base-path";
 import { noteId } from "./endnotes";
-import { rawMarkdownBlockAttribute } from "./markdown";
+import {
+  type MarkdownOptions,
+  rawMarkdownBlockAttribute,
+  renderedMarkdownImageUrl,
+  renderedMarkdownLinkUrl,
+} from "./markdown";
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
@@ -1164,6 +1171,60 @@ const ComparisonReadingAnchor = Extension.create({
     ];
   },
 });
+
+function renderPreviewView(document: Document, spec?: DOMOutputSpec) {
+  if (!spec) throw new Error("The Markdown preview has no HTML renderer.");
+  const { dom, contentDOM } = DOMSerializer.renderSpec(document, spec);
+  if (!(dom instanceof HTMLElement))
+    throw new Error("The Markdown preview must render an HTML element.");
+  return { dom, contentDOM };
+}
+
+export const markdownPreviewUrlsKey = new PluginKey("markdownPreviewUrls");
+
+// Display URLs follow the current file, including when history restores an
+// older link or image. The saved Markdown and editor history stay untouched.
+export function markdownPreviewUrlsPlugin(options: MarkdownOptions) {
+  return new Plugin({
+    key: markdownPreviewUrlsKey,
+    props: {
+      markViews: {
+        link(mark, view, inline) {
+          const { dataMarkdownSrc } = mark.attrs;
+          const rendered = dataMarkdownSrc
+            ? mark.type.create({
+                ...mark.attrs,
+                href: renderedMarkdownLinkUrl(dataMarkdownSrc, options),
+              })
+            : mark;
+          return renderPreviewView(
+            view.dom.ownerDocument,
+            mark.type.spec.toDOM?.(rendered, inline),
+          );
+        },
+      },
+      nodeViews: {
+        image(node, view) {
+          const { dataMarkdownSrc } = node.attrs;
+          const rendered = dataMarkdownSrc
+            ? node.type.create(
+                {
+                  ...node.attrs,
+                  src: renderedMarkdownImageUrl(dataMarkdownSrc, options),
+                },
+                node.content,
+                node.marks,
+              )
+            : node;
+          return renderPreviewView(
+            view.dom.ownerDocument,
+            node.type.spec.toDOM?.(rendered),
+          );
+        },
+      },
+    },
+  });
+}
 
 export function createEditorExtensions(placeholder: string) {
   return [

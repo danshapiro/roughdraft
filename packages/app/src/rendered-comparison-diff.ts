@@ -3,6 +3,7 @@ import { diffArrays } from "diff";
 import type { ControlledReviewBlockHighlight } from "./controlled-review";
 import type { CriticChangeAttrs, CriticChangeKind } from "./critic-markup";
 import { noteKey } from "./endnotes";
+import { stableMarkdownDestination } from "./markdown";
 
 export interface RenderedComparisonDifference {
   content: JSONContent[];
@@ -74,8 +75,11 @@ function semanticAttributes(
   if (!source) return attrs;
   // A relative asset is resolved differently in each frozen input's folder.
   // Assess the Markdown destination, not its generated preview URL.
-  if (type === "link") return { ...attrs, href: source };
-  if (type === "image") return { ...attrs, src: source };
+  const destination = stableMarkdownDestination(String(source));
+  if (type === "link")
+    return { ...attrs, href: destination, dataMarkdownSrc: destination };
+  if (type === "image")
+    return { ...attrs, src: destination, dataMarkdownSrc: destination };
   return attrs;
 }
 
@@ -88,6 +92,30 @@ function semanticMarks(node: JSONContent) {
       canonical({ ...mark, attrs: semanticAttributes(mark.type, mark.attrs) }),
     )
     .sort();
+}
+
+function createSemanticKey() {
+  const semanticCache = new WeakMap<JSONContent, string>();
+  const semanticKey = (node: JSONContent): string => {
+    let key = semanticCache.get(node);
+    if (key === undefined) {
+      key = canonical({
+        type: node.type,
+        attrs: semanticAttributes(node.type, node.attrs),
+        text: node.text,
+        marks: semanticMarks(node),
+        content: (node.content ?? []).map(semanticKey),
+      });
+      semanticCache.set(node, key);
+    }
+    return key;
+  };
+  return semanticKey;
+}
+
+/** Compare only author-visible Markdown attributes, rather than resolved URLs. */
+export function renderedContentIdentity(content: JSONContent[] | null) {
+  return canonical((content ?? []).map(createSemanticKey()));
 }
 
 function tableStructure(node: JSONContent): unknown {
@@ -104,7 +132,7 @@ function tableStructure(node: JSONContent): unknown {
 function visibleText(node: JSONContent): string {
   if (node.type === "text") return node.text ?? "";
   if (node.type === "image")
-    return `Image${node.attrs?.alt ? `: ${node.attrs.alt}` : ""} (${node.attrs?.src ?? ""})`;
+    return `Image${node.attrs?.alt ? `: ${node.attrs.alt}` : ""} (${node.attrs?.dataMarkdownSrc ?? node.attrs?.src ?? ""})`;
   if (node.type === "horizontalRule") return "Horizontal rule";
   if (node.type === "hardBreak") return "\n";
   if (node.type === "rawMarkdownBlock") return "Markdown block";
@@ -168,7 +196,7 @@ function summary(content: JSONContent[], formatting: boolean): string {
     for (const mark of node.marks ?? []) {
       if (mark.type === "link")
         descriptors.add(
-          `link: ${mark.attrs?.href ?? ""}${mark.attrs?.title ? `, title: ${mark.attrs.title}` : ""}`,
+          `link: ${mark.attrs?.dataMarkdownSrc ?? mark.attrs?.href ?? ""}${mark.attrs?.title ? `, title: ${mark.attrs.title}` : ""}`,
         );
       else if (
         formatting &&
@@ -200,22 +228,8 @@ export function diffRenderedComparison(
   const oldSummary: string[] = [];
   const newSummary: string[] = [];
   const nodeHighlights = new WeakMap<JSONContent, CriticChangeKind>();
-  const semanticCache = new WeakMap<JSONContent, string>();
   let changed = false;
-  const semanticKey = (node: JSONContent): string => {
-    let key = semanticCache.get(node);
-    if (key === undefined) {
-      key = canonical({
-        type: node.type,
-        attrs: semanticAttributes(node.type, node.attrs),
-        text: node.text,
-        marks: semanticMarks(node),
-        content: (node.content ?? []).map(semanticKey),
-      });
-      semanticCache.set(node, key);
-    }
-    return key;
-  };
+  const semanticKey = createSemanticKey();
   const equal = (left: JSONContent, right: JSONContent) =>
     semanticKey(left) === semanticKey(right);
   const annotate = (

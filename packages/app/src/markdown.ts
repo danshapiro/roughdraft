@@ -10,6 +10,7 @@ export const rawMarkdownBlockAttribute = "data-markdown-raw-block";
 export interface MarkdownOptions {
   resolveFileUrl?: (path: string) => string | null;
   resolveLinkUrl?: (path: string) => string | null;
+  normalizeRelativeDestinations?: boolean;
 }
 
 export interface YamlFrontmatterSplit {
@@ -125,6 +126,12 @@ function normalizeMarkdownPath(path: string): string {
   return `./${path.replace(/^\/+/, "")}`;
 }
 
+/** Give equivalent relative destinations the same editor mark attributes. */
+export function stableMarkdownDestination(path: string): string {
+  if (!path || isExternalUrl(path) || /^[/?#]/.test(path)) return path;
+  return normalizeMarkdownPath(path);
+}
+
 function tableHasUnsupportedMarkdownContent(table: HTMLTableElement): boolean {
   return Boolean(
     table.querySelector(
@@ -172,6 +179,28 @@ function resolveRenderedUrl(
 ) {
   if (isExternalUrl(path) || isInPageAnchor(path)) return path;
   return resolveFileUrl?.(path) ?? path;
+}
+
+export function renderedMarkdownLinkUrl(
+  path: string,
+  options?: MarkdownOptions,
+) {
+  return browserAnchorPath(
+    resolveRenderedUrl(
+      path,
+      (target) =>
+        options?.resolveLinkUrl?.(target) ??
+        options?.resolveFileUrl?.(target) ??
+        null,
+    ),
+  );
+}
+
+export function renderedMarkdownImageUrl(
+  path: string,
+  options?: MarkdownOptions,
+) {
+  return resolveRenderedUrl(path, options?.resolveFileUrl);
 }
 
 function isYamlFrontmatterDelimiter(line: string): boolean {
@@ -312,8 +341,6 @@ export function appendYamlEndmatter(
 export function createMarkedRenderer(options?: MarkdownOptions) {
   const renderer = new marked.Renderer();
   const baseRenderer = new marked.Renderer();
-  const resolveFileUrl = options?.resolveFileUrl;
-  const resolveLinkUrl = options?.resolveLinkUrl;
 
   renderer.code = ({ text, lang, escaped }) => {
     const language = (lang || "").match(/\S+/)?.[0];
@@ -326,11 +353,11 @@ export function createMarkedRenderer(options?: MarkdownOptions) {
   };
 
   renderer.link = function ({ href, title, tokens, raw }) {
-    const rawHref = href || "";
-    const renderedHref = resolveRenderedUrl(
-      rawHref,
-      (path) => resolveLinkUrl?.(path) ?? resolveFileUrl?.(path) ?? null,
-    );
+    const source = href || "";
+    const rawHref = options?.normalizeRelativeDestinations
+      ? stableMarkdownDestination(source)
+      : source;
+    const renderedHref = renderedMarkdownLinkUrl(rawHref, options);
     const text = this.parser.parseInline(tokens);
     const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
     const markdownSrcAttr = ` data-markdown-src="${escapeHtml(rawHref)}"`;
@@ -343,12 +370,15 @@ export function createMarkedRenderer(options?: MarkdownOptions) {
         ? ' target="_blank" rel="noreferrer noopener"'
         : "";
 
-    return `<a href="${escapeHtml(browserAnchorPath(renderedHref))}"${titleAttr}${markdownSrcAttr}${autolinkAttr}${externalAttr}>${text}</a>`;
+    return `<a href="${escapeHtml(renderedHref)}"${titleAttr}${markdownSrcAttr}${autolinkAttr}${externalAttr}>${text}</a>`;
   };
 
   renderer.image = ({ href, title, text }) => {
-    const rawHref = href || "";
-    const renderedHref = resolveRenderedUrl(rawHref, resolveFileUrl);
+    const source = href || "";
+    const rawHref = options?.normalizeRelativeDestinations
+      ? stableMarkdownDestination(source)
+      : source;
+    const renderedHref = renderedMarkdownImageUrl(rawHref, options);
     const alt = text || "";
     const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
     const markdownSrcAttr = ` data-markdown-src="${escapeHtml(rawHref)}"`;

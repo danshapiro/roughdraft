@@ -88,13 +88,11 @@ describe("file comparison reviews", () => {
     expect(fs.readFileSync(candidate, "utf8")).toBe(after);
   });
 
-  it("rejects edited or historical input paths and seeds a fresh copy without overwriting files", async () => {
+  it("rejects edited or inline-only input paths and seeds a fresh copy without overwriting files", async () => {
     const historical = path.join(root, "Historical.md");
     fs.writeFileSync(historical, before);
     fs.writeFileSync(target, after);
-    const review = (
-      await create("applied", { editor: "unified", beforePath: historical })
-    ).body;
+    const review = (await create("applied", { editor: "unified" })).body;
     const route = `/api/comparisons/${review.id}`;
     const select = (fields: object) =>
       request(api())
@@ -121,6 +119,157 @@ describe("file comparison reviews", () => {
     expect(fs.readFileSync(output, "utf8")).toBe(before);
     expect(fs.readFileSync(historical, "utf8")).toBe(before);
     expect(fs.readFileSync(target, "utf8")).toBe("An external version");
+  });
+
+  it("allows a distinct old Markdown file as the base of an applied review", async () => {
+    const oldFile = path.join(root, "Previous.md");
+    fs.writeFileSync(oldFile, before);
+    fs.writeFileSync(target, after);
+    const review = (
+      await create("applied", {
+        editor: "unified",
+        beforePath: oldFile,
+      })
+    ).body;
+    expect(review.baseOptions).toEqual({ old: oldFile, new: target });
+    const inode = fs.statSync(oldFile).ino;
+    const chosen = await request(api())
+      .post(`/api/comparisons/${review.id}/base`)
+      .send({
+        revision: review.revision,
+        choice: "old",
+      });
+    expect(chosen.status).toBe(200);
+    expect(chosen.body).toMatchObject({
+      baseVersion: "old",
+      destinationPath: oldFile,
+      savedText: before,
+    });
+    expect(fs.statSync(oldFile).ino).toBe(inode);
+    expect(fs.readFileSync(target, "utf8")).toBe(after);
+    const aliased = path.join(root, "Alias.md");
+    fs.symlinkSync(target, aliased);
+    const sameFile = (
+      await create("applied", {
+        editor: "unified",
+        beforePath: aliased,
+        beforeText: after,
+      })
+    ).body;
+    expect(sameFile.baseOptions).toEqual({ old: null, new: target });
+  });
+
+  it("forks a stale tab's text, comments and selected reference without rebinding the original review", async () => {
+    const stale = await chooseOriginal();
+    const app = request(api());
+    const route = `/api/comparisons/${stale.id}`;
+    const contact = (id: string, content: string) => ({
+      id,
+      changeId: "document",
+      content,
+      createdAt: "2026-11-19T12:00:00.000Z",
+      scope: "document",
+    });
+    const currentComment = contact("fresh", "Newer tab review");
+    const updated = await app.post(`${route}/save`).send({
+      revision: stale.revision,
+      markdown: "Newer tab on disk",
+      decisions: {},
+      reviewComments: [currentComment],
+    });
+    expect(updated.status).toBe(200);
+    const savedReview = (await app.get(route)).body;
+    const inode = fs.statSync(target).ino;
+    const copy = path.join(root, "Stale copy.md");
+    const inspected = await app
+      .get(`${route}/destination`)
+      .query({ path: copy });
+    const staleComment = contact(
+      "stale",
+      "Keep only the stale tab comment on this copy",
+    );
+    const submission = {
+      revision: stale.revision,
+      path: inspected.body.path,
+      expectedVersion: inspected.body.version,
+      baseVersion: "new",
+      markdown: "Stale tab\n\n{++pending++}",
+      cleanMarkdown: "Stale tab",
+      decisions: { kept: "kept" },
+      reviewComments: [staleComment],
+    };
+    const forked = await app.post(`${route}/fork`).send(submission);
+    expect(forked.status).toBe(201);
+    expect(forked.body.id).not.toBe(stale.id);
+    const copyReview = await app.get(`/api/comparisons/${forked.body.id}`);
+    expect(copyReview.body).toMatchObject({
+      mode: "proposal",
+      beforeText: before,
+      afterText: after,
+      beforeLabel: savedReview.beforeLabel,
+      afterLabel: savedReview.afterLabel,
+      baseVersion: "new",
+      destinationPath: copy,
+      savedText: "Stale tab",
+      draft: {
+        markdown: submission.markdown,
+        cleanMarkdown: submission.cleanMarkdown,
+        decisions: submission.decisions,
+      },
+      reviewComments: [staleComment],
+      feedback: null,
+      status: "open",
+    });
+    expect((await app.get(route)).body).toEqual(savedReview);
+    expect(fs.statSync(target).ino).toBe(inode);
+    expect(fs.readFileSync(target, "utf8")).toBe("Newer tab on disk");
+    expect(fs.readFileSync(copy, "utf8")).toBe("Stale tab");
+  });
+
+  it("rejects forks to the active file or to a copy changed since inspection", async () => {
+    const review = await chooseOriginal();
+    const app = request(api());
+    const route = `/api/comparisons/${review.id}`;
+    const alias = path.join(root, "Alias.md");
+    fs.symlinkSync(target, alias);
+    const copy = path.join(root, "Copy.md");
+    const output = (await app.get(`${route}/destination`).query({ path: copy }))
+      .body;
+    fs.writeFileSync(copy, "Somebody else's copy");
+    const body = { markdown: "My version", decisions: {} };
+    expect(
+      (await app.post(`${route}/fork`).send({ ...body, path: copy })).status,
+    ).toBe(400);
+    expect(
+      (
+        await app.post(`${route}/fork`).send({
+          ...body,
+          path: copy,
+          expectedVersion: output.version,
+        })
+      ).status,
+    ).toBe(409);
+    for (const active of [target, alias]) {
+      expect(
+        (
+          await app.post(`${route}/fork`).send({
+            ...body,
+            path: active,
+            expectedVersion: review.baseVersion,
+          })
+        ).status,
+      ).toBe(409);
+    }
+    const bad = await app.post(`${route}/fork`).send({
+      ...body,
+      path: path.join(root, "Bad side.md"),
+      expectedVersion: null,
+      baseVersion: "other",
+    });
+    expect(bad.status).toBe(400);
+    expect(fs.readFileSync(target, "utf8")).toBe(before);
+    expect(fs.readFileSync(copy, "utf8")).toBe("Somebody else's copy");
+    expect((await app.get(route)).body).toEqual(review);
   });
 
   it.each([

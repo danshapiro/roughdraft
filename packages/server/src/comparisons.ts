@@ -500,7 +500,7 @@ class ComparisonStore {
     }
     atomicWrite(this.filename(review.id), `${JSON.stringify(review)}\n`);
   }
-  load(id: string): StoredComparison {
+  private readReview(id: string): StoredComparison {
     const filename = this.filename(id);
     if (!fs.existsSync(filename))
       throw new ComparisonError(404, "Comparison not found");
@@ -508,6 +508,10 @@ class ComparisonStore {
       fs.readFileSync(filename, "utf8"),
     ) as StoredComparison;
     review.reviewComments ??= [];
+    return review;
+  }
+  load(id: string): StoredComparison {
+    const review = this.readReview(id);
     // An intent makes a retry safe if the process stopped after rename but before
     // recording completion. Never replay a write during recovery.
     if (review.pendingApply && review.targetPath) {
@@ -706,7 +710,12 @@ class ComparisonStore {
         ? file
         : null;
     const old = selectable(
-      mode === "proposal" ? target : mode === "compare" ? beforeFile : null,
+      mode === "proposal"
+        ? target
+        : mode === "compare" ||
+            (mode === "applied" && beforeFile?.path !== target?.path)
+          ? beforeFile
+          : null,
       beforeText,
     );
     const newer = selectable(
@@ -1058,6 +1067,82 @@ class ComparisonStore {
       review,
       draft,
       reviewComments,
+      filename,
+      resolved,
+      current,
+    );
+  }
+  forkDraft(id: string, body: Record<string, unknown>): StoredComparison {
+    // Read only: a stale tab's copy must never update the shared review, even
+    // if an earlier request on that review is still awaiting recovery.
+    const review = this.readReview(id);
+    this.requireEditor(review);
+    const filename = stringField(body, "path");
+    if (!filename) throw new ComparisonError(400, "Choose a path for the copy");
+    const expectedVersion = body.expectedVersion;
+    if (expectedVersion !== null && typeof expectedVersion !== "string")
+      throw new ComparisonError(
+        400,
+        "Inspect the destination before saving to it",
+      );
+    const selectedSide = body.baseVersion;
+    if (
+      selectedSide !== undefined &&
+      selectedSide !== null &&
+      selectedSide !== "old" &&
+      selectedSide !== "new"
+    )
+      throw new ComparisonError(400, "baseVersion must be old, new, or null");
+    const { path: resolved, current } = this.inspectDestination(filename);
+    if (
+      [review.destinationPath, review.pendingSave?.path].some(
+        (active) => active === resolved || active === path.resolve(filename),
+      )
+    )
+      throw new ComparisonError(409, "Choose a different file for the copy");
+    if (expectedVersion !== (current?.version ?? null))
+      throw new ComparisonError(
+        409,
+        "The destination changed on disk. Inspect it or choose another file.",
+      );
+    const draft = draftField(body);
+    assertPlainMarkdown(cleanDraft(draft));
+    const comments =
+      reviewCommentsField(body.reviewComments, review, true) ?? [];
+    const fork: StoredComparison = {
+      id: crypto.randomUUID(),
+      revision: 1,
+      mode: review.mode,
+      title: review.title,
+      beforeLabel: review.beforeLabel,
+      afterLabel: review.afterLabel,
+      beforeText: review.beforeText,
+      afterText: review.afterText,
+      targetPath: review.targetPath,
+      targetVersion: review.targetVersion,
+      segments: review.segments,
+      editor: "unified",
+      baseVersion:
+        selectedSide === undefined
+          ? (review.baseVersion ?? null)
+          : selectedSide,
+      baseOptions: review.baseOptions,
+      baseInputVersions: review.baseInputVersions,
+      destinationPath: null,
+      destinationVersion: null,
+      savedPath: null,
+      savedText: null,
+      feedback: null,
+      comment: "",
+      reviewComments: comments,
+      draft,
+      status: "open",
+      completion: null,
+    };
+    return this.publishDraft(
+      fork,
+      draft,
+      comments,
       filename,
       resolved,
       current,
@@ -1432,6 +1517,18 @@ export function comparisonRouter(
     "/:id/save",
     handle((req, res) => {
       res.json(store.view(store.saveDraft(load(req), objectBody(req.body))));
+    }),
+  );
+  router.post(
+    "/:id/fork",
+    handle((req, res) => {
+      res
+        .status(201)
+        .json(
+          store.view(
+            store.forkDraft(String(req.params.id), objectBody(req.body)),
+          ),
+        );
     }),
   );
   router.post(

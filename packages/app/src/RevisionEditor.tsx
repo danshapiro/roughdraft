@@ -60,6 +60,7 @@ import {
   cleanRevisionMarkdown,
   copyRevisionMarkdown,
   downloadRevisionMarkdown,
+  editableMarkdownOptions,
   preserveSourceSpelling,
 } from "./revision-markdown";
 import { suggestionPositions } from "./revision-projection";
@@ -73,6 +74,7 @@ import {
 import {
   type InspectedDestination,
   type RevisionDraft,
+  RevisionRequestError,
   useRevisionSession,
 } from "./revision-session";
 import "./RevisionEditor.css";
@@ -97,15 +99,15 @@ function useReference(
   markdown: string | null,
   baseSide: BaseSide,
   mode: DocumentInteractionMode,
-  beforeBackend: ApiBackend,
 ) {
   const modeRef = useRef(mode);
   modeRef.current = mode;
   useEffect(() => {
     if (!editor || markdown === null) return;
-    const parsed = criticMarkdownToEditorState(markdown, {
-      resolveFileUrl: (filename) => beforeBackend.resolveFileUrl(filename),
-    });
+    const parsed = criticMarkdownToEditorState(
+      markdown,
+      editableMarkdownOptions,
+    );
     const reference = editor.schema.nodeFromJSON(acceptedDocument(parsed.doc));
     editor.registerPlugin(
       new Plugin({
@@ -168,7 +170,7 @@ function useReference(
     return () => {
       if (!editor.isDestroyed) editor.unregisterPlugin(referenceKey);
     };
-  }, [editor, markdown, baseSide, beforeBackend]);
+  }, [editor, markdown, baseSide]);
 }
 
 function pathLeaf(path: string) {
@@ -334,17 +336,6 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       }),
     [sourcePath],
   );
-  const beforeBackend = useMemo(
-    () =>
-      new ApiBackend({
-        kind: "local-files",
-        label: "Local files",
-        detail: referenceLabel,
-        projectPath:
-          documentProject(referenceLabel) ?? documentProject(sourcePath),
-      }),
-    [referenceLabel, sourcePath],
-  );
   const page = useMemo(
     () => ({ id: initial.id, title: initial.title, content: source.markdown }),
     [initial, source.markdown],
@@ -354,7 +345,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     ownEditor.current = next;
     setEditor(next);
   }, []);
-  useReference(editor, reference, baseSide, interaction, beforeBackend);
+  useReference(editor, reference, baseSide, interaction);
 
   useEffect(() => {
     if (!editor) return;
@@ -575,11 +566,19 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         ? run("save", draft, {
             path: output.path,
             expectedVersion: output.version,
+            baseVersion: session.baseVersion ?? null,
           })
         : run("sync", draft));
       setConflict(false);
       setSaveAs(false);
     } catch (error) {
+      if (
+        output &&
+        error instanceof RevisionRequestError &&
+        error.status === 409
+      ) {
+        setReplace(null);
+      }
       if (
         !output &&
         error instanceof Error &&
@@ -622,36 +621,42 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         const live = ownEditor.current;
         if (!live) throw new Error("The editor is still loading.");
         const raw = side === "old" ? initial.beforeText : initial.afterText;
-        const parsed = criticMarkdownToEditorState(raw);
-        const target = live.schema.nodeFromJSON(acceptedDocument(parsed.doc));
-        let state = EditorState.create({ doc: live.state.doc });
-        const changes = referenceChanges(target, state.doc).sort(
-          (a, b) => b.from - a.from || b.to - a.to,
-        );
-        for (const change of changes) {
-          const replacement = revertReferenceChange(state, change);
-          if (!replacement)
-            throw new Error(
-              "A pending suggestion overlaps this version. Start from New to keep the suggestion.",
-            );
-          state = state.apply(replacement);
-        }
         const cleanMarkdown = cleanRevisionMarkdown(raw);
-        const annotated = editorStateToCriticMarkdown(
-          state.doc.toJSON(),
-          commentMap,
-          {
-            frontmatter: parsed.frontmatter,
-            endmatter: parsed.endmatter,
-          },
-        );
-        if (
-          canonical(cleanRevisionMarkdown(annotated)) !==
-          canonical(cleanMarkdown)
-        )
-          throw new Error(
-            "This version cannot carry the current annotations. Choose the other version or discard the overlapping suggestion first.",
+        let annotated = raw;
+        if (draft.markdown !== (draft.cleanMarkdown ?? draft.markdown)) {
+          const parsed = criticMarkdownToEditorState(
+            raw,
+            editableMarkdownOptions,
           );
+          const target = live.schema.nodeFromJSON(acceptedDocument(parsed.doc));
+          let state = EditorState.create({ doc: live.state.doc });
+          const changes = referenceChanges(target, state.doc).sort(
+            (a, b) => b.from - a.from || b.to - a.to,
+          );
+          for (const change of changes) {
+            const replacement = revertReferenceChange(state, change);
+            if (!replacement)
+              throw new Error(
+                "A pending suggestion overlaps this version. Start from New to keep the suggestion.",
+              );
+            state = state.apply(replacement);
+          }
+          annotated = editorStateToCriticMarkdown(
+            state.doc.toJSON(),
+            commentMap,
+            {
+              frontmatter: parsed.frontmatter,
+              endmatter: parsed.endmatter,
+            },
+          );
+          if (
+            canonical(cleanRevisionMarkdown(annotated)) !==
+            canonical(cleanMarkdown)
+          )
+            throw new Error(
+              "This version cannot carry the current annotations. Choose the other version or discard the overlapping suggestion first.",
+            );
+        }
         snapshot = {
           ...snapshot,
           markdown: annotated,
@@ -690,7 +695,6 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     setBusy(true);
     setActionError("");
     try {
-      await flush();
       await run("send", draft, { comment: comment.trim() });
       setSendOpen(false);
       setComment("");

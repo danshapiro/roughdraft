@@ -439,6 +439,16 @@ test.describe("the single revision editor", () => {
       .poll(() => contents(copy))
       .toBe("Unsaved from the first tab\n");
     expect(contents(file)).toBe("Saved by the second tab\n");
+    expect(new URL(page.url()).searchParams.get("comparison")).not.toBe(id);
+    await second.reload();
+    await expect(second.getByTestId("revision-path")).toHaveText(file);
+    await expect(richTextEditor(second)).toHaveText("Saved by the second tab");
+    await page.reload();
+    await expect(page.getByTestId("revision-path")).toHaveText(copy);
+    await selectRichText(page, "Unsaved from the first tab");
+    await page.keyboard.type("Editing the copy");
+    await expect.poll(() => contents(copy)).toBe("Editing the copy\n");
+    expect(contents(file)).toBe("Saved by the second tab\n");
   });
 
   test("opening a linked file flushes the edit and stays in the same editor", async ({
@@ -464,5 +474,58 @@ test.describe("the single revision editor", () => {
     await expect(page.getByTestId("revision-path")).toHaveText(second);
     await expect(richTextEditor(page)).toContainText("Linked document");
     expect(contents(first)).toBe("Edited.\n\n[Second file](second.md)\n");
+  });
+
+  for (const { kind, original, proposed, expected } of [
+    {
+      kind: "link",
+      original: "[Old wording](./guide.md)\n",
+      proposed: "[New wording](guide.md)\n",
+      expected: "[New wording](./guide.md)\n",
+    },
+    {
+      kind: "image",
+      original: "![Old image](old.png)\n",
+      proposed: "![New image](new.png)\n",
+    },
+  ]) {
+    test(`the first Keep uses New ${kind} content when choosing Old as the file`, async ({
+      page,
+      request,
+    }) => {
+      const beforePath = writeProjectFile(project, "before.md", original);
+      const afterPath = writeProjectFile(project, "after.md", proposed);
+      await openReview(page, request, { beforePath, afterPath });
+      await page.getByTestId(keep).first().click();
+      await page.getByTestId("revision-base-old").click();
+      await page.getByTestId("revision-base-confirm").click();
+      await expect(page.getByTestId("revision-path")).toHaveText(beforePath);
+      await expect.poll(() => contents(beforePath)).toBe(expected ?? proposed);
+      expect(contents(afterPath)).toBe(proposed);
+    });
+  }
+
+  test("Send feedback does not initiate a pending autosave", async ({
+    page,
+    request,
+  }) => {
+    const file = writeProjectFile(project, "mode.md", "Original\n");
+    const id = await openReview(page, request, { targetPath: file });
+    await expect(richTextEditor(page)).toHaveText("Original");
+    await page.clock.install();
+    await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1000);
+    await selectRichText(page, "Original");
+    await page.keyboard.type("Edited in the browser");
+    await page.getByTestId("revision-send").dispatchEvent("click");
+    await page.getByTestId("revision-send-confirm").dispatchEvent("click");
+    await expect
+      .poll(async () => (await readReview(request, id)).feedback)
+      .toMatchObject({
+        saved: false,
+        draft: { cleanMarkdown: "Edited in the browser\n" },
+      });
+    expect(contents(file)).toBe("Original\n");
+    await page.clock.runFor(500);
+    await expect.poll(() => contents(file)).toBe("Edited in the browser\n");
   });
 });
