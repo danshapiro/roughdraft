@@ -22,6 +22,7 @@ import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
 import type { ControlledDocumentReview } from "./controlled-review";
 import { RichTextEditorSurface } from "./PageCard";
+import { reviewShortcut } from "./review-decisions";
 import { RevisionEditor } from "./RevisionEditor";
 import "./ComparisonReview.css";
 
@@ -85,6 +86,7 @@ function NativeComparisonDocument({
   view,
   formatted,
   busy,
+  activeChangeId,
   onChoices,
   onNavigationGroupsChange,
 }: {
@@ -93,8 +95,9 @@ function NativeComparisonDocument({
   view: ComparisonView;
   formatted: boolean;
   busy: boolean;
+  activeChangeId: string | null;
   onChoices: (choices: Choices) => void;
-  onNavigationGroupsChange: (ids: string[]) => void;
+  onNavigationGroupsChange: (groups: ReadonlyMap<string, string[]>) => void;
 }) {
   const contextPath =
     review.targetPath ??
@@ -146,9 +149,11 @@ function NativeComparisonDocument({
       model.suggestions.map((suggestion) => suggestion.changeId),
     );
     onNavigationGroupsChange(
-      model.groups
-        .filter((group) => visibleIds.has(group.id))
-        .map((group) => group.id),
+      new Map(
+        model.groups
+          .filter((group) => visibleIds.has(group.id))
+          .map((group) => [group.id, group.segmentIds]),
+      ),
     );
   }, [model, onNavigationGroupsChange]);
   const commentsRef = useRef(review.reviewComments ?? []);
@@ -221,6 +226,7 @@ function NativeComparisonDocument({
   };
   const controlledReview: ControlledDocumentReview = {
     ...model,
+    activeChangeId,
     canDecide: review.mode !== "compare" && review.status === "open",
     disabled: busy || review.status !== "open",
     acceptLabel: review.mode === "applied" ? "Keep" : "Accept",
@@ -343,6 +349,7 @@ export function ComparisonReview({
   const showDiffs = view === "diff";
   const [formatted, setFormatted] = useState(true);
   const [navigationIds, setNavigationIds] = useState<string[]>([]);
+  const navigationGroups = useRef<ReadonlyMap<string, string[]>>(new Map());
   const [activeChangeId, setActiveChangeId] = useState<string | null>(null);
   const headerRef = useRef<HTMLElement | null>(null);
   const documentRef = useRef<HTMLDivElement | null>(null);
@@ -357,14 +364,19 @@ export function ComparisonReview({
     captureReadingPosition();
     setView(next);
   };
-  const receiveNavigationGroups = useCallback((ids: string[]) => {
-    setNavigationIds((current) =>
-      current.length === ids.length &&
-      current.every((id, index) => id === ids[index])
-        ? current
-        : ids,
-    );
-  }, []);
+  const receiveNavigationGroups = useCallback(
+    (groups: ReadonlyMap<string, string[]>) => {
+      navigationGroups.current = groups;
+      const ids = [...groups.keys()];
+      setNavigationIds((current) =>
+        current.length === ids.length &&
+        current.every((id, index) => id === ids[index])
+          ? current
+          : ids,
+      );
+    },
+    [],
+  );
   useEffect(() => {
     if (activeChangeId && !navigationIds.includes(activeChangeId))
       setActiveChangeId(null);
@@ -717,6 +729,24 @@ export function ComparisonReview({
           <nav
             className="comparison-header-navigation"
             aria-label="Change navigation"
+            onKeyDown={(event) => {
+              const action = reviewShortcut(event.nativeEvent);
+              if (
+                !action ||
+                !activeChangeId ||
+                !writable ||
+                !open ||
+                disabled ||
+                !showDiffs
+              )
+                return;
+              const ids = navigationGroups.current.get(activeChangeId);
+              if (!ids?.length) return;
+              event.preventDefault();
+              if (event.repeat) return;
+              const decision = action === "accept" ? "after" : "before";
+              changeChoices({ decisions: ids.map((id) => ({ id, decision })) });
+            }}
           >
             <Button
               variant="ghost"
@@ -928,7 +958,7 @@ export function ComparisonReview({
                 disabled={busy}
                 onClick={() => chooseAll("after")}
               >
-                {review.mode === "applied" ? "Keep all" : "Accept all"}
+                Accept all
               </Button>
               <Button
                 variant="outline"
@@ -937,7 +967,7 @@ export function ComparisonReview({
                 disabled={busy}
                 onClick={() => chooseAll("before")}
               >
-                {review.mode === "applied" ? "Revert all" : "Skip all"}
+                Reject all
               </Button>
             </div>
           )}
@@ -982,6 +1012,7 @@ export function ComparisonReview({
             view={view}
             formatted={formatted}
             busy={busy}
+            activeChangeId={activeChangeId}
             onChoices={changeChoices}
             onNavigationGroupsChange={receiveNavigationGroups}
           />

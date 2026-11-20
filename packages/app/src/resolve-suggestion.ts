@@ -8,21 +8,32 @@ export function resolveSuggestionSource(
   changeId: string,
   decision: "accept" | "reject",
 ): string | null {
+  return resolveSuggestionsSource(markdown, [changeId], decision);
+}
+
+/** Resolve source-backed suggestions together, preserving the untouched text. */
+export function resolveSuggestionsSource(
+  markdown: string,
+  changeIds: readonly string[],
+  decision: "accept" | "reject",
+): string | null {
   const { endmatter } = splitYamlDocumentMetadata(markdown);
   const index = extractRoughdraftReviewIndex(markdown);
+  const removedIds = new Set(changeIds);
   const matches = index.items.filter(
-    (item) => item.kind === "suggestion" && item.id === changeId,
+    (item) => item.kind === "suggestion" && removedIds.has(item.id),
   );
-  // Anonymous or ambiguous editor items use the normal document serializer.
-  if (matches.length !== 1) return null;
-  const suggestion = matches[0];
-  // The editor uses this invisible character only while suggesting a paragraph.
+  // Anonymous, ambiguous, or temporary editor items use the normal serializer.
   if (
-    suggestion.text.includes("\u2060") ||
-    suggestion.originalText?.includes("\u2060")
-  )
+    matches.length !== removedIds.size ||
+    new Set(matches.map((item) => item.id)).size !== removedIds.size ||
+    matches.some(
+      (item) =>
+        item.text.includes("\u2060") || item.originalText?.includes("\u2060"),
+    )
+  ) {
     return null;
-  const removedIds = new Set([changeId]);
+  }
   let previousSize = 0;
   while (removedIds.size !== previousSize) {
     previousSize = removedIds.size;
@@ -36,33 +47,38 @@ export function resolveSuggestionSource(
   );
   // An independently highlighted reply needs the editor's anchor-removal path.
   if (replies.some((item) => item.anchorText !== undefined)) return null;
-  const chosen =
-    decision === "accept"
-      ? suggestion.suggestionKind === "deletion"
-        ? ""
-        : suggestion.text
-      : suggestion.suggestionKind === "addition"
-        ? ""
-        : (suggestion.originalText ?? "");
   const edits = [
-    { from: suggestion.offset, to: suggestion.endOffset, text: chosen },
+    ...matches.map((suggestion) => ({
+      from: suggestion.offset,
+      to: suggestion.endOffset,
+      text:
+        decision === "accept"
+          ? suggestion.suggestionKind === "deletion"
+            ? ""
+            : suggestion.text
+          : suggestion.suggestionKind === "addition"
+            ? ""
+            : (suggestion.originalText ?? ""),
+    })),
     ...replies
       .filter((item) => item.endOffset > item.offset)
-      .map((item) => ({
-        from: item.offset,
-        to: item.endOffset,
-        text: "",
-      })),
-  ].sort((a, b) => b.from - a.from);
-  let resolved = markdown;
+      .map((item) => ({ from: item.offset, to: item.endOffset, text: "" })),
+  ].sort((a, b) => a.from - b.from);
+  const parts: string[] = [];
+  let end = 0;
   for (const edit of edits) {
-    resolved =
-      resolved.slice(0, edit.from) + edit.text + resolved.slice(edit.to);
+    if (edit.from < end) return null;
+    parts.push(markdown.slice(end, edit.from), edit.text);
+    end = edit.to;
   }
+  parts.push(markdown.slice(end));
+  const resolved = parts.join("");
   if (!endmatter) return resolved;
   const yaml = parseDocument(endmatter.replace(/^---[^\n]*\n/, ""));
   if (yaml.errors.length) return null;
-  if (isMap(yaml.get("suggestions"))) yaml.deleteIn(["suggestions", changeId]);
+  if (isMap(yaml.get("suggestions"))) {
+    for (const id of changeIds) yaml.deleteIn(["suggestions", id]);
+  }
   if (isMap(yaml.get("comments"))) {
     for (const id of removedIds) yaml.deleteIn(["comments", id]);
   }

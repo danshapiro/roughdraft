@@ -20,6 +20,7 @@ import {
   useState,
 } from "react";
 
+import { Button } from "./components/ui/button";
 import { CommentEditorList } from "./CommentEditorList";
 import {
   type CriticChangeAttrs,
@@ -56,9 +57,17 @@ import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
 import { LinkAffordances } from "./LinkAffordances";
 import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
 import { toHtml, splitYamlDocumentMetadata } from "./markdown";
-import { resolveSuggestionSource } from "./resolve-suggestion";
+import { resolveSuggestionsSource } from "./resolve-suggestion";
+import {
+  applySuggestionDecisions,
+  type ReviewDecision,
+  reviewShortcut,
+} from "./review-decisions";
 import { editableMarkdownOptions } from "./revision-markdown";
-import { projectAcceptedDocument } from "./revision-projection";
+import {
+  projectAcceptedDocument,
+  suggestionPositions,
+} from "./revision-projection";
 import type { Page, StorageBackend } from "./storage";
 import { useCommentAnchorLayout } from "./useCommentAnchorLayout";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
@@ -136,6 +145,8 @@ interface RichTextEditorSurfaceProps {
 
 interface EditableReviewSurface {
   suggestions: CriticChangeRailItem[];
+  disabled?: boolean;
+  activeChangeId?: string | null;
   decisions: string[];
   comments: ReadonlyMap<string, CriticComment>;
   onCommentsChange: (comments: Map<string, CriticComment>) => void;
@@ -2197,40 +2208,86 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     [createControlledReply, measureLayout],
   );
 
-  const removeSuggestionComments = useCallback(
-    (changeId: string, currentEditor: Editor) => {
-      const directCommentIds = [...commentsRef.current.values()]
-        .filter((comment) => comment.parentCommentId === changeId)
-        .map((comment) => comment.id);
-      const commentIdsToDelete = [
-        ...directCommentIds,
-        ...directCommentIds.flatMap((commentId) =>
-          getCommentDescendantIds(commentId, commentsRef.current),
-        ),
-      ];
+  const decideNativeSuggestions = useCallback(
+    (changeIds: string[], decision: ReviewDecision) => {
+      const currentEditor = editorRef.current;
+      if (!currentEditor || !changeIds.length) return false;
+      const tr = currentEditor.state.tr;
+      if (!applySuggestionDecisions(tr, changeIds, decision)) return false;
 
-      if (commentIdsToDelete.length === 0) return commentsRef.current;
-
-      const nextComments = new Map(commentsRef.current);
-      for (const id of commentIdsToDelete) {
-        nextComments.delete(id);
+      const resolvedSource = resolveSuggestionsSource(
+        currentMarkdownRef.current,
+        changeIds,
+        decision,
+      );
+      const existing = commentsRef.current;
+      const resolvedIds = new Set(changeIds);
+      const removedIds = new Set<string>();
+      for (const { id, parentCommentId } of existing.values()) {
+        if (!parentCommentId || !resolvedIds.has(parentCommentId)) continue;
+        removedIds.add(id);
+        for (const replyId of getCommentDescendantIds(id, existing))
+          removedIds.add(replyId);
+      }
+      let nextComments = existing;
+      const markType = tr.doc.type.schema.marks.commentRef;
+      if (removedIds.size > 0) {
+        nextComments = new Map(existing);
+        for (const id of removedIds) nextComments.delete(id);
+        if (markType) {
+          tr.doc.descendants((node, pos) => {
+            if (!node.isText) return;
+            const mark = markType.isInSet(node.marks);
+            if (!mark) return;
+            const ids = mark.attrs.commentIds as string[];
+            const remaining = ids.filter((id) => !removedIds.has(id));
+            if (remaining.length === ids.length) return;
+            tr.removeMark(pos, pos + node.nodeSize, mark);
+            if (remaining.length > 0) {
+              tr.addMark(
+                pos,
+                pos + node.nodeSize,
+                markType.create({ commentIds: remaining }),
+              );
+            }
+          });
+        }
       }
 
-      const chain = currentEditor.chain().focus();
-      for (const id of commentIdsToDelete) {
-        chain.removeCommentId(id);
+      // Save once, with the matching source and reply metadata. The complete
+      // operation is a single editor history event.
+      resolvingSuggestionRef.current = true;
+      try {
+        currentEditor.view.dispatch(
+          closeHistory(tr).setMeta(explicitReviewEdit, true),
+        );
+        currentEditor.view.dispatch(closeHistory(currentEditor.state.tr));
+        currentEditor.commands.focus();
+        if (nextComments !== existing) {
+          commentsRef.current = nextComments;
+          setComments(nextComments);
+        }
+        if (resolvedSource !== null) {
+          currentMarkdownRef.current = resolvedSource;
+          endmatterRef.current =
+            splitYamlDocumentMetadata(resolvedSource).endmatter;
+          onMarkdownChange(resolvedSource);
+        } else {
+          emitMarkdownChange(currentEditor.getJSON(), nextComments);
+        }
+        setSelectedChangeId((id) => (id && resolvedIds.has(id) ? null : id));
+        setHoveredChangeId((id) => (id && resolvedIds.has(id) ? null : id));
+        refreshCriticChanges();
+        return true;
+      } finally {
+        resolvingSuggestionRef.current = false;
       }
-      chain.run();
-
-      commentsRef.current = nextComments;
-      setComments(nextComments);
-      return nextComments;
     },
-    [],
+    [emitMarkdownChange, onMarkdownChange, refreshCriticChanges],
   );
 
   const decideSuggestion = useCallback(
-    (changeId: string, decision: "accept" | "reject") => {
+    (changeId: string, decision: ReviewDecision) => {
       const controlled = controlledReviewRef.current;
       if (controlled) {
         if (controlled.canDecide && !controlled.disabled) {
@@ -2241,8 +2298,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       }
       const currentEditor = editorRef.current;
       if (!currentEditor) return;
-
       const live = editableReviewRef.current;
+      if (!live) {
+        decideNativeSuggestions([changeId], decision);
+        return;
+      }
+      if (live.disabled) return;
       const applyNative = () => {
         if (currentEditor.isDestroyed) return;
         const command =
@@ -2251,62 +2312,24 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         currentEditor.commands[command](changeId);
         currentEditor.view.dispatch(closeHistory(currentEditor.state.tr));
       };
-      const finishDecision = () => {
-        setSelectedChangeId((current) =>
-          current === changeId ? null : current,
-        );
-        setHoveredChangeId((current) =>
-          current === changeId ? null : current,
-        );
-        refreshCriticChanges();
-      };
-      if (live) {
-        const apply = () => {
-          applyNative();
-          finishDecision();
-        };
-        const handle = decision === "accept" ? live.onAccept : live.onReject;
-        if (!handle(changeId, apply)) apply();
-        else finishDecision();
-        return;
-      }
+      const handle = decision === "accept" ? live.onAccept : live.onReject;
+      if (!handle(changeId, applyNative)) applyNative();
+      setSelectedChangeId((id) => (id === changeId ? null : id));
+      setHoveredChangeId((id) => (id === changeId ? null : id));
+      refreshCriticChanges();
+    },
+    [decideNativeSuggestions, refreshCriticChanges],
+  );
 
-      const resolvedSource = resolveSuggestionSource(
-        currentMarkdownRef.current,
-        changeId,
+  function decideAllNativeSuggestions(decision: ReviewDecision) {
+    const currentEditor = editorRef.current;
+    if (currentEditor) {
+      decideNativeSuggestions(
+        [...suggestionPositions(currentEditor.state.doc).keys()],
         decision,
       );
-      // Commands and reply cleanup can each dispatch an update. Save the final
-      // document once, after both have completed, to avoid competing autosaves.
-      resolvingSuggestionRef.current = true;
-      try {
-        const chain = currentEditor.chain().focus();
-        const changed =
-          decision === "accept"
-            ? chain.acceptCriticChange(changeId).run()
-            : chain.rejectCriticChange(changeId).run();
-        if (!changed) return;
-        const nextComments = removeSuggestionComments(changeId, currentEditor);
-        if (resolvedSource !== null) {
-          currentMarkdownRef.current = resolvedSource;
-          endmatterRef.current =
-            splitYamlDocumentMetadata(resolvedSource).endmatter;
-          onMarkdownChange(resolvedSource);
-        } else {
-          emitMarkdownChange(currentEditor.getJSON(), nextComments);
-        }
-        finishDecision();
-      } finally {
-        resolvingSuggestionRef.current = false;
-      }
-    },
-    [
-      emitMarkdownChange,
-      onMarkdownChange,
-      refreshCriticChanges,
-      removeSuggestionComments,
-    ],
-  );
+    }
+  }
 
   const acceptSuggestion = useCallback(
     (changeId: string) => decideSuggestion(changeId, "accept"),
@@ -2478,6 +2501,44 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const hasReviewColumn = isControlled || isEditableReview || hasReviewRail;
   const documentShellRef =
     useReviewLayoutShiftAnimation<HTMLDivElement>(hasReviewColumn);
+  useEffect(() => {
+    const shell = documentShellRef.current;
+    if (!shell || !editor) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const decision = reviewShortcut(event);
+      const target = event.target;
+      if (!decision || !(target instanceof Element)) return;
+      if (target.closest("input, textarea, select, [role=dialog]")) return;
+      const card = target.closest<HTMLElement>("[data-suggestion-change-id]");
+      if (!card && !editor.view.dom.contains(target)) return;
+      if (card && target.closest("[contenteditable=true]")) return;
+      const controlled = controlledReviewRef.current;
+      const live = editableReviewRef.current;
+      if (
+        (controlled && (!controlled.canDecide || controlled.disabled)) ||
+        live?.disabled
+      )
+        return;
+      const isPending = (id: string | null | undefined): id is string =>
+        !!id &&
+        (controlled
+          ? controlled.suggestions.some((item) => item.changeId === id)
+          : live?.suggestions.some((item) => item.changeId === id) ||
+            suggestionPositions(editor.state.doc).has(id));
+      const id = [
+        card?.dataset.suggestionChangeId,
+        selectedChangeIdRef.current,
+        ...getSelectionCriticChangeIds(editor),
+        live?.activeChangeId ?? controlled?.activeChangeId,
+      ].find(isPending);
+      if (!id) return;
+      event.preventDefault();
+      if (!event.repeat) decideSuggestion(id, decision);
+    };
+    shell.addEventListener("keydown", onKeyDown);
+    return () => shell.removeEventListener("keydown", onKeyDown);
+  }, [decideSuggestion, documentShellRef, editor]);
+
   const activeComments = activeCommentIds
     .map((commentId) => comments.get(commentId))
     .filter((comment): comment is CriticComment => Boolean(comment));
@@ -2526,6 +2587,34 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         className={documentShellClass}
       >
         <div className={documentMainClass}>
+          {!isControlled &&
+            !isEditableReview &&
+            reviewSuggestions.length > 0 && (
+              <div
+                className="mb-3 flex flex-wrap gap-2"
+                role="group"
+                aria-label="Review suggestions"
+              >
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  data-testid="document-accept-all"
+                  onClick={() => decideAllNativeSuggestions("accept")}
+                >
+                  Accept all
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  data-testid="document-reject-all"
+                  onClick={() => decideAllNativeSuggestions("reject")}
+                >
+                  Reject all
+                </Button>
+              </div>
+            )}
           {activeComments.length > 0 ? (
             <CommentEditorList
               comments={activeComments}
@@ -2615,7 +2704,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
               : isEditableReview
                 ? {
                     canDecide: true,
-                    disabled: false,
+                    disabled: Boolean(editableReview?.disabled),
                     acceptLabel: (id) =>
                       editableReview?.suggestions.some(
                         (item) => item.changeId === id,

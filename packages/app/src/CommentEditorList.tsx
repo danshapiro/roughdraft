@@ -51,6 +51,7 @@ interface CommentEditorListProps {
 export interface CommentActionDefinition {
   key: string;
   label: string;
+  shortcut?: { keys: string; label: string };
   tone?: "neutral" | "danger";
   presentation?: "default" | "popover";
   icon: ReactNode;
@@ -361,6 +362,7 @@ const COMMENT_AVATAR_CENTER = 12;
 
 function CommentActionButton({
   label,
+  shortcut,
   testId,
   tone = "neutral",
   presentation = "default",
@@ -370,6 +372,7 @@ function CommentActionButton({
   onClick,
 }: {
   label: string;
+  shortcut?: CommentActionDefinition["shortcut"];
   testId?: string;
   tone?: "neutral" | "danger";
   presentation?: "default" | "popover";
@@ -382,6 +385,7 @@ function CommentActionButton({
     <Button
       type="button"
       aria-label={compact ? label : undefined}
+      aria-keyshortcuts={shortcut?.keys}
       data-testid={testId}
       variant="ghost"
       size={compact ? "icon-xs" : "sm"}
@@ -411,7 +415,9 @@ function CommentActionButton({
   return (
     <Tooltip>
       <TooltipTrigger render={button} />
-      <TooltipContent>{label}</TooltipContent>
+      <TooltipContent>
+        {shortcut ? `${label} (${shortcut.label})` : label}
+      </TooltipContent>
     </Tooltip>
   );
 }
@@ -770,6 +776,7 @@ function CommentThreadNode({
                   <CommentActionButton
                     key={action.key}
                     label={action.label}
+                    shortcut={action.shortcut}
                     testId={`comment-${variant}-${comment.id}-action-${action.key}`}
                     tone={action.tone}
                     presentation={action.presentation}

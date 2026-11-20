@@ -15,6 +15,7 @@ export interface ControlledDocumentReview {
   comments: Map<string, CriticComment>;
   blockHighlights: ControlledReviewBlockHighlight[];
   canDecide: boolean;
+  activeChangeId?: string | null;
   disabled: boolean;
   acceptLabel: string;
   rejectLabel: string;

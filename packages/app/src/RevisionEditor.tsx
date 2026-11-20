@@ -63,6 +63,12 @@ import {
   editableMarkdownOptions,
   createSourceSpellingPreserver,
 } from "./revision-markdown";
+import {
+  applySuggestionDecisions,
+  type ReviewDecision,
+  reviewShortcut,
+  reviewShortcutLabel,
+} from "./review-decisions";
 import { suggestionPositions } from "./revision-projection";
 import {
   type BaseSide,
@@ -232,7 +238,8 @@ function TipButton({
 type BaseAction =
   | { kind: "edit" }
   | { kind: "suggestion"; id: string; keep: boolean }
-  | { kind: "reference"; pairId: string; keep: boolean };
+  | { kind: "reference"; pairId: string; keep: boolean }
+  | { kind: "all"; decision: ReviewDecision };
 type BaseSelection = BaseSide | "copy";
 
 export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
@@ -482,6 +489,63 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     [baseSide, chooseFile, destination],
   );
 
+  const decideAll = useCallback(
+    (decision: ReviewDecision) => {
+      const live = ownEditor.current;
+      if (!live) return;
+      if (!destination) {
+        chooseFile({ kind: "all", decision });
+        return;
+      }
+      const existing = new Set(kept(live.state.doc));
+      const changes = (referenceKey.getState(live.state) ?? noChanges).filter(
+        (change) =>
+          !change.overlapsSuggestion && !existing.has(change.item.changeId),
+      );
+      const nativeIds = suggestionPositions(live.state.doc).keys();
+      const tr = live.state.tr;
+      if ((decision === "accept") === (baseSide === "new")) {
+        if (changes.length > 0) {
+          tr.setDocAttribute("kept", [
+            ...existing,
+            ...changes.map((change) => change.item.changeId),
+          ]);
+        }
+      } else if (changes.length > 0) {
+        // Working right to left keeps untouched positions valid. Verify every
+        // replacement before dispatching any of the choices.
+        changes.sort((a, b) => b.from - a.from || b.to - a.to);
+        let boundary = live.state.doc.content.size;
+        let scratch = EditorState.create({ doc: tr.doc });
+        for (const change of changes) {
+          const replacement =
+            change.to <= boundary && revertReferenceChange(scratch, change);
+          if (!replacement) {
+            setActionError(
+              "Some changes overlap or moved. Review them individually before choosing again.",
+            );
+            return;
+          }
+          for (const step of replacement.steps) tr.step(step);
+          scratch = scratch.apply(replacement);
+          boundary = change.from;
+        }
+      }
+      if (!applySuggestionDecisions(tr, nativeIds, decision)) {
+        setActionError("A suggestion moved. Review it before deciding.");
+        return;
+      }
+      if (!tr.docChanged) return;
+      // A resolved native edit can appear as a new difference from the frozen
+      // file. Mark the newly introduced comparison wording as already reviewed.
+      live.view.dispatch(closeHistory(tr).setMeta(explicitReviewEdit, true));
+      live.view.dispatch(closeHistory(live.state.tr));
+      setActiveChange(null);
+      setActionError("");
+    },
+    [baseSide, chooseFile, destination],
+  );
+
   useEffect(() => {
     if (!afterBase || !editor || editor === afterBase.replacedEditor) return;
     const { action } = afterBase;
@@ -496,6 +560,8 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       if (!decided)
         setActionError("The suggestion moved. Review it before deciding.");
       editor.view.dispatch(closeHistory(editor.state.tr));
+    } else if (action.kind === "all") {
+      decideAll(action.decision);
     } else {
       const match = referenceKey
         .getState(editor.state)
@@ -504,7 +570,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         deciding(match.item.changeId, action.keep);
       else setActionError("The change moved. Review it before choosing again.");
     }
-  }, [afterBase, deciding, editor]);
+  }, [afterBase, decideAll, deciding, editor]);
 
   const renderedChanges = editor
     ? (referenceKey.getState(editor.state) ?? noChanges)
@@ -512,20 +578,30 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const decisions = editor
     ? kept(editor.state.doc)
     : Object.keys(source.decisions);
-  const visibleChanges = useMemo(
-    () =>
-      renderedChanges
-        .filter(
-          (change) =>
-            !change.overlapsSuggestion &&
-            !decisions.includes(change.item.changeId),
-        )
-        .map((change) => change.item),
-    [renderedChanges, decisions],
-  );
+  const visibleChanges = useMemo(() => {
+    const decided = new Set(decisions);
+    return renderedChanges
+      .filter(
+        (change) =>
+          !change.overlapsSuggestion && !decided.has(change.item.changeId),
+      )
+      .map((change) => change.item);
+  }, [renderedChanges, decisions]);
+  const decisionsDisabled =
+    busy ||
+    choosingBase ||
+    Boolean(afterBase) ||
+    saveAs ||
+    sendOpen ||
+    Boolean(disk) ||
+    conflict ||
+    session.targetChanged ||
+    writePaused;
   const reviewSurface = useMemo(
     () => ({
       suggestions: visibleChanges,
+      disabled: decisionsDisabled,
+      activeChangeId: activeChange,
       decisions,
       markdownFlushRef,
       onMarkdownQueued,
@@ -536,9 +612,11 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       onBlockedSuggestionEdit: () => setBlocked(true),
     }),
     [
+      activeChange,
       commentMap,
       deciding,
       decisions,
+      decisionsDisabled,
       onMarkdownQueued,
       updateComments,
       visibleChanges,
@@ -942,6 +1020,24 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               className="revision-tool-group revision-navigation"
               aria-label="Change navigation"
               role="group"
+              onKeyDown={(event) => {
+                const decision = reviewShortcut(event.nativeEvent);
+                const id = activeChange;
+                if (
+                  !decision ||
+                  !id ||
+                  !navigation.includes(id) ||
+                  decisionsDisabled
+                )
+                  return;
+                event.preventDefault();
+                if (event.repeat || deciding(id, decision === "accept")) return;
+                editor?.view.dispatch(closeHistory(editor.state.tr));
+                if (decision === "accept")
+                  editor?.commands.acceptCriticChange(id);
+                else editor?.commands.rejectCriticChange(id);
+                editor?.view.dispatch(closeHistory(editor.state.tr));
+              }}
             >
               <TipButton
                 tip="Previous change"
@@ -972,6 +1068,30 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               >
                 <ArrowDown />
               </TipButton>
+              {formatted && count > 0 && (
+                <>
+                  <TipButton
+                    tip={`Accept pending changes. Current change: ${reviewShortcutLabel("accept")}`}
+                    variant="outline"
+                    size="sm"
+                    disabled={decisionsDisabled}
+                    data-testid="revision-accept-all"
+                    onClick={() => decideAll("accept")}
+                  >
+                    Accept all
+                  </TipButton>
+                  <TipButton
+                    tip={`Reject pending changes. Current change: ${reviewShortcutLabel("reject")}`}
+                    variant="outline"
+                    size="sm"
+                    disabled={decisionsDisabled}
+                    data-testid="revision-reject-all"
+                    onClick={() => decideAll("reject")}
+                  >
+                    Reject all
+                  </TipButton>
+                </>
+              )}
             </div>
             <div
               className="revision-tool-group"

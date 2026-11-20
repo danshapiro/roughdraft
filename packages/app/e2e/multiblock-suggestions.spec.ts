@@ -279,3 +279,70 @@ test("a suggestion containing only a fenced code block still has one review acti
     removeMarkdownProject(projectDir);
   }
 });
+
+for (const decision of ["accept", "reject"] as const) {
+  test(`${decision} all saves both block and inline changes without reformatting the file`, async ({
+    page,
+  }) => {
+    const projectDir = createMarkdownProject(`multiblock-all-${decision}`);
+    try {
+      const accept = decision === "accept";
+      const inline = '\nThree   spaces: {~~old sign~>new sign~~}{id="s25"}.\n';
+      const filePath = writeProjectFile(
+        projectDir,
+        "laser.md",
+        suggestion + inline,
+      );
+      await openMarkdownFile(page, filePath);
+      await expect(page.getByTestId("suggestion-thread-s24")).toBeVisible();
+      await page.getByTestId(`document-${decision}-all`).click();
+      await expect
+        .poll(() => readProjectFile(projectDir, "laser.md"))
+        .toBe(
+          prefix +
+            (accept ? newBlocks : oldBlocks) +
+            suffix +
+            `\nThree   spaces: ${accept ? "new sign" : "old sign"}.\n`,
+        );
+      await page.reload();
+      await expect(richTextEditor(page)).toContainText(
+        accept ? "Updated features" : "Original features",
+      );
+      await expect(page.getByTestId("document-accept-all")).toBeHidden();
+    } finally {
+      removeMarkdownProject(projectDir);
+    }
+  });
+}
+
+test("review shortcuts stay out of reply inputs and decide the focused card", async ({
+  page,
+}) => {
+  const projectDir = createMarkdownProject("multiblock-shortcuts");
+  try {
+    const filename = "laser.md";
+    const source = 'Keep {~~old~>new~~}{id="s24"} settings.\n';
+    await openMarkdownFile(
+      page,
+      writeProjectFile(projectDir, filename, source),
+    );
+    await page.getByTestId("comment-rail-s24-action-reply").click();
+    const reply = page.getByTestId("comment-rail-c1-editor");
+    await reply.fill("Leave the suggestion pending while I am writing.");
+    const modifier = process.platform === "darwin" ? "Meta" : "Control";
+    await page.keyboard.press(`${modifier}+Alt+A`);
+    await expect(reply).toBeFocused();
+    await expect(page.getByTestId("suggestion-thread-s24")).toBeVisible();
+    await page.getByTestId("comment-rail-c1-action-save").click();
+    await expect
+      .poll(() => readProjectFile(projectDir, filename))
+      .toContain("Leave the suggestion pending");
+    await page.getByTestId("comment-rail-s24-action-reject").focus();
+    await page.keyboard.press(`${modifier}+Alt+R`);
+    await expect
+      .poll(() => readProjectFile(projectDir, filename))
+      .toBe("Keep old settings.\n");
+  } finally {
+    removeMarkdownProject(projectDir);
+  }
+});
