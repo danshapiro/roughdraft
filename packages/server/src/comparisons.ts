@@ -422,6 +422,8 @@ export function comparisonSegments(
 }
 
 class ComparisonStore {
+  private lastFeedbackTime = 0;
+
   constructor(
     private directory: string,
     private options: {
@@ -442,6 +444,34 @@ class ComparisonStore {
     if (!/^[a-f0-9-]{36}$/.test(id))
       throw new ComparisonError(404, "Comparison not found");
     return path.join(this.directory, `${id}.json`);
+  }
+  private watchChildren(id: string): string {
+    return path.join(this.directory, `watch-${id}`);
+  }
+  watch(id: string): StoredComparison {
+    const root = this.load(id);
+    if (root.editor !== "unified") return root;
+    let latest = root;
+    const seen = new Set<string>();
+    const pending = [id];
+    for (let next = pending.pop(); next; next = pending.pop()) {
+      if (seen.has(next)) continue;
+      seen.add(next);
+      const review = next === id ? root : this.loadIndexedReview(next);
+      if (!review) continue;
+      if (
+        review.feedback &&
+        review.feedback.sentAt > (latest.feedback?.sentAt ?? "")
+      )
+        latest = review;
+      try {
+        for (const child of fs.readdirSync(this.watchChildren(next)))
+          pending.push(child);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    return latest;
   }
   private documentIndex(filename: string, pending = false): string {
     return path.join(
@@ -1139,6 +1169,12 @@ class ComparisonStore {
       status: "open",
       completion: null,
     };
+    // Register the copy before publishing it so a restart cannot strand a
+    // watch. Failed or incomplete copies have no readable review to report.
+    const children = this.watchChildren(review.id);
+    if (fs.mkdirSync(children, { recursive: true, mode: 0o700 }))
+      syncDirectory(this.directory);
+    atomicWrite(path.join(children, fork.id), "");
     return this.publishDraft(
       fork,
       draft,
@@ -1226,7 +1262,14 @@ class ComparisonStore {
   ): StoredComparison {
     const { draft, reviewComments } = this.editorUpdate(review, body);
     const comment = stringField(body, "comment") ?? review.comment;
-    const sentAt = new Date().toISOString();
+    // Two sends in the same millisecond must still be distinguishable to a watcher.
+    const previousTime = Date.parse(review.feedback?.sentAt ?? "") || 0;
+    this.lastFeedbackTime = Math.max(
+      Date.now(),
+      previousTime + 1,
+      this.lastFeedbackTime + 1,
+    );
+    const sentAt = new Date(this.lastFeedbackTime).toISOString();
     const destinationPath = review.destinationPath ?? null;
     const saved =
       destinationPath !== null &&
@@ -1490,6 +1533,12 @@ export function comparisonRouter(
       res
         .status(201)
         .json(store.view(store.openDocument(objectBody(req.body))));
+    }),
+  );
+  router.get(
+    "/:id/watch",
+    handle((req, res) => {
+      res.json(store.view(store.watch(String(req.params.id))));
     }),
   );
   router.get(

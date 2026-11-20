@@ -172,9 +172,10 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     const resumed = await command([
       "comparison",
       result.events[0].comparisonId,
+      "--no-watch",
     ]);
     expect(resumed.code).toBe(0);
-    expect(resumed.events.at(-1).completion).toEqual(
+    expect(resumed.events[0].comparison.completion).toEqual(
       result.events.at(-1).completion,
     );
   }, 15000);
@@ -262,7 +263,16 @@ describe("comparison CLI actual subprocess and filesystem", () => {
       ...draft,
     });
     await api(`/${review.id}/send`, { revision: saved.revision, ...draft });
-    const resumed = await command(["comparison", review.id]);
+    const resumed = await command(
+      ["comparison", review.id, "--timeout", "5"],
+      async (event) => {
+        await api(`/${review.id}/send`, {
+          revision: event.comparison.revision,
+          ...draft,
+          comment: "New feedback",
+        });
+      },
+    );
     expect(resumed.code, resumed.errors).toBe(0);
     expect(resumed.events).toHaveLength(2);
     for (const event of resumed.events) {
@@ -301,6 +311,44 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     expect(fs.readFileSync(before, "utf8")).toBe("Before");
     expect(fs.readFileSync(after, "utf8")).toBe("After");
   }, 15000);
+  it("waits for fresh feedback when resumed and follows it to a stale tab's copy", async () => {
+    const source = path.join(directory, "original.md");
+    const copy = path.join(directory, "copy.md");
+    const draft = { markdown: "Copied text", decisions: {} };
+    fs.writeFileSync(source, "Original text");
+    const review = await api("/document", { targetPath: source });
+    const earlier = await api(`/${review.id}/send`, {
+      revision: review.revision,
+      markdown: "Original text",
+      decisions: {},
+      comment: "Previous feedback",
+    });
+    const result = await command(
+      ["comparison", review.id, "--timeout", "5"],
+      async (event) => {
+        expect(event.comparison.feedback).toEqual(earlier.feedback);
+        const copied = await api(`/${review.id}/fork`, {
+          path: copy,
+          expectedVersion: null,
+          ...draft,
+        });
+        await api(`/${copied.id}/send`, {
+          revision: copied.revision,
+          ...draft,
+          comment: "Feedback from copy",
+        });
+      },
+    );
+    expect(result.code, result.errors).toBe(0);
+    expect(result.events.at(-1)).toMatchObject({
+      event: "comparison.completed",
+      completion: { fileWritten: false, targetPath: copy },
+      comparison: { feedback: { comment: "Feedback from copy", saved: true } },
+    });
+    expect(result.events.at(-1).comparisonId).not.toBe(review.id);
+    expect(fs.readFileSync(source, "utf8")).toBe("Original text");
+  }, 15000);
+
   it("reopens a file draft and waits for new feedback instead of replaying the old snapshot", async () => {
     const target = path.join(directory, "notes.md");
     fs.writeFileSync(target, "live file");
