@@ -360,6 +360,8 @@ export function useRevisionSession(
     };
   }, [draft, run, seed]);
 
+  const readDraft = useCallback(() => latest.current, []);
+
   const flush = useCallback(async () => {
     const saved = await run("sync", latest.current);
     return !paused.current && !saved.targetChanged;
@@ -377,6 +379,7 @@ export function useRevisionSession(
     session,
     draft,
     updateDraft,
+    readDraft,
     run,
     inspect,
     recoveryError,

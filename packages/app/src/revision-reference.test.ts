@@ -3,7 +3,11 @@ import { EditorState } from "@tiptap/pm/state";
 import { describe, expect, it } from "vitest";
 import { criticMarkdownToEditorState } from "./critic-markup";
 import { createEditorExtensions } from "./editor-extensions";
-import { referenceChanges, revertReferenceChange } from "./revision-reference";
+import {
+  createReferenceComparison,
+  referenceChanges,
+  revertReferenceChange,
+} from "./revision-reference";
 
 const schema = getSchema(createEditorExtensions(""));
 const doc = (markdown: string) =>
@@ -97,6 +101,49 @@ describe("reference review in the editable document", () => {
     expect(
       referenceChanges(reference, rewritten).map(({ item }) => item.changeId),
     ).not.toContain(kept.item.changeId);
+  });
+
+  it("keeps saved reference IDs while pending suggestions move editable positions", () => {
+    const reference = doc("Use red.");
+    const initial = doc("Use blue.");
+    const withSuggestion = state("{++Please ++}{#s1}Use blue.");
+    const warm = createReferenceComparison(reference);
+    const [first] = warm(initial);
+    // A saved Keep from the original comparison engine must still apply.
+    expect(first.item.changeId).toBe("reference-5-8-3o3cwh1a9lxq");
+    const [shifted] = warm(withSuggestion.doc);
+    expect(shifted.item.changeId).toBe(first.item.changeId);
+    expect(shifted.from).toBe(first.from + "Please ".length);
+    expect(shifted.overlapsSuggestion).toBe(false);
+    expect(
+      revertReferenceChange(withSuggestion, shifted)?.doc.textContent,
+    ).toBe("Please Use red.");
+  });
+
+  it("keeps warm comparison decisions and restore ranges correct as blocks become exact matches", () => {
+    const reference = doc(
+      "# Rules\n\nUse red pens.\n\nUse red pens.\n\n- Keep a spare red pen.",
+    );
+    const initial = state(
+      "# Rules\n\nUse new pens.\n\nUse red pens.\n\n- Keep a spare blue pen.",
+    );
+    const warm = createReferenceComparison(reference);
+    const first = warm(initial.doc);
+    const edit = (value: typeof initial, text: string) => {
+      const position = value.doc.child(0).nodeSize + "Use ".length + 1;
+      return value.apply(value.tr.insertText(text, position, position + 3));
+    };
+    const changed = edit(initial, "tan");
+    const exact = edit(changed, "red");
+    for (const current of [changed, exact, initial]) {
+      const changes = warm(current.doc);
+      expect(changes).toEqual(referenceChanges(reference, current.doc));
+      const blue = changes.find((change) => change.item.newText === "blue");
+      expect(blue?.item.changeId).toBe(first.at(-1)?.item.changeId);
+      expect(
+        blue && revertReferenceChange(current, blue)?.doc.textContent,
+      ).toContain("Keep a spare red pen.");
+    }
   });
 
   it("restores a deleted list item at the original position without changing its neighbors", () => {
