@@ -2,6 +2,7 @@ import type { Editor } from "@tiptap/react";
 import { Check, Reply, X } from "lucide-react";
 import {
   type CSSProperties,
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -34,6 +35,51 @@ import { cn } from "./lib/utils";
 import type { DraftSuggestionState } from "./PageCard";
 
 const SUGGESTION_QUOTE_PREVIEW_LIMIT = 140;
+const WINDOWED_RAIL_THRESHOLD = 60;
+const RAIL_WINDOW_STEP = 200;
+const RAIL_OVERSCAN = 600;
+
+// Large reviews can have thousands of word-level changes. Keep their positions
+// in the layout, but mount editors and action controls only near the viewport.
+function useReviewRailWindow(enabled: boolean) {
+  const railRef = useRef<HTMLDivElement>(null);
+  const [range, setRange] = useState({ top: -RAIL_OVERSCAN, bottom: 1600 });
+  useLayoutEffect(() => {
+    if (!enabled || !railRef.current) return;
+    let frame = 0;
+    const measure = () => {
+      frame = 0;
+      const rail = railRef.current;
+      if (!rail) return;
+      const offset = -rail.getBoundingClientRect().top;
+      const top = Math.floor(offset / RAIL_WINDOW_STEP) * RAIL_WINDOW_STEP;
+      const bottom =
+        Math.ceil((offset + window.innerHeight) / RAIL_WINDOW_STEP) *
+        RAIL_WINDOW_STEP;
+      setRange((current) =>
+        current.top === top - RAIL_OVERSCAN &&
+        current.bottom === bottom + RAIL_OVERSCAN
+          ? current
+          : { top: top - RAIL_OVERSCAN, bottom: bottom + RAIL_OVERSCAN },
+      );
+    };
+    const schedule = () => {
+      if (!frame) frame = requestAnimationFrame(measure);
+    };
+    measure();
+    const resize = new ResizeObserver(schedule);
+    resize.observe(railRef.current);
+    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    return () => {
+      cancelAnimationFrame(frame);
+      resize.disconnect();
+      window.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
+    };
+  }, [enabled]);
+  return { railRef, range };
+}
 
 export interface CriticChangeRailItem {
   changeId: string;
@@ -102,6 +148,31 @@ function railLayoutItemStyle(
 ): CSSProperties | undefined {
   return layout === "anchored" ? { top: railTop } : undefined;
 }
+
+const OffscreenReviewCard = memo(function OffscreenReviewCard({
+  anchor,
+  layout,
+  top,
+  height,
+}: {
+  anchor?: string;
+  layout: "anchored" | "flow";
+  top: number;
+  height: number;
+}) {
+  return (
+    <div
+      aria-hidden="true"
+      data-review-rail-anchor={anchor}
+      className={
+        layout === "anchored"
+          ? "absolute inset-x-0 pointer-events-none"
+          : undefined
+      }
+      style={{ ...railLayoutItemStyle(layout, top), height }}
+    />
+  );
+});
 
 function getSuggestionPreview(suggestion: CriticChangeRailItem) {
   const oldText = suggestion.oldText.trim();
@@ -227,6 +298,9 @@ export function DocumentReviewRail({
 }: DocumentReviewRailProps) {
   const draftTextareaRef = useRef<HTMLTextAreaElement>(null);
   const itemRefs = useRef(new Map<string, HTMLDivElement>());
+  const resizeRef = useRef<ResizeObserver | null>(null);
+  const keysByElement = useRef(new WeakMap<Element, string>());
+  const focusedKey = useRef<string | null>(null);
   const [itemHeights, setItemHeights] = useState<Record<string, number>>({});
 
   const activeRootThreadId = useMemo(
@@ -330,93 +404,87 @@ export function DocumentReviewRail({
     [selectedCommentId, suggestions],
   );
 
+  const activeKey =
+    draftEntry?.key ??
+    selectedChangeId ??
+    activeSuggestionIdForComment ??
+    activeRootThreadId;
   const layouts = useMemo(() => {
     const entries = [
       ...suggestionEntries,
       ...commentEntries,
       ...(draftEntry ? [draftEntry] : []),
     ].sort((left, right) => left.anchorTop - right.anchorTop);
-    const activeKey =
-      draftEntry?.key ??
-      selectedChangeId ??
-      activeSuggestionIdForComment ??
-      activeRootThreadId;
-
-    return resolveAnchoredRailLayouts(entries, itemHeights, activeKey);
+    if (railLayout !== "flow")
+      return resolveAnchoredRailLayouts(entries, itemHeights, activeKey);
+    // Match the CSS grid's gap so an unmounted card occupies the same space.
+    let top = 0;
+    return entries.map((entry) => {
+      const height = itemHeights[entry.key] ?? 120;
+      const railTop = top;
+      const railBottom = top + height;
+      top = railBottom + 12;
+      return { ...entry, railTop, railBottom, height };
+    });
   }, [
-    activeRootThreadId,
-    activeSuggestionIdForComment,
+    activeKey,
     commentEntries,
     draftEntry,
     itemHeights,
-    selectedChangeId,
+    railLayout,
     suggestionEntries,
   ]);
 
+  const windowed = layouts.length >= WINDOWED_RAIL_THRESHOLD;
+  const { railRef, range } = useReviewRailWindow(windowed);
+
   const setItemRef = useCallback((key: string, node: HTMLDivElement | null) => {
+    const previous = itemRefs.current.get(key);
+    if (previous === node) return;
+    if (previous) {
+      resizeRef.current?.unobserve(previous);
+      itemRefs.current.delete(key);
+    }
     if (node) {
       itemRefs.current.set(key, node);
-    } else {
-      itemRefs.current.delete(key);
+      keysByElement.current.set(node, key);
+      resizeRef.current?.observe(node, { box: "border-box" });
     }
   }, []);
 
   useLayoutEffect(() => {
-    if (layouts.length === 0) {
-      setItemHeights((current) =>
-        Object.keys(current).length === 0 ? current : {},
-      );
-      return;
-    }
-
-    const updateHeights = () => {
-      setItemHeights((current) => {
-        const next: Record<string, number> = {};
-        let changed = false;
-
-        for (const layout of layouts) {
-          const element = itemRefs.current.get(layout.key);
-          const measuredHeight = Math.ceil(
-            element?.getBoundingClientRect().height ?? 0,
-          );
-          const height =
-            measuredHeight > 0
-              ? Math.ceil(normalizeCommentMeasurement(measuredHeight, 1))
-              : (current[layout.key] ?? 0);
-          next[layout.key] = height;
-          if (current[layout.key] !== height) {
-            changed = true;
-          }
-        }
-
+    const observer = new ResizeObserver((entries) => {
+      const sizes = new Map<string, number>();
+      for (const entry of entries) {
+        const key = keysByElement.current.get(entry.target);
+        const size = entry.borderBoxSize[0]?.blockSize;
         if (
-          !changed &&
-          Object.keys(current).length === Object.keys(next).length
-        ) {
-          return current;
+          key === undefined ||
+          itemRefs.current.get(key) !== entry.target ||
+          !size
+        )
+          continue;
+        sizes.set(key, Math.ceil(normalizeCommentMeasurement(size, 1)));
+      }
+      if (!sizes.size) return;
+      setItemHeights((current) => {
+        let next = current;
+        for (const [key, height] of sizes) {
+          if (current[key] === height) continue;
+          if (next === current) next = { ...current };
+          next[key] = height;
         }
-
         return next;
       });
-    };
-
-    updateHeights();
-
-    const resizeObserver = new ResizeObserver(() => {
-      updateHeights();
     });
-
-    for (const layout of layouts) {
-      const element = itemRefs.current.get(layout.key);
-      if (element) {
-        resizeObserver.observe(element);
-      }
-    }
-
+    resizeRef.current = observer;
+    for (const element of itemRefs.current.values())
+      observer.observe(element, { box: "border-box" });
     return () => {
-      resizeObserver.disconnect();
+      resizeRef.current = null;
+      observer.disconnect();
     };
-  }, [layouts]);
+  }, []);
 
   useEffect(() => {
     if (draftSuggestion && draftTextareaRef.current) {
@@ -437,10 +505,46 @@ export function DocumentReviewRail({
   return (
     <aside className={cn("min-w-0", className)} data-testid={testId}>
       <div
-        className={cn(railLayout === "flow" ? "grid gap-3" : "relative")}
+        ref={railRef}
+        className={
+          railLayout === "flow" ? "grid gap-3" : "relative [contain:layout]"
+        }
         style={railHeight ? { minHeight: railHeight } : undefined}
+        onFocus={(event) => {
+          focusedKey.current =
+            event.target.closest<HTMLElement>("[data-review-rail-key]")?.dataset
+              .reviewRailKey ?? null;
+        }}
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget))
+            focusedKey.current = null;
+        }}
       >
         {layouts.map((layout) => {
+          if (
+            windowed &&
+            layout.key !== focusedKey.current &&
+            layout.key !== activeKey &&
+            layout.type !== "draft" &&
+            (layout.railBottom < range.top || layout.railTop > range.bottom) &&
+            !(
+              pendingFocusCommentId &&
+              (layout.type === "comment"
+                ? layout.thread.commentIds
+                : layout.suggestion.commentIds
+              ).includes(pendingFocusCommentId)
+            )
+          ) {
+            return (
+              <OffscreenReviewCard
+                key={layout.key}
+                anchor={layout.type === "suggestion" ? layout.key : undefined}
+                layout={railLayout}
+                top={layout.railTop}
+                height={layout.height}
+              />
+            );
+          }
           if (layout.type === "comment") {
             const isSelected =
               !!activeRootThreadId &&
@@ -456,6 +560,7 @@ export function DocumentReviewRail({
               <div
                 key={layout.key}
                 ref={(node) => setItemRef(layout.key, node)}
+                data-review-rail-key={layout.key}
                 data-testid={`comment-thread-${layout.thread.rootCommentId}`}
                 data-comment-thread-container="true"
                 className={cn(
@@ -505,6 +610,7 @@ export function DocumentReviewRail({
               <div
                 key={layout.key}
                 ref={(node) => setItemRef(layout.key, node)}
+                data-review-rail-key={layout.key}
                 data-testid="draft-suggestion-thread"
                 data-suggestion-thread-container="true"
                 className={cn(
@@ -674,7 +780,9 @@ export function DocumentReviewRail({
             <div
               key={layout.key}
               ref={(node) => setItemRef(layout.key, node)}
+              data-review-rail-key={layout.key}
               data-testid={`suggestion-thread-${suggestion.changeId}`}
+              data-review-rail-anchor={layout.key}
               data-suggestion-thread-container="true"
               className={cn(
                 railLayoutItemClass(railLayout),

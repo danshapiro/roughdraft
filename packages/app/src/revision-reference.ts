@@ -1,3 +1,4 @@
+import type { JSONContent } from "@tiptap/core";
 import {
   type Fragment,
   type Node as ProseMirrorNode,
@@ -8,8 +9,9 @@ import { ReplaceStep } from "@tiptap/pm/transform";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { CriticChangeRailItem } from "./DocumentReviewRail";
 import {
-  diffRenderedComparison,
+  createRenderedComparisonObserver,
   renderedContentIdentity,
+  type RenderedSourceDifference,
 } from "./rendered-comparison-diff";
 import { projectAcceptedDocument } from "./revision-projection";
 
@@ -55,62 +57,119 @@ function project(doc: ProseMirrorNode) {
   return projection;
 }
 
-/** A decision belongs to one reference position and the exact content of both sides. */
-function changeIdentity(
-  oldFrom: number,
-  oldTo: number,
-  before: Fragment,
-  after: Fragment,
-) {
-  const json = JSON.stringify([
-    renderedContentIdentity(before.toJSON()),
-    renderedContentIdentity(after.toJSON()),
-  ]);
-  // FNV-1a with a 64 bit result keeps persisted IDs short even for whole blocks.
-  let hash = 14695981039346656037n;
+/** FNV-1a over the existing UTF-16 representation, preserving saved IDs. */
+function hashIdentity(json: string) {
+  let high = 0xcbf29ce4;
+  let low = 0x84222325;
   for (let index = 0; index < json.length; index++) {
-    hash = BigInt.asUintN(
-      64,
-      (hash ^ BigInt(json.charCodeAt(index))) * 1099511628211n,
-    );
+    low = (low ^ json.charCodeAt(index)) >>> 0;
+    // The 64-bit prime is 2^40 + 435. Use two 32-bit limbs to avoid
+    // allocating several BigInts for each character of a large change.
+    const product = low * 435;
+    high =
+      (Math.imul(high, 435) + (low << 8) + Math.floor(product / 2 ** 32)) >>> 0;
+    low = product >>> 0;
   }
-  return `reference-${oldFrom}-${oldTo}-${hash.toString(36)}`;
+  return ((BigInt(high) << 32n) | BigInt(low)).toString(36);
 }
 
-export function referenceChanges(
+export function createReferenceComparison(
   reference: ProseMirrorNode,
-  current: ProseMirrorNode,
   baseSide: BaseSide = "new",
-): ReferenceChange[] {
+) {
   const opposite = project(reference).doc;
-  const projection = project(current);
-  const edited = projection.doc;
-  if (opposite.eq(edited)) return [];
-  const [before, after] =
-    baseSide === "old" ? [edited, opposite] : [opposite, edited];
-  const map = projection.mapping.invert();
-  const changes: ReferenceChange[] = [];
-  diffRenderedComparison(
-    before.toJSON().content ?? [],
-    after.toJSON().content ?? [],
-    { ...referenceAuthor, changeId: "reference", kind: "substitution-old" },
-    ({ oldFrom, oldTo, newFrom, newTo, structural, oldText, newText }) => {
-      const oldPart = before.slice(oldFrom, oldTo).content;
-      const newPart = after.slice(newFrom, newTo).content;
-      const isOld = baseSide === "old";
-      const start = map.map(isOld ? oldFrom : newFrom, 1);
-      const to = map.map(isOld ? oldTo : newTo, -1);
+  // ProseMirror shares unchanged nodes between transactions. Keep their JSON
+  // stable so the matcher can reuse text, semantic keys and alignment scores.
+  const json = new WeakMap<ProseMirrorNode, JSONContent>();
+  const toJson = (node: ProseMirrorNode): JSONContent => {
+    const cached = json.get(node);
+    if (cached) return cached;
+    const value: JSONContent = { type: node.type.name };
+    if (Object.keys(node.attrs).length) value.attrs = node.attrs;
+    if (node.text !== undefined) value.text = node.text;
+    if (node.marks.length)
+      value.marks = node.marks.map((mark) => mark.toJSON());
+    if (node.childCount) value.content = node.children.map(toJson);
+    json.set(node, value);
+    return value;
+  };
+  const compare = createRenderedComparisonObserver();
+  const localDigests = new WeakMap<RenderedSourceDifference, string>();
+  const identity = (fragment: Fragment) =>
+    renderedContentIdentity(
+      fragment.childCount ? fragment.content.map(toJson) : null,
+    );
+
+  type ProjectedChange = Omit<
+    ReferenceChange,
+    "expected" | "overlapsSuggestion"
+  >;
+  let previousAccepted: ProseMirrorNode | undefined;
+  let projectedChanges: ProjectedChange[] = [];
+  const isOld = baseSide === "old";
+  return (current: ProseMirrorNode): ReferenceChange[] => {
+    const projection = project(current);
+    const edited = projection.doc;
+    // Suggesting can change the editable positions without changing the
+    // accepted content. Keep the comparison and remap only its positions.
+    if (!previousAccepted?.content.eq(edited.content)) {
+      previousAccepted = edited;
+      projectedChanges = [];
+      if (!opposite.eq(edited)) {
+        const [before, after] = isOld ? [edited, opposite] : [opposite, edited];
+        compare(
+          toJson(before).content ?? [],
+          toJson(after).content ?? [],
+          (
+            { oldFrom, oldTo, newFrom, newTo, structural, oldText, newText },
+            local,
+          ) => {
+            const oldPart = before.slice(oldFrom, oldTo).content;
+            const newPart = after.slice(newFrom, newTo).content;
+            let digest = local && localDigests.get(local);
+            if (digest === undefined) {
+              digest = hashIdentity(
+                JSON.stringify([identity(oldPart), identity(newPart)]),
+              );
+              if (local) localDigests.set(local, digest);
+            }
+            const pairId = `reference-${oldFrom}-${oldTo}-${digest}`;
+            const changeId = isOld
+              ? `reference-${newFrom}-${newTo}-${digest}`
+              : pairId;
+            const kind = !oldPart.size
+              ? "addition"
+              : !newPart.size
+                ? "deletion"
+                : "substitution-old";
+            projectedChanges.push({
+              item: {
+                changeId,
+                change: { ...referenceAuthor, changeId, kind },
+                kind,
+                oldText,
+                newText,
+                anchorTop: 0,
+                anchorBottom: 0,
+                commentIds: [],
+              },
+              pairId,
+              baseSide,
+              from: isOld ? oldFrom : newFrom,
+              to: isOld ? oldTo : newTo,
+              structural,
+              restore: isOld ? newPart : oldPart,
+            });
+          },
+          !isOld,
+        );
+      }
+    }
+    const map = projection.mapping.invert();
+    return projectedChanges.map((change) => {
+      const start = map.map(change.from, 1);
+      const to = map.map(change.to, -1);
       const from = Math.min(start, to);
-      const restore = isOld ? newPart : oldPart;
-      const pairId = changeIdentity(oldFrom, oldTo, oldPart, newPart);
-      const changeId = isOld
-        ? changeIdentity(newFrom, newTo, oldPart, newPart)
-        : pairId;
-      const kind = !oldPart.size
-        ? "addition"
-        : !newPart.size
-          ? "deletion"
-          : "substitution-old";
       // Bias away from adjacent pending insertions. A deletion at the same
       // anchor as a pending insertion has no unambiguous place to be restored.
       let overlapsSuggestion = start > to;
@@ -118,29 +177,23 @@ export function referenceChanges(
         if (pendingMark(node) || node.type.name === "criticChangeBlock")
           overlapsSuggestion = true;
       });
-      changes.push({
-        item: {
-          changeId,
-          change: { ...referenceAuthor, changeId, kind },
-          kind,
-          oldText,
-          newText,
-          anchorTop: 0,
-          anchorBottom: 0,
-          commentIds: [],
-        },
-        pairId,
-        baseSide,
+      return {
+        ...change,
         from,
         to,
-        structural,
-        restore,
         expected: current.slice(from, to).content,
         overlapsSuggestion,
-      });
-    },
-  );
-  return changes;
+      };
+    });
+  };
+}
+
+export function referenceChanges(
+  reference: ProseMirrorNode,
+  current: ProseMirrorNode,
+  baseSide: BaseSide = "new",
+): ReferenceChange[] {
+  return createReferenceComparison(reference, baseSide)(current);
 }
 
 export function revertReferenceChange(

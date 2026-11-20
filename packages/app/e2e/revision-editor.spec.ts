@@ -276,6 +276,57 @@ test.describe("the single revision editor", () => {
     expect(contents(afterPath)).toBe(newText);
   });
 
+  test("large reviews keep distant changes usable and save a typing burst before a shortcut", async ({
+    page,
+    request,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const rows = Array.from(
+      { length: 100 },
+      (_, i) =>
+        `Passage ${i} keeps the original wording. {~~old item~>updated item~~}{#s${i}} ${"Additional context for the reader. ".repeat(5).trim()}`,
+    );
+    const source = `# Large review\n\nOpening word stays here.\n\n${rows.join("\n\n")}\n`;
+    const filename = writeProjectFile(project, "large-review.md", source);
+    const id = await openReview(page, request, { targetPath: filename });
+    const pending = page.getByTestId("revision-pending");
+    await expect(pending).toHaveText("100");
+    const cards = page.getByTestId(/^suggestion-thread-s\d+$/);
+    await expect(cards.first()).toBeVisible();
+    expect(await cards.count()).toBeLessThan(35);
+    await expect(page.getByTestId("suggestion-thread-s99")).toHaveCount(0);
+
+    await page.getByTestId("revision-previous-change").click();
+    await expect(
+      richTextEditor(page).locator('[data-critic-change-id="s99"]').first(),
+    ).toBeInViewport();
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    const last = page.getByTestId("suggestion-thread-s99");
+    await expect(last).toBeInViewport();
+    await last.getByTestId(keep).click();
+    await expect(pending).toHaveText("99");
+    await saved(page);
+
+    await selectRichText(page, "Opening word");
+    await page.keyboard.insertText("Refreshed opening");
+    await page.keyboard.press("Control+s");
+    await expect
+      .poll(() => contents(filename))
+      .toContain("Refreshed opening stays here.");
+    expect(contents(filename)).toContain(
+      rows[99].replace("{~~old item~>updated item~~}{#s99}", "updated item"),
+    );
+    await page.setViewportSize({ width: 830, height: 900 });
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await expect(page.getByTestId("suggestion-thread-s98")).toBeInViewport();
+    expect(await cards.count()).toBeLessThan(35);
+    const persisted = await readReview(request, id);
+    expect(persisted.draft?.markdown).toContain("{~~old item~>updated item~~}");
+    await page.reload();
+    await expect(pending).toHaveText("99");
+    await expect(page.getByTestId("revision-conflict")).toHaveCount(0);
+  });
+
   test("keeps the same passage and column when switching views", async ({
     page,
     request,
@@ -451,14 +502,15 @@ test.describe("the single revision editor", () => {
     expect(contents(file)).toBe("Saved by the second tab\n");
   });
 
-  test("opening a linked file flushes the edit and stays in the same editor", async ({
+  test("opening a linked file flushes a queued large-document edit and stays in the same editor", async ({
     page,
     request,
   }) => {
+    const body = "A paragraph of unchanged text. ".repeat(425).trim();
     const first = writeProjectFile(
       project,
       "first.md",
-      "Original.\n\n[Second file](second.md)\n",
+      `Original.\n\n[Second file](second.md)\n\n${body}\n`,
     );
     const second = writeProjectFile(
       project,
@@ -473,7 +525,9 @@ test.describe("the single revision editor", () => {
       .click();
     await expect(page.getByTestId("revision-path")).toHaveText(second);
     await expect(richTextEditor(page)).toContainText("Linked document");
-    expect(contents(first)).toBe("Edited.\n\n[Second file](second.md)\n");
+    expect(contents(first)).toBe(
+      `Edited.\n\n[Second file](second.md)\n\n${body}\n`,
+    );
   });
 
   for (const { kind, original, proposed, expected } of [

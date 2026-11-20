@@ -5,7 +5,7 @@ import {
   editorStateToCriticMarkdown,
 } from "./critic-markup";
 import { createEditorExtensions } from "./editor-extensions";
-import type { MarkdownOptions } from "./markdown";
+import { type MarkdownOptions, splitYamlDocumentMetadata } from "./markdown";
 import { projectAcceptedDocument } from "./revision-projection";
 
 const schema = getSchema(createEditorExtensions(""));
@@ -24,6 +24,11 @@ export function acceptedDocument(doc: JSONContent): JSONContent {
 }
 
 export function cleanRevisionMarkdown(markdown: string): string {
+  if (
+    !/\{(?:\+\+|--|~~|>>)/.test(markdown) &&
+    !splitYamlDocumentMetadata(markdown).endmatter
+  )
+    return markdown;
   const { doc, comments } = criticMarkdownToEditorState(markdown);
   const hasChanges = (node: JSONContent): boolean =>
     node.type === "criticChangeBlock" ||
@@ -36,16 +41,13 @@ export function cleanRevisionMarkdown(markdown: string): string {
 }
 
 /** Reuse the original byte spelling when an edit can be mapped there safely. */
-export function preserveSourceSpelling(
+export function createSourceSpellingPreserver(
   original: string,
   before: string,
-  after: string,
-): string | null {
-  if (before === after) return original;
-  if (before === original) return after;
+): (after: string) => string | null {
+  if (before === original) return (after) => after;
   const alignment = diffChars(before, original, { maxEditLength: 4096 });
-  const changes = diffChars(before, after, { maxEditLength: 4096 });
-  if (!alignment || !changes) return null;
+  if (!alignment) return (after) => (before === after ? original : null);
   const sourceIndices = new Int32Array(before.length).fill(-1);
   let canonicalOffset = 0;
   let sourceOffset = 0;
@@ -60,41 +62,46 @@ export function preserveSourceSpelling(
   const crlf =
     original.includes("\r\n") &&
     !original.replaceAll("\r\n", "").includes("\n");
-  let result = "";
-  canonicalOffset = 0;
-  sourceOffset = 0;
-  for (let i = 0; i < changes.length; i++) {
-    const part = changes[i];
-    if (!part.added && !part.removed) {
-      canonicalOffset += part.value.length;
-      continue;
+  return (after) => {
+    if (before === after) return original;
+    const changes = diffChars(before, after, { maxEditLength: 4096 });
+    if (!changes) return null;
+    let result = "";
+    let canonicalOffset = 0;
+    let sourceOffset = 0;
+    for (let i = 0; i < changes.length; i++) {
+      const part = changes[i];
+      if (!part.added && !part.removed) {
+        canonicalOffset += part.value.length;
+        continue;
+      }
+      const at = canonicalOffset;
+      let removed = "";
+      let added = "";
+      while (i < changes.length && (changes[i].added || changes[i].removed)) {
+        const change = changes[i++];
+        if (change.removed) removed += change.value;
+        else added += change.value;
+      }
+      i--;
+      canonicalOffset += removed.length;
+      const start = removed
+        ? (sourceIndices[at] ?? -1)
+        : at === 0
+          ? (sourceIndices[0] ?? 0)
+          : (sourceIndices[at - 1] ?? -2) + 1;
+      if (
+        start < sourceOffset ||
+        (removed && original.slice(start, start + removed.length) !== removed)
+      )
+        return null;
+      result +=
+        original.slice(sourceOffset, start) +
+        (crlf ? added.replaceAll("\n", "\r\n") : added);
+      sourceOffset = start + removed.length;
     }
-    const at = canonicalOffset;
-    let removed = "";
-    let added = "";
-    while (i < changes.length && (changes[i].added || changes[i].removed)) {
-      const change = changes[i++];
-      if (change.removed) removed += change.value;
-      else added += change.value;
-    }
-    i--;
-    canonicalOffset += removed.length;
-    const start = removed
-      ? (sourceIndices[at] ?? -1)
-      : at === 0
-        ? (sourceIndices[0] ?? 0)
-        : (sourceIndices[at - 1] ?? -2) + 1;
-    if (
-      start < sourceOffset ||
-      (removed && original.slice(start, start + removed.length) !== removed)
-    )
-      return null;
-    result +=
-      original.slice(sourceOffset, start) +
-      (crlf ? added.replaceAll("\n", "\r\n") : added);
-    sourceOffset = start + removed.length;
-  }
-  return result + original.slice(sourceOffset);
+    return result + original.slice(sourceOffset);
+  };
 }
 
 export async function copyRevisionMarkdown(markdown: string) {

@@ -1,4 +1,13 @@
-import { generateHTML, generateJSON, type JSONContent } from "@tiptap/core";
+import {
+  elementFromString,
+  getHTMLFromFragment,
+  getSchema,
+  type JSONContent,
+} from "@tiptap/core";
+import {
+  DOMParser as ProseMirrorDOMParser,
+  DOMSerializer,
+} from "@tiptap/pm/model";
 import { extractRoughdraftReviewIndex } from "@roughdraft/rfm";
 import {
   Marked,
@@ -70,7 +79,13 @@ interface CriticChangeToken {
   newTokens?: Token[];
 }
 
-const extensions = createEditorExtensions("");
+const schema = getSchema(createEditorExtensions(""));
+const htmlParser = ProseMirrorDOMParser.fromSchema(schema);
+const domSerializer = DOMSerializer.fromSchema(schema);
+const parseHtml = (html: string): JSONContent =>
+  htmlParser.parse(elementFromString(html)).toJSON();
+const renderHtml = (doc: JSONContent) =>
+  getHTMLFromFragment(schema.nodeFromJSON(doc).content, schema);
 const criticCommentAnchorPattern = /^\{==([\s\S]+?)==\}/;
 const criticCommentBlockPattern =
   /^\{>>([\s\S]*?)<<\}(?:(\{@([\s\S]+?)@\})|(\{(?:\s*[A-Za-z][A-Za-z0-9_-]*="(?:\\[\s\S]|[^"\\])*")+\s*\})|(\{#[A-Za-z][A-Za-z0-9_-]*\}))?/;
@@ -1634,10 +1649,7 @@ export function criticMarkdownToRenderedHtml(
   );
   let html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
   if (html.includes("data-critic-block=")) {
-    html = generateHTML(
-      markBlockChangeContent(generateJSON(html, extensions)),
-      extensions,
-    );
+    html = renderHtml(markBlockChangeContent(parseHtml(html)));
   }
   addEndmatterFeedback(comments, parsedEndmatter);
 
@@ -1657,9 +1669,7 @@ export function criticMarkdownToEditorState(
   const parsedEndmatter = parseReviewEndmatter(endmatter);
   const { parser, comments } = createCriticMarked(options, parsedEndmatter);
   const html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
-  const doc = markBlockChangeContent(
-    generateJSON(html, extensions),
-  ) as JSONContent & {
+  const doc = markBlockChangeContent(parseHtml(html)) as JSONContent & {
     yamlFrontmatter?: string;
     yamlEndmatter?: string;
   };
@@ -1717,7 +1727,9 @@ export function editorStateToCriticMarkdown(
   comments: Map<string, CriticComment>,
   options?: { frontmatter?: string | null; endmatter?: string | null },
 ): string {
-  const html = generateHTML(doc, extensions);
+  const fragment = domSerializer.serializeFragment(
+    schema.nodeFromJSON(doc).content,
+  );
   const service = createTurndownService();
   const frontmatter =
     options?.frontmatter ??
@@ -1739,7 +1751,7 @@ export function editorStateToCriticMarkdown(
   );
   return appendYamlEndmatter(
     prependYamlFrontmatter(
-      normalizeBlockSpacing(`${service.turndown(html).trimEnd()}\n`),
+      normalizeBlockSpacing(`${service.turndown(fragment).trimEnd()}\n`),
       frontmatter,
     ),
     endmatter,

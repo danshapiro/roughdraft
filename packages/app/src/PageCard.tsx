@@ -11,6 +11,7 @@ import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import {
   memo,
+  type RefObject,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -57,7 +58,7 @@ import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
 import { toHtml, splitYamlDocumentMetadata } from "./markdown";
 import { resolveSuggestionSource } from "./resolve-suggestion";
 import { editableMarkdownOptions } from "./revision-markdown";
-import { acceptedDocument } from "./revision-markdown";
+import { projectAcceptedDocument } from "./revision-projection";
 import type { Page, StorageBackend } from "./storage";
 import { useCommentAnchorLayout } from "./useCommentAnchorLayout";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
@@ -142,6 +143,8 @@ interface EditableReviewSurface {
   onAccept: (changeId: string, applyNative: () => void) => boolean;
   onReject: (changeId: string, applyNative: () => void) => boolean;
   onBlockedSuggestionEdit: () => void;
+  markdownFlushRef?: RefObject<(() => void) | null>;
+  onMarkdownQueued?: () => void;
 }
 
 const ReviewDecisions = Extension.create({
@@ -715,6 +718,8 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const suppressNextMarkdownUpdateRef = useRef(false);
   const resolvingSuggestionRef = useRef(false);
   const currentMarkdownRef = useRef(sourceMarkdown);
+  const markdownTimer = useRef<number | null>(null);
+  const markdownQueuedAt = useRef<number | null>(null);
   const lastFocusRequestKeyRef = useRef<string | null>(null);
   const selectedCommentIdRef = useRef<string | null>(null);
   const selectedChangeIdRef = useRef<string | null>(null);
@@ -824,9 +829,32 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     );
   }, [comments.size, reviewSuggestions.length, onCommentRailPresenceChange]);
 
+  const refreshCriticChanges = useCallback(() => {
+    if (criticChangeFrameRef.current !== null || markdownTimer.current !== null)
+      return;
+    criticChangeFrameRef.current = requestAnimationFrame(() => {
+      criticChangeFrameRef.current = null;
+      if (markdownTimer.current !== null) return;
+      setCriticChanges(
+        getDocumentCriticChangeRailItems(
+          editorRef.current,
+          commentsRef.current,
+          controlledReviewRef.current?.suggestions ??
+            editableReviewRef.current?.suggestions,
+          Boolean(editableReviewRef.current),
+        ),
+      );
+    });
+  }, []);
+
   const emitMarkdownChange = useCallback(
     (doc?: JSONContent, nextComments?: Map<string, CriticComment>) => {
       if (controlledReviewRef.current) return;
+      if (markdownTimer.current !== null) {
+        window.clearTimeout(markdownTimer.current);
+        markdownTimer.current = null;
+      }
+      markdownQueuedAt.current = null;
       const currentEditor = editorRef.current;
       const currentDoc = doc ?? currentEditor?.getJSON();
       if (!currentDoc) return;
@@ -844,6 +872,26 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     },
     [onMarkdownChange],
   );
+
+  const flushPendingMarkdown = useCallback(() => {
+    if (markdownTimer.current === null) return;
+    emitMarkdownChange();
+    refreshCriticChanges();
+  }, [emitMarkdownChange, refreshCriticChanges]);
+
+  const markdownFlushRef = editableReview?.markdownFlushRef;
+  useLayoutEffect(() => {
+    if (!markdownFlushRef) return;
+    markdownFlushRef.current = flushPendingMarkdown;
+    return () => {
+      markdownFlushRef.current = null;
+      if (markdownTimer.current !== null) {
+        window.clearTimeout(markdownTimer.current);
+        markdownTimer.current = null;
+      }
+      markdownQueuedAt.current = null;
+    };
+  }, [flushPendingMarkdown, markdownFlushRef]);
 
   const lastReviewComments = useRef(editableReview?.comments);
   useEffect(() => {
@@ -898,29 +946,11 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     [backend, isEditableReview, resolveFileUrl, resolveLinkUrl],
   );
 
-  const refreshCriticChanges = useCallback(() => {
-    if (criticChangeFrameRef.current != null) {
-      cancelAnimationFrame(criticChangeFrameRef.current);
-    }
-
-    criticChangeFrameRef.current = requestAnimationFrame(() => {
-      criticChangeFrameRef.current = null;
-      setCriticChanges(
-        getDocumentCriticChangeRailItems(
-          editorRef.current,
-          commentsRef.current,
-          controlledReviewRef.current?.suggestions ??
-            editableReviewRef.current?.suggestions,
-          Boolean(editableReviewRef.current),
-        ),
-      );
-    });
-  }, []);
-
   useEffect(() => {
     return () => {
-      if (criticChangeFrameRef.current != null) {
+      if (criticChangeFrameRef.current !== null) {
         cancelAnimationFrame(criticChangeFrameRef.current);
+        criticChangeFrameRef.current = null;
       }
     };
   }, []);
@@ -1433,7 +1463,32 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           return;
         }
 
-        emitMarkdownChange(currentEditor.getJSON());
+        const review = editableReviewRef.current;
+        if (
+          review?.markdownFlushRef &&
+          after.content.size >= 12_000 &&
+          !transaction.getMeta(explicitReviewEdit)
+        ) {
+          // Serialize and remeasure the rail once per typing burst. The live
+          // editor still owns selection, decisions and navigation positions.
+          // Explicit file/export actions flush the draft before reading it.
+          const now = performance.now();
+          if (markdownQueuedAt.current === null) {
+            markdownQueuedAt.current = now;
+            review.onMarkdownQueued?.();
+          }
+          if (markdownTimer.current !== null)
+            window.clearTimeout(markdownTimer.current);
+          markdownTimer.current = window.setTimeout(
+            flushPendingMarkdown,
+            Math.max(
+              0,
+              Math.min(225, 1_200 - (now - markdownQueuedAt.current)),
+            ),
+          );
+        } else {
+          emitMarkdownChange(currentEditor.getJSON());
+        }
         refreshCriticChanges();
       },
     },
@@ -1470,6 +1525,15 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   useEffect(() => {
     if (!editor || !isEditableReview) return;
     const guardKey = new PluginKey("roughdraftSuggestionGuard");
+    const accepted = new WeakMap<ProseMirrorNode, ProseMirrorNode>();
+    const acceptedContent = (doc: ProseMirrorNode) => {
+      let projected = accepted.get(doc);
+      if (!projected) {
+        projected = projectAcceptedDocument(doc).doc;
+        accepted.set(doc, projected);
+      }
+      return projected;
+    };
     const guard = new Plugin({
       key: guardKey,
       filterTransaction: (tr, state) => {
@@ -1480,9 +1544,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           isHistoryTransaction(tr)
         )
           return true;
-        const before = acceptedDocument(state.doc.toJSON());
-        const after = acceptedDocument(tr.doc.toJSON());
-        if (JSON.stringify(before) === JSON.stringify(after)) return true;
+        if (acceptedContent(state.doc).eq(acceptedContent(tr.doc))) return true;
         editableReviewRef.current?.onBlockedSuggestionEdit();
         return false;
       },
@@ -2923,8 +2985,8 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
   }, []);
 
   const hasCommentRailSpace = useMemo(
-    () => criticMarkdownHasReviewRail(markdown),
-    [markdown],
+    () => editorViewMode === "code" && criticMarkdownHasReviewRail(markdown),
+    [editorViewMode, markdown],
   );
 
   useEffect(() => {

@@ -61,13 +61,13 @@ import {
   copyRevisionMarkdown,
   downloadRevisionMarkdown,
   editableMarkdownOptions,
-  preserveSourceSpelling,
+  createSourceSpellingPreserver,
 } from "./revision-markdown";
 import { suggestionPositions } from "./revision-projection";
 import {
   type BaseSide,
   type ReferenceChange,
-  referenceChanges,
+  createReferenceComparison,
   referenceDecorations,
   revertReferenceChange,
 } from "./revision-reference";
@@ -108,16 +108,27 @@ function useReference(
       markdown,
       editableMarkdownOptions,
     );
-    const reference = editor.schema.nodeFromJSON(acceptedDocument(parsed.doc));
+    const reference = editor.schema.nodeFromJSON(parsed.doc);
+    const compare = createReferenceComparison(reference, baseSide);
+    let previousDecorations:
+      | {
+          content: ProseMirrorNode["content"];
+          changes: ReferenceChange[];
+          decisions: string[];
+          activeId?: string | null;
+          hoveredId?: string | null;
+          set: DecorationSet;
+        }
+      | undefined;
     editor.registerPlugin(
       new Plugin({
         key: referenceKey,
         state: {
-          init: (_, state) => referenceChanges(reference, state.doc, baseSide),
+          init: (_, state) => compare(state.doc),
           apply: (transaction, previous) =>
             transaction.docChanged &&
             !transaction.before.content.eq(transaction.doc.content)
-              ? referenceChanges(reference, transaction.doc, baseSide)
+              ? compare(transaction.doc)
               : previous,
         },
         appendTransaction: (transactions, previous, current) => {
@@ -153,16 +164,36 @@ function useReference(
         },
         props: {
           decorations: (state) => {
-            const choices = new Set(kept(state.doc));
-            const changes = (referenceKey.getState(state) ?? noChanges).filter(
-              (change) => !choices.has(change.item.changeId),
-            );
+            const changes = referenceKey.getState(state) ?? noChanges;
             if (!changes.length) return DecorationSet.empty;
+            const decisions = kept(state.doc);
             const highlighted = criticChangeHighlightPluginKey.getState(state);
-            return referenceDecorations(state.doc, changes, {
-              activeId: highlighted?.selectedChangeId,
-              hoveredId: highlighted?.hoveredChangeId,
-            });
+            const activeId = highlighted?.selectedChangeId;
+            const hoveredId = highlighted?.hoveredChangeId;
+            const { content } = state.doc;
+            if (
+              previousDecorations?.content === content &&
+              previousDecorations.changes === changes &&
+              previousDecorations.decisions === decisions &&
+              previousDecorations.activeId === activeId &&
+              previousDecorations.hoveredId === hoveredId
+            )
+              return previousDecorations.set;
+            const choices = new Set(decisions);
+            const set = referenceDecorations(
+              state.doc,
+              changes.filter((change) => !choices.has(change.item.changeId)),
+              { activeId, hoveredId },
+            );
+            previousDecorations = {
+              content,
+              changes,
+              decisions,
+              activeId,
+              hoveredId,
+              set,
+            };
+            return set;
           },
         },
       }),
@@ -221,6 +252,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     session,
     draft,
     updateDraft,
+    readDraft,
     run,
     inspect,
     recoveryError,
@@ -229,6 +261,27 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     reviewChanged,
     flush,
   } = useRevisionSession(initial, seed);
+  const markdownFlushRef = useRef<(() => void) | null>(null);
+  const [markdownQueued, setMarkdownQueued] = useState(false);
+  const onMarkdownQueued = useCallback(() => setMarkdownQueued(true), []);
+  const currentDraft = useCallback(() => {
+    markdownFlushRef.current?.();
+    return readDraft();
+  }, [readDraft]);
+  useEffect(() => {
+    const preserve = () => {
+      markdownFlushRef.current?.();
+    };
+    const preserveWhenHidden = () => {
+      if (document.visibilityState === "hidden") preserve();
+    };
+    document.addEventListener("visibilitychange", preserveWhenHidden);
+    window.addEventListener("pagehide", preserve);
+    return () => {
+      document.removeEventListener("visibilitychange", preserveWhenHidden);
+      window.removeEventListener("pagehide", preserve);
+    };
+  }, []);
   const [source, setSource] = useState(draft);
   const [editorGeneration, restartEditor] = useState(0);
   const commentHistory = useRef<{
@@ -276,7 +329,9 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const exactClean = useRef(
     source.cleanMarkdown ?? cleanRevisionMarkdown(source.markdown),
   );
-  const exactCanonical = useRef<string | null>(null);
+  const preserveSource = useRef<ReturnType<
+    typeof createSourceSpellingPreserver
+  > | null>(null);
   const [editor, setEditor] = useState<Editor | null>(null);
   const [interaction, setInteraction] =
     useState<DocumentInteractionMode>("editing");
@@ -359,16 +414,16 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
 
   const changeMarkdown = useCallback(
     (markdown: string) => {
+      setMarkdownQueued(false);
       const current = ownEditor.current?.state.doc;
       if (!current) return;
       const result = cleanRevisionMarkdown(markdown);
-      exactCanonical.current ??= canonical(exactClean.current);
-      const requested = canonical(result);
-      const preserved = preserveSourceSpelling(
+      preserveSource.current ??= createSourceSpellingPreserver(
         exactClean.current,
-        exactCanonical.current,
-        requested,
+        canonical(exactClean.current),
       );
+      const requested = canonical(result);
+      const preserved = preserveSource.current(requested);
       const cleanMarkdown =
         preserved !== null && canonical(preserved) === requested
           ? preserved
@@ -472,28 +527,40 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     () => ({
       suggestions: visibleChanges,
       decisions,
+      markdownFlushRef,
+      onMarkdownQueued,
       comments: commentMap,
       onCommentsChange: updateComments,
       onAccept: (id: string) => deciding(id, true),
       onReject: (id: string) => deciding(id, false),
       onBlockedSuggestionEdit: () => setBlocked(true),
     }),
-    [commentMap, deciding, decisions, updateComments, visibleChanges],
+    [
+      commentMap,
+      deciding,
+      decisions,
+      onMarkdownQueued,
+      updateComments,
+      visibleChanges,
+    ],
   );
-  const positions = new Map<string, number>();
-  for (const change of renderedChanges) {
-    const id = change.item.changeId;
-    if (!change.overlapsSuggestion && !decisions.includes(id))
-      positions.set(id, change.from);
-  }
-  if (editor) {
-    for (const [id, pos] of suggestionPositions(editor.state.doc)) {
-      positions.set(id, pos);
+  const editorDoc = editor?.state.doc;
+  const navigation = useMemo(() => {
+    const positions = new Map<string, number>();
+    const ignored = new Set(decisions);
+    for (const change of renderedChanges) {
+      const id = change.item.changeId;
+      if (!change.overlapsSuggestion && !ignored.has(id))
+        positions.set(id, change.from);
     }
-  }
-  const navigation = [...positions.entries()]
-    .sort((a, b) => a[1] - b[1])
-    .map(([id]) => id);
+    if (editorDoc) {
+      for (const [id, pos] of suggestionPositions(editorDoc))
+        positions.set(id, pos);
+    }
+    return [...positions.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .map(([id]) => id);
+  }, [decisions, editorDoc, renderedChanges]);
   const count = navigation.length;
   const markdown = draft.cleanMarkdown ?? draft.markdown;
   const cleanSaved = useMemo(
@@ -501,6 +568,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     [session.savedText],
   );
   const saved =
+    !markdownQueued &&
     destination !== null &&
     destination === session.savedPath &&
     markdown === cleanSaved &&
@@ -526,11 +594,9 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     ];
     const target =
       anchors.find((anchor) => anchor.dataset.criticChangeId === id) ??
-      [
-        ...(documentRef.current?.querySelectorAll<HTMLElement>(
-          '[data-suggestion-thread-container="true"]',
-        ) ?? []),
-      ].find((item) => item.dataset.testid === `suggestion-thread-${id}`);
+      documentRef.current?.querySelector<HTMLElement>(
+        `[data-review-rail-anchor="${CSS.escape(id)}"]`,
+      );
     if (!target) return;
     setActiveChange(id);
     const top =
@@ -562,13 +628,14 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     setBusy(true);
     setActionError("");
     try {
+      const snapshot = currentDraft();
       await (output
-        ? run("save", draft, {
+        ? run("save", snapshot, {
             path: output.path,
             expectedVersion: output.version,
             baseVersion: session.baseVersion ?? null,
           })
-        : run("sync", draft));
+        : run("sync", snapshot));
       setConflict(false);
       setSaveAs(false);
     } catch (error) {
@@ -616,6 +683,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     setActionError("");
     try {
       const side = baseChoice === "copy" ? copySeed : baseChoice;
+      const draft = currentDraft();
       let snapshot = draft;
       if (side !== baseSide && initial.mode !== "document") {
         const live = ownEditor.current;
@@ -630,7 +698,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           );
           const target = live.schema.nodeFromJSON(acceptedDocument(parsed.doc));
           let state = EditorState.create({ doc: live.state.doc });
-          const changes = referenceChanges(target, state.doc).sort(
+          const changes = createReferenceComparison(target)(state.doc).sort(
             (a, b) => b.from - a.from || b.to - a.to,
           );
           for (const change of changes) {
@@ -677,7 +745,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           : snapshot;
         exactClean.current =
           draftForEditor.cleanMarkdown ?? draftForEditor.markdown;
-        exactCanonical.current = null;
+        preserveSource.current = null;
         setSource(draftForEditor);
         restartEditor((generation) => generation + 1);
       }
@@ -695,7 +763,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     setBusy(true);
     setActionError("");
     try {
-      await run("send", draft, { comment: comment.trim() });
+      await run("send", currentDraft(), { comment: comment.trim() });
       setSendOpen(false);
       setComment("");
     } catch (error) {
@@ -829,6 +897,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 variant="ghost"
                 onClick={() => {
                   captures.current();
+                  if (formatted) currentDraft();
                   setFormatted(!formatted);
                 }}
               >
@@ -840,12 +909,15 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 data-testid="revision-copy"
                 variant="ghost"
                 size="icon"
-                onClick={() =>
-                  void copyRevisionMarkdown(markdown).then(() => {
+                onClick={() => {
+                  const draft = currentDraft();
+                  void copyRevisionMarkdown(
+                    draft.cleanMarkdown ?? draft.markdown,
+                  ).then(() => {
                     setCopied(true);
                     window.setTimeout(() => setCopied(false), 1400);
-                  }, reportError)
-                }
+                  }, reportError);
+                }}
               >
                 {copied ? <Check /> : <Copy />}
               </TipButton>
@@ -855,7 +927,13 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 data-testid="revision-download"
                 variant="ghost"
                 size="icon"
-                onClick={() => downloadRevisionMarkdown(markdown, filename)}
+                onClick={() => {
+                  const draft = currentDraft();
+                  downloadRevisionMarkdown(
+                    draft.cleanMarkdown ?? draft.markdown,
+                    filename,
+                  );
+                }}
               >
                 <Download />
               </TipButton>
@@ -868,6 +946,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               <TipButton
                 tip="Previous change"
                 aria-label="Previous change"
+                data-testid="revision-previous-change"
                 variant="ghost"
                 size="icon"
                 disabled={!formatted || !count}
@@ -885,6 +964,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               <TipButton
                 tip="Next change"
                 aria-label="Next change"
+                data-testid="revision-next-change"
                 variant="ghost"
                 size="icon"
                 disabled={!formatted || !count}
@@ -992,6 +1072,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               }
               beforeNavigate={async () => {
                 try {
+                  currentDraft();
                   return await flush();
                 } catch (error) {
                   reportError(error);

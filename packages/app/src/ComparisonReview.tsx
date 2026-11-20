@@ -405,12 +405,8 @@ export function ComparisonReview({
           element.dataset.criticChangeId === nextId &&
           element.getBoundingClientRect().height > 0,
       ) ??
-      [
-        ...root.querySelectorAll<HTMLElement>(
-          '[data-suggestion-thread-container="true"]',
-        ),
-      ].find(
-        (element) => element.dataset.testid === `suggestion-thread-${nextId}`,
+      root.querySelector<HTMLElement>(
+        `[data-review-rail-anchor="${CSS.escape(nextId)}"]`,
       );
     if (!anchor) return;
     setActiveChangeId(nextId);
