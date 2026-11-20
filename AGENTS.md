@@ -93,6 +93,20 @@ bun .codex/skills/slog/scripts/slog.ts latest file
 
 Always use shadcn for UI work in this repo. Prefer existing components in `packages/app/src/components/ui/`; when a needed primitive is missing, add it there in the same shadcn style before wiring it into product code.
 
+## Mobile and foldable UX
+
+Unless the user requests otherwise, design and review UX for mobile as well as
+desktop. Keep document text comfortably readable without zooming (normally at
+least 16 CSS px), use readable control labels, and give standalone touch controls
+at least 44 by 44 CSS px of usable space. Keep important actions reachable and
+avoid horizontal page scrolling or dialogs that hide their actions.
+
+Dan uses a Galaxy Fold 8 Ultra. Consider both its narrow folded cover screen and
+its larger unfolded inner screen, in portrait and landscape. Check representative
+phone and foldable viewport sizes rather than assuming one fixed resolution, and
+preserve edits and review state when the viewport changes as the device unfolds
+or the on-screen keyboard appears.
+
 ## UI Screenshot Guide
 
 When changing UI behavior, routes, dialogs, popovers, banners, editor modes, review rail states, or visual error/empty states, update `docs/spec/ui-state-screenshot-guide.md` if the change adds, removes, or materially changes a state that should be captured for visual review.
