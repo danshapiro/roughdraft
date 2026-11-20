@@ -1,3 +1,4 @@
+import { reviewShortcutKeys, reviewShortcutLabel } from "./review-decisions";
 import type { Editor } from "@tiptap/react";
 import { Check, Reply, X } from "lucide-react";
 import {
@@ -736,6 +737,10 @@ export function DocumentReviewRail({
                           ? reviewControls.acceptLabel(suggestion.changeId)
                           : (reviewControls?.acceptLabel ??
                             "Accept suggestion"),
+                      shortcut: {
+                        keys: reviewShortcutKeys("accept"),
+                        label: reviewShortcutLabel("accept"),
+                      },
                       icon: <Check className="size-3.5" />,
                       compact: true,
                       onClick: (event) => {
@@ -751,6 +756,10 @@ export function DocumentReviewRail({
                           : (reviewControls?.rejectLabel ??
                             "Reject suggestion"),
                       tone: "danger",
+                      shortcut: {
+                        keys: reviewShortcutKeys("reject"),
+                        label: reviewShortcutLabel("reject"),
+                      },
                       icon: <X className="size-3.5" />,
                       compact: true,
                       onClick: (event) => {
@@ -782,6 +791,7 @@ export function DocumentReviewRail({
               ref={(node) => setItemRef(layout.key, node)}
               data-review-rail-key={layout.key}
               data-testid={`suggestion-thread-${suggestion.changeId}`}
+              data-suggestion-change-id={suggestion.changeId}
               data-review-rail-anchor={layout.key}
               data-suggestion-thread-container="true"
               className={cn(

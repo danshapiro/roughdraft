@@ -99,26 +99,34 @@ function semanticMarks(node: JSONContent) {
 
 function createSemanticKey() {
   const semanticCache = new WeakMap<JSONContent, string>();
+  const attributeCache = new WeakMap<object, string>();
+  const attributesKey = (node: JSONContent) => {
+    const { attrs } = node;
+    if (!attrs) return "{}";
+    const attributes = semanticAttributes(node.type, attrs);
+    // Ordinary attrs are immutable and often shared by many text blocks.
+    // Normalized link and endnote attrs are new objects, so they cannot alias
+    // an unnormalized value with the same source attrs.
+    if (attributes !== attrs) return canonical(attributes);
+    let value = attributeCache.get(attrs);
+    if (value === undefined) {
+      value = canonical(attrs);
+      attributeCache.set(attrs, value);
+    }
+    return value;
+  };
   const semanticKey = (node: JSONContent): string => {
     let key = semanticCache.get(node);
     if (key === undefined) {
-      key = canonical({
-        type: node.type,
-        attrs: semanticAttributes(node.type, node.attrs),
-        text: node.text,
-        marks: semanticMarks(node),
-        content: (node.content ?? []).map(semanticKey),
-      });
+      // Keep the canonical field order and nulls: these bytes are also used
+      // for persisted review IDs. The schema of this object is fixed.
+      const content = node.content?.map(semanticKey) ?? [];
+      key = `{"attrs":${attributesKey(node)},"content":${JSON.stringify(content)},"marks":${JSON.stringify(semanticMarks(node))},"text":${JSON.stringify(node.text ?? null)},"type":${JSON.stringify(node.type ?? null)}}`;
       semanticCache.set(node, key);
     }
     return key;
   };
   return semanticKey;
-}
-
-/** Compare only author-visible Markdown attributes, rather than resolved URLs. */
-export function renderedContentIdentity(content: JSONContent[] | null) {
-  return canonical((content ?? []).map(createSemanticKey()));
 }
 
 function tableStructure(node: JSONContent): unknown {
@@ -379,7 +387,7 @@ export function createRenderedComparisonObserver() {
     };
     return parts;
   };
-  return (
+  const observe = (
     before: JSONContent[],
     after: JSONContent[],
     observe: DifferenceObserver,
@@ -395,6 +403,11 @@ export function createRenderedComparisonObserver() {
       runs,
       (left, right) => topLevelAlignment(left, right, referenceOnLeft),
     );
+  };
+  return {
+    observe,
+    // Use the same semantic keys for alignment and persisted change identity.
+    identity: (content: JSONContent[]) => JSON.stringify(content.map(key)),
   };
 }
 

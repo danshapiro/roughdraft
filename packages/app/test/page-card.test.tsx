@@ -1758,6 +1758,88 @@ describe("PageCard editor integration", () => {
     expect(suggestionText).not.toContain("Deletion");
   });
 
+  it("saves a bulk decision once without dropping an independent comment", async () => {
+    const notes = "{==Independent note==}{>>Keep this thread.<<}{#c3}";
+    const rendered = await renderPageCard({
+      page: {
+        id: "review-bulk-comments",
+        title: "Review bulk comments",
+        content: [
+          "# Review",
+          "",
+          "Prefer {~~red~>blue~~}{#s1}.",
+          "",
+          "Add {++a sign++}{#s2}.",
+          "",
+          '{==Separate anchor==}{>>Resolve this reply.<<}{id="c1" by="AI" re="s1"}',
+          "",
+          notes,
+          "",
+        ].join("\n"),
+      },
+    });
+    await flushAnimationFrame();
+    const button = getByTestId<HTMLButtonElement>(
+      rendered.container,
+      "document-accept-all",
+    );
+    vi.useFakeTimers();
+    await act(async () => button.click());
+    await act(async () => vi.advanceTimersByTime(500));
+
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+    const saved = rendered.onSave.mock.calls[0]?.[1];
+    expect(saved).toContain("Prefer blue.");
+    expect(saved).toContain("Add a sign.");
+    expect(saved).toContain("Separate anchor");
+    expect(saved).toContain("Independent note");
+    expect(saved).toContain("Keep this thread.");
+    expect(saved).not.toContain("Resolve this reply.");
+    expect(saved).not.toMatch(/\{(?:~~|\+\+)/);
+  });
+
+  it("ignores repeated decision shortcuts and rejects only the selected change", async () => {
+    const rendered = await renderPageCard({
+      page: {
+        id: "review-shortcut-repeat",
+        title: "Review shortcut repeat",
+        content:
+          "The {~~old color~>new color~~}{#s1} and an {++extra shape++}{#s2}.\n",
+      },
+    });
+    const editor = rendered.getEditor();
+    await selectText(editor, "new color");
+    const apple = /Mac|iPhone|iPad/.test(navigator.platform);
+    async function reject(repeat: boolean) {
+      await act(async () => {
+        editor.view.dom.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            code: "KeyR",
+            key: "r",
+            altKey: true,
+            ctrlKey: !apple,
+            metaKey: apple,
+            repeat,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      });
+    }
+    vi.useFakeTimers();
+    await reject(true);
+    await act(async () => vi.advanceTimersByTime(500));
+    expect(rendered.onSave).not.toHaveBeenCalled();
+    expect(editor.getText()).toContain("new color");
+
+    await reject(false);
+    await act(async () => vi.advanceTimersByTime(500));
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+    expect(rendered.onSave.mock.calls[0]?.[1]).toBe(
+      "The old color and an {++extra shape++}{#s2}.\n",
+    );
+  });
+
   it("renders suggestion replies through the regular comment tree", async () => {
     const rendered = await renderPageCard({
       page: {

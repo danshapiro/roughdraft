@@ -4,7 +4,10 @@ import {
   criticMarkdownToEditorState,
   editorStateToCriticMarkdown,
 } from "./critic-markup";
-import { cleanRevisionMarkdown } from "./revision-markdown";
+import {
+  cleanRevisionMarkdown,
+  createSourceSpellingPreserver,
+} from "./revision-markdown";
 
 describe("Markdown written or exported from a review", () => {
   it("keeps original wording until suggestions are kept", () => {
@@ -41,5 +44,32 @@ describe("Markdown written or exported from a review", () => {
         "Start.\n\n{++```js\nconst proposed = 1;\n```++}\n\nEnd.\n",
       ),
     ).toBe("Start.\n\nEnd.\n");
+  });
+});
+
+describe("preserving original Markdown when saving comparison choices", () => {
+  it("keeps the original line endings and list markers when applying distant wording changes", () => {
+    const original =
+      "# Notes\r\n\r\n* Red apple\r\n* Leave this line.\r\n* Green pear\r\n";
+    const canonical =
+      "# Notes\n- Red apple\n- Leave this line.\n- Green pear\n";
+    const preserve = createSourceSpellingPreserver(original, canonical);
+
+    expect(preserve(canonical)).toBe(original);
+    expect(
+      preserve(
+        canonical
+          .replace("Red apple", "Blue plum")
+          .replace("Green pear", "Fig"),
+      ),
+    ).toBe("# Notes\r\n\r\n* Blue plum\r\n* Leave this line.\r\n* Fig\r\n");
+  });
+
+  it("declines to apply a change across source it cannot map safely", () => {
+    const preserve = createSourceSpellingPreserver(
+      "* Keep wording\n",
+      "- Keep wording\n",
+    );
+    expect(preserve("Keep wording\n")).toBeNull();
   });
 });

@@ -10,10 +10,12 @@ import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { CriticChangeRailItem } from "./DocumentReviewRail";
 import {
   createRenderedComparisonObserver,
-  renderedContentIdentity,
   type RenderedSourceDifference,
 } from "./rendered-comparison-diff";
-import { projectAcceptedDocument } from "./revision-projection";
+import {
+  hasPendingSuggestions,
+  projectAcceptedDocument,
+} from "./revision-projection";
 
 export interface ReferenceChange {
   item: CriticChangeRailItem;
@@ -93,12 +95,15 @@ export function createReferenceComparison(
     json.set(node, value);
     return value;
   };
-  const compare = createRenderedComparisonObserver();
-  const localDigests = new WeakMap<RenderedSourceDifference, string>();
+  const comparison = createRenderedComparisonObserver();
+  type LocalChange = {
+    digest: string;
+    kind: CriticChangeRailItem["kind"];
+    restore: Fragment;
+  };
+  const localChanges = new WeakMap<RenderedSourceDifference, LocalChange>();
   const identity = (fragment: Fragment) =>
-    renderedContentIdentity(
-      fragment.childCount ? fragment.content.map(toJson) : null,
-    );
+    comparison.identity(fragment.content.map(toJson));
 
   type ProjectedChange = Omit<
     ReferenceChange,
@@ -117,31 +122,35 @@ export function createReferenceComparison(
       projectedChanges = [];
       if (!opposite.eq(edited)) {
         const [before, after] = isOld ? [edited, opposite] : [opposite, edited];
-        compare(
+        comparison.observe(
           toJson(before).content ?? [],
           toJson(after).content ?? [],
           (
             { oldFrom, oldTo, newFrom, newTo, structural, oldText, newText },
             local,
           ) => {
-            const oldPart = before.slice(oldFrom, oldTo).content;
-            const newPart = after.slice(newFrom, newTo).content;
-            let digest = local && localDigests.get(local);
-            if (digest === undefined) {
-              digest = hashIdentity(
-                JSON.stringify([identity(oldPart), identity(newPart)]),
-              );
-              if (local) localDigests.set(local, digest);
+            let detail = local && localChanges.get(local);
+            if (!detail) {
+              const oldPart = before.slice(oldFrom, oldTo).content;
+              const newPart = after.slice(newFrom, newTo).content;
+              detail = {
+                digest: hashIdentity(
+                  JSON.stringify([identity(oldPart), identity(newPart)]),
+                ),
+                kind: !oldPart.size
+                  ? "addition"
+                  : !newPart.size
+                    ? "deletion"
+                    : "substitution-old",
+                restore: isOld ? newPart : oldPart,
+              };
+              if (local) localChanges.set(local, detail);
             }
+            const { digest, kind, restore } = detail;
             const pairId = `reference-${oldFrom}-${oldTo}-${digest}`;
             const changeId = isOld
               ? `reference-${newFrom}-${newTo}-${digest}`
               : pairId;
-            const kind = !oldPart.size
-              ? "addition"
-              : !newPart.size
-                ? "deletion"
-                : "substitution-old";
             projectedChanges.push({
               item: {
                 changeId,
@@ -158,30 +167,39 @@ export function createReferenceComparison(
               from: isOld ? oldFrom : newFrom,
               to: isOld ? oldTo : newTo,
               structural,
-              restore: isOld ? newPart : oldPart,
+              restore,
             });
           },
           !isOld,
         );
       }
     }
-    const map = projection.mapping.invert();
+    const map = projection.mapping.maps.length
+      ? projection.mapping.invert()
+      : null;
+    const hasSuggestions = hasPendingSuggestions(current);
     return projectedChanges.map((change) => {
-      const start = map.map(change.from, 1);
-      const to = map.map(change.to, -1);
+      const start = map?.map(change.from, 1) ?? change.from;
+      const to = map?.map(change.to, -1) ?? change.to;
       const from = Math.min(start, to);
       // Bias away from adjacent pending insertions. A deletion at the same
       // anchor as a pending insertion has no unambiguous place to be restored.
       let overlapsSuggestion = start > to;
-      current.nodesBetween(from, to, (node) => {
-        if (pendingMark(node) || node.type.name === "criticChangeBlock")
-          overlapsSuggestion = true;
-      });
+      if (hasSuggestions && !overlapsSuggestion) {
+        current.nodesBetween(from, to, (node) => {
+          if (pendingMark(node) || node.type.name === "criticChangeBlock")
+            overlapsSuggestion = true;
+        });
+      }
       return {
         ...change,
         from,
         to,
-        expected: current.slice(from, to).content,
+        // A decision compares this immutable snapshot against the live doc.
+        // Avoid slicing every changed passage when no decision was made.
+        get expected() {
+          return current.slice(from, to).content;
+        },
         overlapsSuggestion,
       };
     });

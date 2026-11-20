@@ -180,6 +180,91 @@ test.describe("the single revision editor", () => {
     });
   }
 
+  for (const decision of ["Accept", "Reject"] as const) {
+    test(`${decision} all chooses an exact version; one undo restores all undecided changes`, async ({
+      page,
+      request,
+    }) => {
+      const { beforePath, afterPath } = compareFiles();
+      const accept = decision === "Accept";
+      const file = accept ? beforePath : afterPath;
+      const all = page.getByTestId(`revision-${decision.toLowerCase()}-all`);
+      const confirm = page.getByTestId("revision-base-confirm");
+      await openReview(page, request, { beforePath, afterPath });
+      await all.click();
+      await expect(confirm).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId("revision-file-status")).toHaveText(
+        "No file",
+      );
+      expect(contents(beforePath)).toBe(oldText);
+      expect(contents(afterPath)).toBe(newText);
+
+      await all.click();
+      await page
+        .getByTestId(accept ? "revision-base-old" : "revision-base-new")
+        .click();
+      await confirm.click();
+      await expect.poll(() => contents(file)).toBe(accept ? newText : oldText);
+      await expect(page.getByTestId("revision-pending")).toBeEmpty();
+      await saved(page);
+      await page.getByTestId("revision-undo").click();
+      await expect.poll(() => contents(file)).toBe(accept ? oldText : newText);
+      await expect(page.getByTestId("revision-pending")).toHaveText("2");
+    });
+  }
+
+  test("review shortcuts act on the current change and preserve the other choice", async ({
+    page,
+    request,
+  }) => {
+    const { beforePath, afterPath } = compareFiles();
+    await openReview(page, request, { beforePath, afterPath });
+    const next = page.getByTestId("revision-next-change");
+    const modifier = process.platform === "darwin" ? "Meta" : "Control";
+    await next.click();
+    await page.keyboard.press(`${modifier}+Alt+A`);
+    await page.getByTestId("revision-base-new").click();
+    await page.getByTestId("revision-base-confirm").click();
+    await expect(page.getByTestId("revision-pending")).toHaveText("1");
+    expect(contents(afterPath)).toBe(newText);
+
+    await next.click();
+    await page.keyboard.press(`${modifier}+Alt+R`);
+    await expect
+      .poll(() => contents(afterPath))
+      .toBe(newText.replace("shut", "open"));
+    await expect(page.getByTestId("revision-pending")).toBeEmpty();
+    expect(contents(beforePath)).toBe(oldText);
+  });
+
+  test("Accept all combines pending native suggestions and comparison changes", async ({
+    page,
+    request,
+  }) => {
+    const same = "\nDisplay the original sign.\n";
+    const before = oldText + same;
+    const after = newText + same;
+    const beforePath = writeProjectFile(project, "before.md", before);
+    const afterPath = writeProjectFile(project, "after.md", after);
+    await openReview(page, request, { beforePath, afterPath });
+    await page.getByTestId("revision-suggest").click();
+    await selectRichText(page, "original");
+    await page.keyboard.type("updated");
+    await expect(page.getByTestId("revision-pending")).toHaveText("3");
+    await page.getByTestId("revision-accept-all").click();
+    await page.getByTestId("revision-base-new").click();
+    await page.getByTestId("revision-base-confirm").click();
+    await expect
+      .poll(() => contents(afterPath))
+      .toBe(after.replace("original", "updated"));
+    await expect(page.getByTestId("revision-pending")).toBeEmpty();
+    expect(contents(beforePath)).toBe(before);
+    await page.getByTestId("revision-undo").click();
+    await expect.poll(() => contents(afterPath)).toBe(after);
+    await expect(page.getByTestId("revision-pending")).toHaveText("3");
+  });
+
   test("canceling a decision does not choose a file; a new copy can start from either input", async ({
     page,
     request,

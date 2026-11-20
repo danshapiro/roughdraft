@@ -8,10 +8,34 @@ interface ReadingPosition {
   scrollY: number;
 }
 
-function visibleAnchors(root: HTMLElement) {
-  return [
-    ...root.querySelectorAll<HTMLElement>("[data-comparison-anchor]"),
-  ].filter((element) => element.getBoundingClientRect().height > 0);
+function anchors(root: HTMLElement, unit?: string) {
+  return root.querySelectorAll<HTMLElement>(
+    unit === undefined
+      ? "[data-comparison-anchor]"
+      : `[data-comparison-anchor="${CSS.escape(unit)}"]`,
+  );
+}
+
+function visibleUnit(root: HTMLElement, unit: string) {
+  return [...anchors(root, unit)].filter(
+    (element) => element.getBoundingClientRect().height > 0,
+  );
+}
+
+function nearestVisibleUnit(root: HTMLElement, unit: string) {
+  const number = Number(unit.slice(5));
+  let result: HTMLElement | undefined;
+  let distance = Number.POSITIVE_INFINITY;
+  for (const anchor of anchors(root)) {
+    const next = Math.abs(
+      Number(anchor.dataset.comparisonAnchor?.slice(5)) - number,
+    );
+    if (next < distance && anchor.getBoundingClientRect().height > 0) {
+      distance = next;
+      result = anchor;
+    }
+  }
+  return result;
 }
 
 function textNodes(elements: HTMLElement[]) {
@@ -81,13 +105,17 @@ export function useComparisonReadingPosition(
     // Anchor the reading passage in the upper quarter of the usable viewport.
     // Text wrapping can change above it when switching to literal Markdown.
     const line = headerBottom + (window.innerHeight - headerBottom) / 4;
-    const anchors = visibleAnchors(root).filter((element) =>
-      element.textContent?.trim(),
-    );
-    const first = anchors.find(
-      (element) => element.getBoundingClientRect().bottom > line,
-    );
-    if (!first || first.getBoundingClientRect().top >= window.innerHeight) {
+    let first: HTMLElement | undefined;
+    let firstTop = 0;
+    for (const anchor of anchors(root)) {
+      const rect = anchor.getBoundingClientRect();
+      if (rect.bottom <= line || !rect.height || !anchor.textContent?.trim())
+        continue;
+      first = anchor;
+      firstTop = rect.top;
+      break;
+    }
+    if (!first || firstTop >= window.innerHeight) {
       pending.current = {
         viewKey,
         unit: "",
@@ -101,7 +129,9 @@ export function useComparisonReadingPosition(
     const unit = first.dataset.comparisonAnchor ?? "";
     const candidates = words(
       textNodes(
-        anchors.filter((element) => element.dataset.comparisonAnchor === unit),
+        visibleUnit(root, unit).filter((element) =>
+          element.textContent?.trim(),
+        ),
       ),
     );
     // Binary search the first reading line rather than measuring every word.
@@ -137,9 +167,7 @@ export function useComparisonReadingPosition(
       viewKey,
       unit,
       quote: candidates.slice(low, low + 8).map((item) => item.text),
-      offset: word
-        ? wordRange(word).getBoundingClientRect().top
-        : first.getBoundingClientRect().top,
+      offset: word ? wordRange(word).getBoundingClientRect().top : firstTop,
       scrollY: window.scrollY,
     };
     reading.current = pending.current;
@@ -161,6 +189,10 @@ export function useComparisonReadingPosition(
       for (const event of ["wheel", "touchstart", "pointerdown", "keydown"])
         window.removeEventListener(event, stop);
     };
+    // Resize and scroll corrections can reuse the same text match. Invalidate
+    // it when an editor replaces or edits the underlying text nodes.
+    let matched: HTMLElement[] | undefined;
+    let matchedWord: ReturnType<typeof words>[number] | undefined;
     const restore = () => {
       if (stopped) return;
       if (!position.unit) {
@@ -168,33 +200,36 @@ export function useComparisonReadingPosition(
         restoredScroll.current = window.scrollY;
         return;
       }
-      const anchors = visibleAnchors(root);
-      let matching = anchors.filter(
-        (element) => element.dataset.comparisonAnchor === position.unit,
-      );
+      let matching = visibleUnit(root, position.unit);
       if (!matching.length) {
         // A deleted passage has no clean counterpart. Stay at its nearest block.
-        const number = Number(position.unit.slice(5));
-        const nearest = anchors.sort(
-          (left, right) =>
-            Math.abs(Number(left.dataset.comparisonAnchor?.slice(5)) - number) -
-            Math.abs(Number(right.dataset.comparisonAnchor?.slice(5)) - number),
-        )[0];
+        const nearest = nearestVisibleUnit(root, position.unit);
         if (!nearest) return;
         matching = [nearest];
       }
-      const candidates = words(textNodes(matching));
-      let word: (typeof candidates)[number] | undefined;
-      for (let length = position.quote.length; length > 0 && !word; length--) {
-        const index = candidates.findIndex((_, start) =>
-          position.quote
-            .slice(0, length)
-            .every((text, offset) => candidates[start + offset]?.text === text),
-        );
-        if (index >= 0) word = candidates[index];
+      if (
+        !matched ||
+        matched.length !== matching.length ||
+        matching.some((element, index) => element !== matched?.[index])
+      ) {
+        matched = matching;
+        matchedWord = undefined;
+        const candidates = words(textNodes(matching));
+        for (let length = position.quote.length; length > 0; length--) {
+          const prefix = position.quote.slice(0, length);
+          const index = candidates.findIndex((_, start) =>
+            prefix.every(
+              (text, offset) => candidates[start + offset]?.text === text,
+            ),
+          );
+          if (index >= 0) {
+            matchedWord = candidates[index];
+            break;
+          }
+        }
       }
-      const top = word
-        ? wordRange(word).getBoundingClientRect().top
+      const top = matchedWord
+        ? wordRange(matchedWord).getBoundingClientRect().top
         : matching[0].getBoundingClientRect().top;
       const delta = top - position.offset;
       if (Math.abs(delta) > 0.5)
@@ -207,9 +242,14 @@ export function useComparisonReadingPosition(
     };
     // Native editors initialize after React commits. Observe their final content
     // and layout, and stop immediately when the reader starts another action.
-    const observer = new MutationObserver(schedule);
+    const observer = new MutationObserver((mutations) => {
+      if (mutations.some((mutation) => mutation.type !== "attributes"))
+        matched = undefined;
+      schedule();
+    });
     observer.observe(root, {
       childList: true,
+      characterData: true,
       subtree: true,
       attributes: true,
     });

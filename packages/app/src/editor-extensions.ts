@@ -505,6 +505,58 @@ export function rejectCriticChangeTransaction(
   return tr;
 }
 
+export function acceptCriticChangeTransaction(
+  state: EditorState,
+  changeId: string,
+): Transaction | null {
+  const markType = state.schema.marks.criticChange;
+  if (!markType) return null;
+
+  const ranges = collectCriticChangeRanges(state.doc, changeId);
+  if (ranges.length === 0) return null;
+
+  const tr = state.tr;
+
+  for (const range of [...ranges].reverse()) {
+    if (range.block) {
+      if (range.kind === "deletion" || range.kind === "substitution-old") {
+        tr.delete(range.from, range.to);
+      } else {
+        tr.removeMark(range.from, range.to, range.mark);
+        const block = tr.doc.nodeAt(range.from);
+        if (block) tr.replaceWith(range.from, range.to, block.content);
+      }
+      continue;
+    }
+    if (range.kind === "deletion" || range.kind === "substitution-old") {
+      tr.delete(range.from, range.to);
+    } else {
+      const sentinelPositions = findSuggestedParagraphSentinels(
+        state.doc,
+        range.from,
+        range.to,
+      );
+
+      for (const position of [...sentinelPositions].reverse()) {
+        tr.delete(position, position + SUGGESTED_PARAGRAPH_SENTINEL.length);
+      }
+
+      const from = tr.mapping.map(range.from, -1);
+      const to = tr.mapping.map(range.to, -1);
+      tr.removeMark(from, to, markType);
+    }
+  }
+
+  resolveCriticBoundaries(
+    tr,
+    changeId,
+    ranges.some(
+      (range) => range.kind === "addition" || range.kind === "substitution-new",
+    ),
+  );
+  return tr;
+}
+
 const CriticChange = Mark.create({
   name: "criticChange",
   priority: 1090,
@@ -586,61 +638,8 @@ const CriticChange = Mark.create({
       acceptCriticChange:
         (changeId) =>
         ({ state, dispatch }) => {
-          const markType = state.schema.marks.criticChange;
-          if (!markType) return false;
-
-          const ranges = collectCriticChangeRanges(state.doc, changeId);
-          if (ranges.length === 0) return false;
-
-          const tr = state.tr;
-
-          for (const range of [...ranges].reverse()) {
-            if (range.block) {
-              if (
-                range.kind === "deletion" ||
-                range.kind === "substitution-old"
-              ) {
-                tr.delete(range.from, range.to);
-              } else {
-                tr.removeMark(range.from, range.to, range.mark);
-                const block = tr.doc.nodeAt(range.from);
-                if (block) tr.replaceWith(range.from, range.to, block.content);
-              }
-              continue;
-            }
-            if (
-              range.kind === "deletion" ||
-              range.kind === "substitution-old"
-            ) {
-              tr.delete(range.from, range.to);
-            } else {
-              const sentinelPositions = findSuggestedParagraphSentinels(
-                state.doc,
-                range.from,
-                range.to,
-              );
-
-              for (const position of [...sentinelPositions].reverse()) {
-                tr.delete(
-                  position,
-                  position + SUGGESTED_PARAGRAPH_SENTINEL.length,
-                );
-              }
-
-              const from = tr.mapping.map(range.from, -1);
-              const to = tr.mapping.map(range.to, -1);
-              tr.removeMark(from, to, markType);
-            }
-          }
-
-          resolveCriticBoundaries(
-            tr,
-            changeId,
-            ranges.some(
-              (range) =>
-                range.kind === "addition" || range.kind === "substitution-new",
-            ),
-          );
+          const tr = acceptCriticChangeTransaction(state, changeId);
+          if (!tr) return false;
           if (dispatch) dispatch(tr.setMeta(explicitReviewEdit, true));
           return true;
         },
