@@ -6,27 +6,53 @@ import {
   SUGGESTED_PARAGRAPH_SENTINEL,
 } from "./editor-extensions";
 
-/** Map each suggestion to its first anchor, including suggestions with no text. */
-export function suggestionPositions(doc: Node): Map<string, number> {
+const reviewCache = new WeakMap<
+  Node,
+  {
+    positions: ReadonlyMap<string, number>;
+    hasComments: boolean;
+    hasSuggestions: boolean;
+  }
+>();
+
+function reviewAnnotations(doc: Node) {
+  const cached = reviewCache.get(doc);
+  if (cached) return cached;
   const positions = new Map<string, number>();
+  let hasComments = false;
+  let hasSuggestions = false;
   doc.descendants((node, pos) => {
-    const block = node.type.name === "criticChangeBlock" && node.attrs.change;
-    if (block?.changeId && !positions.has(block.changeId)) {
-      positions.set(block.changeId, pos);
+    if (node.type.name === "criticChangeBlock") {
+      hasSuggestions = true;
+      const id = node.attrs.change?.changeId;
+      if (id && !positions.has(id)) positions.set(id, pos);
     }
     for (const mark of node.marks) {
+      if (mark.type.name === "commentRef") hasComments = true;
       if (mark.type.name !== "criticChange") continue;
+      hasSuggestions = true;
       const id = mark.attrs.changeId;
       if (typeof id === "string" && !positions.has(id)) positions.set(id, pos);
     }
   });
-  return positions;
+  const annotations = { positions, hasComments, hasSuggestions };
+  reviewCache.set(doc, annotations);
+  return annotations;
+}
+
+/** Map each suggestion to its first anchor, including suggestions with no text. */
+export function suggestionPositions(doc: Node): ReadonlyMap<string, number> {
+  return reviewAnnotations(doc).positions;
+}
+
+export function hasPendingSuggestions(doc: Node): boolean {
+  return reviewAnnotations(doc).hasSuggestions;
 }
 
 /** Strip review annotations with the same boundary rules as the editor's Revert. */
 export function projectAcceptedDocument(doc: Node): Transform {
   const projection = new Transform(doc);
-  const ids = suggestionPositions(doc);
+  const { positions: ids, hasComments } = reviewAnnotations(doc);
   if (ids.size) {
     let state = EditorState.create({ doc });
     for (const id of ids.keys()) {
@@ -37,7 +63,9 @@ export function projectAcceptedDocument(doc: Node): Transform {
     }
   }
   const { commentRef } = doc.type.schema.marks;
-  if (!commentRef) return projection;
+  // Rejecting a block suggestion may restore comments from its old side.
+  // Only skip the comment pass when there were no annotations to project.
+  if (!commentRef || (!ids.size && !hasComments)) return projection;
   const sentinels: { from: number; to: number }[] = [];
   const anchorless = (node: Node) =>
     node.isText &&

@@ -67,6 +67,21 @@ describe("reference review in the editable document", () => {
     expect(revertReferenceChange(current, change)).toBeNull();
   });
 
+  it("will not revert a stale change over newer text at the same position", () => {
+    const reference = doc("Use red.");
+    const initial = state("Use tan.");
+    const compare = createReferenceComparison(reference);
+    const [stale] = compare(initial.doc);
+    const edited = initial.apply(
+      initial.tr.insertText("ivy", stale.from, stale.to),
+    );
+    const [fresh] = compare(edited.doc);
+
+    expect([fresh.from, fresh.to]).toEqual([stale.from, stale.to]);
+    expect(revertReferenceChange(edited, stale)).toBeNull();
+    expect(revertReferenceChange(edited, fresh)?.doc.eq(reference)).toBe(true);
+  });
+
   it("reverts one changed phrase without touching unchanged wording or other changes", () => {
     const reference = doc("The first orange is sweet. The last peach is ripe.");
     const current = state("The first lime is sweet. The last pear is ripe.");
