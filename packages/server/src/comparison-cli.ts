@@ -22,6 +22,7 @@ interface ComparisonResult {
     reverted: number;
     completedAt: string;
   } | null;
+  editor?: "unified";
   feedback?: { sentAt: string; saved: boolean } | null;
   [key: string]: unknown;
 }
@@ -318,11 +319,24 @@ export async function runComparisonCommand(
         : command === "edit"
           ? "/api/comparisons/document"
           : "/api/comparisons";
-    let comparison = await request(
+    const opened = await request(
       deps,
       new URL(endpoint, connection.apiUrl),
       payload,
     );
+    const reviewPath = `/api/comparisons/${encodeURIComponent(opened.id)}`;
+    const freshFeedback = opened.editor === "unified";
+    const watchUrl = new URL(
+      freshFeedback ? `${reviewPath}/watch` : reviewPath,
+      connection.apiUrl,
+    );
+    const feedbackKey = (result: ComparisonResult) =>
+      result.feedback ? `${result.id}:${result.feedback.sentAt}` : null;
+    let comparison =
+      freshFeedback && !options.noWatch
+        ? await request(deps, watchUrl)
+        : opened;
+    const previousFeedback = feedbackKey(comparison);
     const url = new URL(
       deps.env.ROUGHDRAFT_PUBLIC_URL || connection.frontendUrl,
     );
@@ -330,26 +344,25 @@ export async function runComparisonCommand(
       throw new Error("ROUGHDRAFT_PUBLIC_URL must be an http or https URL.");
     url.search = "";
     url.hash = "";
-    url.searchParams.set("comparison", comparison.id);
+    url.searchParams.set("comparison", opened.id);
     if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1")
       deps.openUrl(url.toString());
     deps.log(
       json
         ? JSON.stringify({
             event: "comparison.opened",
-            comparisonId: comparison.id,
+            comparisonId: opened.id,
             url: url.toString(),
-            comparison,
+            comparison: opened,
           })
         : url.toString(),
     );
     if (options.noWatch) return 0;
     const deadline = Date.now() + options.timeout * 1000;
-    const previousFeedback =
-      command === "edit" ? comparison.feedback?.sentAt : undefined;
     const awaitingFeedback = () =>
-      comparison.status === "open" ||
-      (command === "edit" && comparison.feedback?.sentAt === previousFeedback);
+      freshFeedback
+        ? feedbackKey(comparison) === previousFeedback
+        : comparison.status === "open";
     while (awaitingFeedback()) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
@@ -357,7 +370,7 @@ export async function runComparisonCommand(
           deps.log(
             JSON.stringify({
               event: "comparison.timeout",
-              comparisonId: comparison.id,
+              comparisonId: opened.id,
               url: url.toString(),
               timedOut: true,
               completion: null,
@@ -365,17 +378,14 @@ export async function runComparisonCommand(
           );
         else
           deps.error(
-            `Review ${comparison.id} is still open. No approval was received. Resume with roughdraft comparison ${comparison.id}.`,
+            `No new feedback was received for ${opened.id}. Resume with roughdraft comparison ${opened.id}.`,
           );
         return 1;
       }
       try {
         comparison = await request(
           deps,
-          new URL(
-            `/api/comparisons/${encodeURIComponent(comparison.id)}`,
-            connection.apiUrl,
-          ),
+          watchUrl,
           undefined,
           Math.min(5000, remaining),
         );
@@ -395,6 +405,7 @@ export async function runComparisonCommand(
       if (awaitingFeedback())
         await deps.sleepImpl(Math.min(500, Math.max(0, deadline - Date.now())));
     }
+    url.searchParams.set("comparison", comparison.id);
     deps.log(
       json
         ? JSON.stringify({
@@ -402,6 +413,7 @@ export async function runComparisonCommand(
             comparisonId: comparison.id,
             url: url.toString(),
             completion: comparison.completion,
+            feedback: comparison.feedback ?? null,
             comparison,
           })
         : comparison.feedback

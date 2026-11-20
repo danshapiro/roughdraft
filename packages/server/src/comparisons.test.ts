@@ -224,6 +224,29 @@ describe("file comparison reviews", () => {
     expect(fs.statSync(target).ino).toBe(inode);
     expect(fs.readFileSync(target, "utf8")).toBe("Newer tab on disk");
     expect(fs.readFileSync(copy, "utf8")).toBe("Stale tab");
+
+    // Creating or saving a copy is not a handoff. Only a new Send action
+    // reaches the original watcher, even through a fresh server instance.
+    expect((await app.get(`${route}/watch`)).body).toEqual(savedReview);
+    const sent = await app
+      .post(`/api/comparisons/${forked.body.id}/send`)
+      .send({
+        ...submission,
+        revision: copyReview.body.revision,
+        comment: "Feedback for the waiting agent",
+      });
+    expect(sent.status).toBe(200);
+    const restarted = request(api());
+    expect((await restarted.get(`${route}/watch`)).body).toMatchObject({
+      id: forked.body.id,
+      feedback: {
+        comment: "Feedback for the waiting agent",
+        destinationPath: copy,
+        saved: true,
+      },
+    });
+    expect((await restarted.get(route)).body).toEqual(savedReview);
+    expect(fs.readFileSync(target, "utf8")).toBe("Newer tab on disk");
   });
 
   it("rejects forks to the active file or to a copy changed since inspection", async () => {

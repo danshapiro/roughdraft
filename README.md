@@ -58,7 +58,7 @@ A comparison shows inline highlights and **Keep**/**Revert** cards in the same e
 
 Use `roughdraft snapshot AGENTS.md --out AGENTS.before.md` before making changes you plan to review. A snapshot preserves the exact bytes and won't overwrite an existing snapshot.
 
-**Send feedback** sends a snapshot and submitted comments without saving or authorizing an agent to write a file. `--json` prints the review URL and ID, then `comparison.completed` with `comparison.feedback`. Check `feedback.saved` to tell whether the sent Markdown matches the destination. `completion.fileWritten` is false because Send itself does not write. Agents should reread the destination before any separately authorized edits. Use `--timeout SECONDS` to change the 30-minute wait. A timeout is not approval. `roughdraft comparison ID` reopens a saved review.
+**Send feedback** sends a snapshot and submitted comments without saving or authorizing an agent to write a file. `--json` prints the review URL and ID, then `comparison.completed` with `comparison.feedback`. Check `feedback.saved` to tell whether the sent Markdown matches the destination. `completion.fileWritten` is false because Send itself does not write. Agents should reread the destination before any separately authorized edits. Use `--timeout SECONDS` to change the 30-minute wait. A timeout is not approval. `roughdraft comparison ID` reopens a saved review and waits for the next Send feedback. Add `--no-watch` to inspect the existing review without waiting. Feedback from a recovered copy returns the copy’s path and review ID.
 
 Older comparison links still open their original review. `roughdraft open` and `roughdraft mcp` continue to support the original inline CriticMarkup workflow for tools that use it.
 
