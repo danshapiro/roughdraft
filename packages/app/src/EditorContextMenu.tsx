@@ -1,6 +1,9 @@
 import type { Editor } from "@tiptap/react";
 import { useEditorState } from "@tiptap/react";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { Button } from "./components/ui/button";
+import { Input } from "./components/ui/input";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Bold,
@@ -321,10 +324,8 @@ export function EditorContextMenu({
       return;
     }
 
-    const containerRect = container.getBoundingClientRect();
-    const nextLeft =
-      boundingRect.left + boundingRect.width / 2 - containerRect.left;
-    const nextTop = boundingRect.top - containerRect.top - 14;
+    const nextLeft = boundingRect.left + boundingRect.width / 2;
+    const nextTop = boundingRect.top - 14;
 
     setSelectionActionPosition({
       left: nextLeft,
@@ -412,6 +413,7 @@ export function EditorContextMenu({
         (linkAttrs.href as string | null) || anchor.href,
       );
 
+      setLinkDraft(rawHref);
       setLinkPopoverState({
         href,
         rawHref,
@@ -443,6 +445,7 @@ export function EditorContextMenu({
     const rawHref =
       (editor.getAttributes("link").dataMarkdownSrc as string | null) || "";
 
+    setLinkDraft(rawHref);
     setLinkPopoverState({
       href: resolveEditableLinkTarget(
         rawHref,
@@ -588,11 +591,6 @@ export function EditorContextMenu({
   }, [editor, onAddComment, updateLinkPopover, updateSelectionActionPosition]);
 
   useEffect(() => {
-    if (!linkPopoverState) return;
-    setLinkDraft(linkPopoverState.rawHref);
-  }, [linkPopoverState]);
-
-  useEffect(() => {
     if (!linkPopoverState?.focusInput || !linkInputRef.current) {
       return;
     }
@@ -666,239 +664,255 @@ export function EditorContextMenu({
       }}
     >
       {children}
-      {renderedSelectionMenu ? (
-        <div
-          className="absolute z-30 -translate-x-1/2 -translate-y-full"
-          style={{
-            left: renderedSelectionMenu.left,
-            top: renderedSelectionMenu.top,
-          }}
-        >
-          <div
-            data-testid="selection-menu"
-            data-state={selectionMenuVisible ? "open" : "closed"}
-            className="w-max max-w-[calc(100vw-2rem)] origin-bottom rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/95 dark:bg-slate-800/95 p-2 shadow-[0_18px_48px_rgba(15,23,42,0.16)] dark:shadow-[0_18px_48px_rgba(0,0,0,0.4)] backdrop-blur-xl duration-150 ease-out data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-85 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-85"
-            onMouseDown={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-            }}
-          >
-            <div className="flex flex-wrap items-center gap-1">
-              <SelectionMenuButton
-                label="Bold"
-                icon={<Bold className="size-4" />}
-                active={selectionMenuState.isBoldActive}
-                disabled={!selectionMenuState.canToggleBold}
-                onClick={() => editor?.chain().focus().toggleBold().run()}
-              />
-              <SelectionMenuButton
-                label="Italic"
-                icon={<Italic className="size-4" />}
-                active={selectionMenuState.isItalicActive}
-                disabled={!selectionMenuState.canToggleItalic}
-                onClick={() => editor?.chain().focus().toggleItalic().run()}
-              />
-              <SelectionMenuButton
-                label="Inline code"
-                icon={<Code2 className="size-4" />}
-                active={selectionMenuState.isCodeActive}
-                disabled={!selectionMenuState.canToggleCode}
-                onClick={() => editor?.chain().focus().toggleCode().run()}
-              />
-              <SelectionMenuButton
-                label="Blockquote"
-                icon={<Quote className="size-4" />}
-                active={selectionMenuState.isBlockquoteActive}
-                disabled={!selectionMenuState.canToggleBlockquote}
-                onClick={() => editor?.chain().focus().toggleBlockquote().run()}
-              />
-              <SelectionMenuButton
-                label="Bulleted list"
-                icon={<List className="size-4" />}
-                active={selectionMenuState.isBulletListActive}
-                disabled={!selectionMenuState.canToggleBulletList}
-                onClick={() => editor?.chain().focus().toggleBulletList().run()}
-              />
-              <SelectionMenuButton
-                label="Numbered list"
-                icon={<ListOrdered className="size-4" />}
-                active={selectionMenuState.isOrderedListActive}
-                disabled={!selectionMenuState.canToggleOrderedList}
-                onClick={() =>
-                  editor?.chain().focus().toggleOrderedList().run()
-                }
-              />
-              <SelectionMenuButton
-                label="Link"
-                icon={<Link2 className="size-4" />}
-                active={selectionMenuState.isLinkActive}
-                onClick={openLinkPopover}
-              />
-            </div>
-            {selectionMenuState.activeCriticChangeId ? (
-              <div className="grid grid-cols-2 gap-1">
+      {renderedSelectionMenu
+        ? createPortal(
+            <div
+              className="editor-selection-positioner z-[210]"
+              style={
+                {
+                  "--editor-popup-left": `${renderedSelectionMenu.left}px`,
+                  "--editor-popup-top": `${renderedSelectionMenu.top}px`,
+                } as CSSProperties
+              }
+            >
+              <div
+                data-testid="selection-menu"
+                data-state={selectionMenuVisible ? "open" : "closed"}
+                className="editor-selection-menu w-max max-w-[calc(100vw-2rem)] origin-bottom rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/95 dark:bg-slate-800/95 p-2 shadow-[0_18px_48px_rgba(15,23,42,0.16)] dark:shadow-[0_18px_48px_rgba(0,0,0,0.4)] backdrop-blur-xl duration-150 ease-out data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-85 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-85"
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+              >
+                <div className="flex flex-wrap items-center gap-1">
+                  <SelectionMenuButton
+                    label="Bold"
+                    icon={<Bold className="size-4" />}
+                    active={selectionMenuState.isBoldActive}
+                    disabled={!selectionMenuState.canToggleBold}
+                    onClick={() => editor?.chain().focus().toggleBold().run()}
+                  />
+                  <SelectionMenuButton
+                    label="Italic"
+                    icon={<Italic className="size-4" />}
+                    active={selectionMenuState.isItalicActive}
+                    disabled={!selectionMenuState.canToggleItalic}
+                    onClick={() => editor?.chain().focus().toggleItalic().run()}
+                  />
+                  <SelectionMenuButton
+                    label="Inline code"
+                    icon={<Code2 className="size-4" />}
+                    active={selectionMenuState.isCodeActive}
+                    disabled={!selectionMenuState.canToggleCode}
+                    onClick={() => editor?.chain().focus().toggleCode().run()}
+                  />
+                  <SelectionMenuButton
+                    label="Blockquote"
+                    icon={<Quote className="size-4" />}
+                    active={selectionMenuState.isBlockquoteActive}
+                    disabled={!selectionMenuState.canToggleBlockquote}
+                    onClick={() =>
+                      editor?.chain().focus().toggleBlockquote().run()
+                    }
+                  />
+                  <SelectionMenuButton
+                    label="Bulleted list"
+                    icon={<List className="size-4" />}
+                    active={selectionMenuState.isBulletListActive}
+                    disabled={!selectionMenuState.canToggleBulletList}
+                    onClick={() =>
+                      editor?.chain().focus().toggleBulletList().run()
+                    }
+                  />
+                  <SelectionMenuButton
+                    label="Numbered list"
+                    icon={<ListOrdered className="size-4" />}
+                    active={selectionMenuState.isOrderedListActive}
+                    disabled={!selectionMenuState.canToggleOrderedList}
+                    onClick={() =>
+                      editor?.chain().focus().toggleOrderedList().run()
+                    }
+                  />
+                  <SelectionMenuButton
+                    label="Link"
+                    icon={<Link2 className="size-4" />}
+                    active={selectionMenuState.isLinkActive}
+                    onClick={openLinkPopover}
+                  />
+                </div>
+                {selectionMenuState.activeCriticChangeId ? (
+                  <div className="grid grid-cols-2 gap-1">
+                    <button
+                      type="button"
+                      data-testid="selection-menu-action-accept-suggestion"
+                      className="inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-emerald-700 transition hover:bg-emerald-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                      }}
+                      onClick={() => {
+                        if (selectionMenuState.activeCriticChangeId) {
+                          editor
+                            ?.chain()
+                            .focus()
+                            .acceptCriticChange(
+                              selectionMenuState.activeCriticChangeId,
+                            )
+                            .run();
+                        }
+                        setSelectionActionPosition(null);
+                      }}
+                    >
+                      <Check className="size-4" />
+                      <span>Accept</span>
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="selection-menu-action-reject-suggestion"
+                      className="inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-rose-700 transition hover:bg-rose-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                      }}
+                      onClick={() => {
+                        if (selectionMenuState.activeCriticChangeId) {
+                          editor
+                            ?.chain()
+                            .focus()
+                            .rejectCriticChange(
+                              selectionMenuState.activeCriticChangeId,
+                            )
+                            .run();
+                        }
+                        setSelectionActionPosition(null);
+                      }}
+                    >
+                      <X className="size-4" />
+                      <span>Reject</span>
+                    </button>
+                  </div>
+                ) : null}
                 <button
                   type="button"
-                  data-testid="selection-menu-action-accept-suggestion"
-                  className="inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-emerald-700 transition hover:bg-emerald-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
+                  data-testid="selection-menu-action-comment"
+                  className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl bg-[#E8E3DB] px-3 py-2 text-left text-sm font-bold text-black shadow-[inset_0_1px_0_rgba(255,251,245,0.72)] transition hover:bg-[#ded8ce] focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 dark:bg-slate-700 dark:text-slate-100 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] dark:hover:bg-slate-600 dark:focus-visible:ring-slate-600 disabled:cursor-not-allowed disabled:opacity-40"
+                  disabled={!onAddComment || editor?.state.selection.empty}
                   onMouseDown={(event) => {
                     event.preventDefault();
                     event.stopPropagation();
                   }}
                   onClick={() => {
-                    if (selectionMenuState.activeCriticChangeId) {
-                      editor
-                        ?.chain()
-                        .focus()
-                        .acceptCriticChange(
-                          selectionMenuState.activeCriticChangeId,
-                        )
-                        .run();
-                    }
+                    onAddComment?.();
                     setSelectionActionPosition(null);
                   }}
                 >
-                  <Check className="size-4" />
-                  <span>Accept</span>
-                </button>
-                <button
-                  type="button"
-                  data-testid="selection-menu-action-reject-suggestion"
-                  className="inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-rose-700 transition hover:bg-rose-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
-                  onMouseDown={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                  }}
-                  onClick={() => {
-                    if (selectionMenuState.activeCriticChangeId) {
-                      editor
-                        ?.chain()
-                        .focus()
-                        .rejectCriticChange(
-                          selectionMenuState.activeCriticChangeId,
-                        )
-                        .run();
-                    }
-                    setSelectionActionPosition(null);
-                  }}
-                >
-                  <X className="size-4" />
-                  <span>Reject</span>
+                  <span className="inline-flex items-center gap-2">
+                    <MessageSquarePlus className="size-4.5" />
+                    <span>Comment</span>
+                  </span>
                 </button>
               </div>
-            ) : null}
-            <button
-              type="button"
-              data-testid="selection-menu-action-comment"
-              className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl bg-[#E8E3DB] px-3 py-2 text-left text-sm font-bold text-black shadow-[inset_0_1px_0_rgba(255,251,245,0.72)] transition hover:bg-[#ded8ce] focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 dark:bg-slate-700 dark:text-slate-100 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] dark:hover:bg-slate-600 dark:focus-visible:ring-slate-600 disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!onAddComment || editor?.state.selection.empty}
+            </div>,
+            document.body,
+          )
+        : null}
+      {linkPopoverState
+        ? createPortal(
+            <div
+              ref={linkPopoverRef}
+              data-testid="link-popover"
+              className="editor-link-popup fixed z-[220] flex items-center rounded-[18px] border border-slate-200/90 dark:border-slate-700/90 bg-white/95 dark:bg-slate-800/95 px-3 py-2 shadow-[0_18px_48px_rgba(15,23,42,0.16)] dark:shadow-[0_18px_48px_rgba(0,0,0,0.4)] backdrop-blur-xl"
+              style={
+                {
+                  "--editor-popup-left": `${linkPopoverState.left}px`,
+                  "--editor-popup-top": `${linkPopoverState.top}px`,
+                } as CSSProperties
+              }
               onMouseDown={(event) => {
-                event.preventDefault();
                 event.stopPropagation();
               }}
-              onClick={() => {
-                onAddComment?.();
-                setSelectionActionPosition(null);
-              }}
             >
-              <span className="inline-flex items-center gap-2">
-                <MessageSquarePlus className="size-4.5" />
-                <span>Comment</span>
-              </span>
-            </button>
-          </div>
-        </div>
-      ) : null}
-      {linkPopoverState ? (
-        <div
-          ref={linkPopoverRef}
-          data-testid="link-popover"
-          className="fixed z-[220] flex -translate-x-1/2 -translate-y-full items-center rounded-[18px] border border-slate-200/90 dark:border-slate-700/90 bg-white/95 dark:bg-slate-800/95 px-3 py-2 shadow-[0_18px_48px_rgba(15,23,42,0.16)] dark:shadow-[0_18px_48px_rgba(0,0,0,0.4)] backdrop-blur-xl"
-          style={{
-            left: linkPopoverState.left,
-            top: linkPopoverState.top,
-          }}
-          onMouseDown={(event) => {
-            event.stopPropagation();
-          }}
-        >
-          <input
-            ref={linkInputRef}
-            value={linkDraft}
-            onChange={(event) => setLinkDraft(event.target.value)}
-            onBlur={(event) => {
-              const nextFocused = event.relatedTarget as Node | null;
+              <Input
+                ref={linkInputRef}
+                value={linkDraft}
+                onChange={(event) => setLinkDraft(event.target.value)}
+                onBlur={(event) => {
+                  const nextFocused = event.relatedTarget as Node | null;
 
-              if (
-                nextFocused &&
-                linkPopoverRef.current?.contains(nextFocused)
-              ) {
-                return;
-              }
+                  if (
+                    nextFocused &&
+                    linkPopoverRef.current?.contains(nextFocused)
+                  ) {
+                    return;
+                  }
 
-              applyLink(linkDraft);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                applyLink(linkDraft);
-                editor?.commands.focus();
-              }
+                  applyLink(linkDraft);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    applyLink(linkDraft);
+                    editor?.commands.focus();
+                  }
 
-              if (event.key === "Escape") {
-                event.preventDefault();
-                closeLinkPopover();
-                editor?.commands.focus();
-              }
-            }}
-            className="h-10 w-[22rem] border-0 bg-transparent px-2 text-[17px] text-slate-900 dark:text-slate-100 outline-none placeholder:text-slate-400 dark:placeholder:text-slate-500"
-            placeholder="https://example.com"
-            aria-label="Link URL"
-            data-testid="link-url-input"
-          />
-          <div
-            className="mx-2 h-8 w-px bg-slate-200 dark:bg-slate-700"
-            aria-hidden="true"
-          />
-          <button
-            type="button"
-            className="inline-flex size-9 items-center justify-center rounded-lg text-slate-500 dark:text-slate-400 transition hover:bg-slate-100 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 dark:focus-visible:ring-slate-600"
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => {
-              applyLink(linkDraft);
-              const target =
-                resolveEditableLinkTarget(
-                  linkDraft.trim(),
-                  backend,
-                  resolveLinkUrl,
-                ) || linkPopoverState.href;
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    closeLinkPopover();
+                    editor?.commands.focus();
+                  }
+                }}
+                className="editor-link-input h-10 w-[22rem] border-0 bg-transparent px-2 text-[17px] text-slate-900 dark:text-slate-100 outline-none placeholder:text-slate-400 dark:placeholder:text-slate-500"
+                placeholder="https://example.com"
+                aria-label="Link URL"
+                data-testid="link-url-input"
+              />
+              <div
+                className="mx-2 h-8 w-px bg-slate-200 dark:bg-slate-700"
+                aria-hidden="true"
+              />
+              <Button
+                variant="ghost"
+                type="button"
+                className="inline-flex size-9 items-center justify-center rounded-lg text-slate-500 dark:text-slate-400 transition hover:bg-slate-100 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 dark:focus-visible:ring-slate-600"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  applyLink(linkDraft);
+                  const target =
+                    resolveEditableLinkTarget(
+                      linkDraft.trim(),
+                      backend,
+                      resolveLinkUrl,
+                    ) || linkPopoverState.href;
 
-              if (target) {
-                window.open(target, "_blank", "noopener,noreferrer");
-              }
-            }}
-            aria-label="Open link in new tab"
-            data-testid="link-action-open"
-            title="Open link in new tab"
-          >
-            <ExternalLink className="size-5" />
-          </button>
-          <button
-            type="button"
-            className="inline-flex size-9 items-center justify-center rounded-lg text-slate-500 dark:text-slate-400 transition hover:bg-rose-50 dark:hover:bg-rose-900/40 hover:text-rose-600 dark:hover:text-rose-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-300 dark:focus-visible:ring-rose-800"
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => {
-              editor?.chain().focus().unsetLink().run();
-              closeLinkPopover();
-            }}
-            aria-label="Delete link"
-            data-testid="link-action-delete"
-            title="Delete link"
-          >
-            <Trash2 className="size-5" />
-          </button>
-        </div>
-      ) : null}
+                  if (target) {
+                    window.open(target, "_blank", "noopener,noreferrer");
+                  }
+                }}
+                aria-label="Open link in new tab"
+                data-testid="link-action-open"
+                title="Open link in new tab"
+              >
+                <ExternalLink className="size-5" />
+              </Button>
+              <Button
+                variant="ghost"
+                type="button"
+                className="inline-flex size-9 items-center justify-center rounded-lg text-slate-500 dark:text-slate-400 transition hover:bg-rose-50 dark:hover:bg-rose-900/40 hover:text-rose-600 dark:hover:text-rose-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-300 dark:focus-visible:ring-rose-800"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  editor?.chain().focus().unsetLink().run();
+                  closeLinkPopover();
+                }}
+                aria-label="Delete link"
+                data-testid="link-action-delete"
+                title="Delete link"
+              >
+                <Trash2 className="size-5" />
+              </Button>
+            </div>,
+            document.body,
+          )
+        : null}
       {position ? (
         <div
           ref={menuRef}

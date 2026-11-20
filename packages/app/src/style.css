@@ -895,3 +895,164 @@
     transition: none;
   }
 }
+
+/* Touch layouts include wide unfolded screens, not just narrow phones. Keep
+ * inline document links inline; standalone controls get the larger hit area. */
+@media (max-width: 1023px), (pointer: coarse) {
+  button,
+  [data-slot="select-item"] {
+    min-width: 44px;
+    min-height: 44px;
+    font-size: 14px;
+  }
+
+  [data-slot="input"],
+  [data-slot="textarea"] {
+    min-height: 44px;
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  [data-slot="dialog-content"] {
+    padding: 20px;
+    overflow-wrap: anywhere;
+  }
+
+  [data-slot="dialog-close"] {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    top: 4px;
+    right: 4px;
+  }
+
+  [data-slot="dialog-title"] {
+    padding-inline-end: 32px;
+  }
+
+  [data-slot="dialog-description"],
+  [data-slot="popover-content"],
+  [data-slot="select-content"] {
+    font-size: 14px;
+  }
+
+  .document-mode-control {
+    height: auto;
+  }
+
+  .document-page-shell button svg {
+    min-width: 16px;
+    min-height: 16px;
+  }
+
+  .comment-author {
+    font-size: 14px;
+  }
+
+  .comment-content {
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  .comment-thread-body-with-delete {
+    padding-inline-end: 48px;
+  }
+
+  .link-preview-destination,
+  .document-file-menu button span {
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 1023px) {
+  .document-workspace {
+    padding-inline: 16px;
+  }
+
+  .document-content-card,
+  .revision-markdown {
+    padding: 24px;
+  }
+}
+
+@media (max-width: 600px) {
+  .document-workspace {
+    padding-inline: 8px;
+  }
+
+  .comparison-page {
+    padding-inline: 8px;
+  }
+
+  .document-content-card,
+  .revision-markdown {
+    padding: 20px 16px;
+  }
+
+  .document-file-trigger {
+    flex: 1 1 100%;
+    order: -1;
+    justify-content: flex-start;
+  }
+}
+
+.editor-selection-positioner {
+  position: fixed;
+  left: var(--editor-popup-left);
+  top: var(--editor-popup-top);
+  transform: translate(-50%, -100%);
+}
+
+.editor-link-popup {
+  left: var(--editor-popup-left);
+  top: var(--editor-popup-top);
+  transform: translate(-50%, -100%);
+}
+
+/* On touch layouts, dock transient editing tools above the keyboard instead
+ * of centering a wide popup on a word near either screen edge. Android resizes
+ * the viewport with its keyboard; safe-area spacing also leaves room for the
+ * device's navigation gesture. Desktop keeps the contextual placement. */
+@media (max-width: 1023px), (pointer: coarse) {
+  .editor-selection-positioner,
+  .editor-link-popup {
+    position: fixed;
+    inset-inline: 8px;
+    top: auto;
+    bottom: max(8px, env(safe-area-inset-bottom));
+    transform: none;
+    max-height: calc(100dvh - 16px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .editor-selection-menu {
+    margin-inline: auto;
+  }
+
+  .editor-link-popup {
+    max-width: 40rem;
+    margin-inline: auto;
+  }
+
+  .editor-link-input {
+    flex: 1;
+    min-width: 0;
+    width: 0;
+    font-size: 16px;
+  }
+
+  .document-file-trigger,
+  .document-mode-control [data-slot="select-trigger"] {
+    color: #57534e;
+  }
+
+  .dark .document-file-trigger,
+  .dark .document-mode-control [data-slot="select-trigger"] {
+    color: #cbd5e1;
+  }
+
+  .document-comment-rail textarea {
+    font-size: 16px;
+  }
+}

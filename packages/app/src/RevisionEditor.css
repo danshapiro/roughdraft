@@ -71,3 +71,75 @@
   font-size: 0.95rem;
   line-height: 1.75;
 }
+
+.revision-identity .revision-file-status {
+  font-size: 12px;
+}
+
+.revision-more-actions .revision-tool-group {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.revision-more-actions .revision-tool-group + .revision-tool-group {
+  border-inline-start: 0;
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+  padding: 12px 0 0;
+}
+
+@media (max-width: 1023px), (pointer: coarse) {
+  .revision-header-inner {
+    gap: 8px;
+    padding: 8px 12px;
+  }
+
+  .revision-identity {
+    flex: 1 1 100%;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 2px 8px;
+    align-items: center;
+  }
+
+  .revision-identity h1,
+  .revision-identity .revision-reference-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 14px;
+  }
+
+  .revision-identity .revision-reference-label {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .revision-identity .revision-file-status {
+    font-size: 14px;
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .revision-tools {
+    width: 100%;
+    gap: 4px 8px;
+  }
+
+  .revision-tool-group {
+    gap: 4px;
+  }
+
+  .revision-navigation {
+    flex-wrap: nowrap;
+    order: 1;
+  }
+
+  .revision-navigation span {
+    font-size: 14px;
+  }
+
+  .revision-source-text {
+    font-size: 16px;
+  }
+}

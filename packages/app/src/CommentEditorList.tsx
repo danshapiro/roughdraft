@@ -699,17 +699,20 @@ function CommentThreadNode({
             </div>
             <div
               className={cn(
-                "min-w-0 rounded-xl px-0.5",
-                isRootThread && interactive && !isEditing && "pr-7",
+                "comment-thread-body min-w-0 rounded-xl px-0.5",
+                isRootThread &&
+                  interactive &&
+                  !isEditing &&
+                  "comment-thread-body-with-delete pr-7",
                 bodyTone,
               )}
             >
-              <div className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
+              <div className="comment-author truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
                 {authorLabel}
               </div>
               <div
                 className={cn(
-                  "mt-0.5 text-[13px] leading-5 whitespace-pre-wrap",
+                  "comment-content mt-0.5 text-[13px] leading-5 whitespace-pre-wrap",
                   !hasCommentContent && "italic",
                   variant === "banner"
                     ? "text-slate-800 dark:text-slate-200"

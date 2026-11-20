@@ -260,7 +260,7 @@ function getEditable(container: HTMLElement) {
   return editable as HTMLElement;
 }
 
-function getToolbarButton(container: HTMLElement, label: string) {
+function getToolbarButton(container: ParentNode, label: string) {
   const actionId = label.toLowerCase().replace(/[^a-z0-9]+/g, "-");
   return getByTestId<HTMLButtonElement>(
     container,
@@ -881,7 +881,7 @@ describe("PageCard editor integration", () => {
     await flushAnimationFrame();
 
     expect(document.activeElement).toBe(getEditable(rendered.container));
-    expect(queryByTestId(rendered.container, "link-url-input")).toBeNull();
+    expect(queryByTestId(document.body, "link-url-input")).toBeNull();
   });
 
   it("opens the link edit popover without focusing the URL input when clicking link text", async () => {
@@ -908,7 +908,7 @@ describe("PageCard editor integration", () => {
     await flushAnimationFrame();
 
     const input = queryByTestId<HTMLInputElement>(
-      rendered.container,
+      document.body,
       "link-url-input",
     );
 
@@ -1364,12 +1364,17 @@ describe("PageCard editor integration", () => {
 
     await selectText(editor, "Heading");
     await flushAnimationFrame();
-    expect(rendered.container.textContent).toContain("Comment");
+    expect(
+      getByTestId<HTMLButtonElement>(
+        document.body,
+        "selection-menu-action-comment",
+      ).disabled,
+    ).toBe(false);
 
     await selectText(editor, "bold");
     await flushAnimationFrame();
     expect(
-      getToolbarButton(rendered.container, "Bold").getAttribute("aria-pressed"),
+      getToolbarButton(document.body, "Bold").getAttribute("aria-pressed"),
     ).toBe("true");
   });
 
