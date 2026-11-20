@@ -91,7 +91,9 @@ test.describe("mobile inline editing popups", () => {
       await expect(input).toHaveValue(`https://example.com/${edge}`);
       await input.fill(`https://example.com/updated-${edge}`);
       await input.press("Enter");
-      await input.press("Escape");
+      // Enter may already close the input and return focus to the editor.
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId("link-popover")).toBeHidden();
       await expect
         .poll(() => fs.readFileSync(targetPath, "utf8"))
         .toContain(`[${edge}](https://example.com/updated-${edge})`);
@@ -160,7 +162,9 @@ test.describe("mobile inline editing popups", () => {
     expect(fs.readFileSync(targetPath, "utf8")).toBe(source);
 
     await input.press("Enter");
-    await input.press("Escape");
+    // Enter may already close the input and return focus to the editor.
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("link-popover")).toBeHidden();
     await expect
       .poll(() => fs.readFileSync(targetPath, "utf8"))
       .toContain(`[draft link](${editedUrl})`);
