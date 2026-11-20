@@ -3,6 +3,7 @@ import path from "node:path";
 import type { CliDependencies } from "./cli.js";
 
 export const COMPARISON_COMMANDS = [
+  "edit",
   "propose",
   "review",
   "compare",
@@ -21,6 +22,7 @@ interface ComparisonResult {
     reverted: number;
     completedAt: string;
   } | null;
+  feedback?: { sentAt: string; saved: boolean } | null;
   [key: string]: unknown;
 }
 interface ComparisonOptions {
@@ -52,6 +54,7 @@ export function printComparisonHelp(
   log: (message: string) => void,
 ): void {
   const usages: Record<ComparisonCommand, string> = {
+    edit: "roughdraft edit [FILE.md]",
     propose: "roughdraft propose TARGET.md --after CANDIDATE.md",
     review: "roughdraft review TARGET.md --before SNAPSHOT.md",
     compare: "roughdraft compare BEFORE.md AFTER.md",
@@ -66,8 +69,12 @@ export function printComparisonHelp(
     );
     return;
   }
-  log("Review choices and comments save separately from the Markdown file.");
-  log("Only the explicit Apply or Revert button writes the named destination.");
+  log(
+    "Direct edits and Keep/Revert save to the selected file. Comments and pending suggestions stay in the review.",
+  );
+  log(
+    "Send feedback returns a snapshot without writing or authorizing an agent to write.",
+  );
   log("  --no-watch            Print the review URL and return immediately");
   log(
     "  --timeout SECONDS     Maximum wait (default 1800); timeout is not approval",
@@ -201,7 +208,11 @@ function validateUsage(
   options: ComparisonOptions,
 ): void {
   const expected = command === "compare" ? 2 : 1;
-  if (options.positionals.length !== expected)
+  if (
+    command === "edit"
+      ? options.positionals.length > 1
+      : options.positionals.length !== expected
+  )
     throw new Error(
       `Expected ${expected} argument(s) for ${command}. Use roughdraft help ${command}.`,
     );
@@ -277,20 +288,25 @@ export async function runComparisonCommand(
       );
     }
     let payload: Record<string, string> | undefined;
+    if (command === "edit")
+      payload = input ? { targetPath: markdownPath(deps.cwd, input) } : {};
     if (command === "propose")
       payload = {
+        editor: "unified",
         mode: "proposal",
         targetPath: markdownPath(deps.cwd, input),
         afterPath: markdownPath(deps.cwd, options.after ?? ""),
       };
     if (command === "review")
       payload = {
+        editor: "unified",
         mode: "applied",
         targetPath: markdownPath(deps.cwd, input),
         beforePath: markdownPath(deps.cwd, options.before ?? ""),
       };
     if (command === "compare")
       payload = {
+        editor: "unified",
         mode: "compare",
         beforePath: markdownPath(deps.cwd, input),
         afterPath: markdownPath(deps.cwd, options.positionals[1]),
@@ -299,7 +315,9 @@ export async function runComparisonCommand(
     const endpoint =
       command === "comparison"
         ? `/api/comparisons/${encodeURIComponent(input)}`
-        : "/api/comparisons";
+        : command === "edit"
+          ? "/api/comparisons/document"
+          : "/api/comparisons";
     let comparison = await request(
       deps,
       new URL(endpoint, connection.apiUrl),
@@ -327,7 +345,12 @@ export async function runComparisonCommand(
     );
     if (options.noWatch) return 0;
     const deadline = Date.now() + options.timeout * 1000;
-    while (comparison.status === "open") {
+    const previousFeedback =
+      command === "edit" ? comparison.feedback?.sentAt : undefined;
+    const awaitingFeedback = () =>
+      comparison.status === "open" ||
+      (command === "edit" && comparison.feedback?.sentAt === previousFeedback);
+    while (awaitingFeedback()) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         if (json)
@@ -369,7 +392,7 @@ export async function runComparisonCommand(
         )
           throw error;
       }
-      if (comparison.status === "open")
+      if (awaitingFeedback())
         await deps.sleepImpl(Math.min(500, Math.max(0, deadline - Date.now())));
     }
     deps.log(
@@ -381,9 +404,11 @@ export async function runComparisonCommand(
             completion: comparison.completion,
             comparison,
           })
-        : comparison.completion?.fileWritten
-          ? `Review completed. Saved ${comparison.completion.targetPath}.`
-          : "Review completed. No Markdown file was written.",
+        : comparison.feedback
+          ? `Feedback sent. ${comparison.feedback.saved ? "The snapshot matches the saved file." : "The snapshot has not been saved to the destination."}`
+          : comparison.completion?.fileWritten
+            ? `Review completed. Saved ${comparison.completion.targetPath}.`
+            : "Review completed. No Markdown file was written.",
     );
     return 0;
   } catch (error) {

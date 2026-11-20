@@ -13,132 +13,54 @@ Or install and open a file yourself:
 
 ```bash
 npm i -g roughdraft
-roughdraft open /absolute/path/to/file.md
+roughdraft edit /absolute/path/to/file.md --no-watch
 ```
 ## What is this?
 Roughdraft is a local-first markdown editor and viewer that runs on your computer.
 
 Its job is to make markdown files easy to open, read, edit, review, and discuss with your AI agent without moving them into a proprietary format or a hosted app.
 
-Roughdraft opens a single markdown file directly for CriticMarkup comments and suggested changes.
+Roughdraft edits one Markdown document at a time, with optional comments, suggestions, and a comparison reference.
 ## How it works
 - **Local-first markdown editor** — Open normal `.md` files from your machine and edit them directly
   
 - **Works with your AI agent** — Tell your local agent to open a file in Roughdraft on your computer, then keep collaborating from there
   
-- **Comments & suggested changes** — Use CriticMarkup for inline feedback, revisions, and review conversations
+- **Comments & suggested changes** — Review inline without adding annotations to the Markdown file
   
 - **Markdown files on disk** — Everything stays as regular markdown files you can also edit in VS Code, Vim, Cursor, or anywhere else
   
 - **No cloud, no account, no telemetry** — Runs entirely on your machine
   
-## Quick start
-Install Roughdraft and start the local server:
+## Open the editor
 
 ```bash
-npm i -g roughdraft
-roughdraft start
+roughdraft edit ./draft.md --no-watch
+roughdraft edit --no-watch  # start an untitled draft
 ```
 
-`roughdraft start` runs Roughdraft in the background, reuses or chooses a free localhost port, writes server state to `~/.roughdraft/server.json`, prints the active URL, and exits while the server keeps running.
+Roughdraft starts its local server if needed. Use `--no-open` on a headless machine. Without `--no-watch`, the command prints the URL and waits for **Send feedback**.
 
-Open a specific markdown file:
+- **Edit** puts your typing in the document. **Suggest** marks proposed wording inline. **Keep** adds a suggestion to the document; **Revert** discards it. Switch between Edit and Suggest without leaving the page.
+- Edits and **Keep**/**Revert** changes save automatically to the full path in the toolbar. **Save As** copies the current text and continues editing the copy. It asks before replacing a file. If a file changes on disk, Roughdraft pauses saving so you can inspect it or save your work elsewhere.
+- **Copy Markdown** and **Download Markdown** use the same Markdown as autosave. Pending suggestions and comments stay in the review. Use **Markdown** to see exactly what would be exported and **Formatted** to return to editing.
+- **Undo** and **Redo** cover document edits and Keep/Revert choices while the editor stays open, including after a save. Comment history is separate. The draft and submitted comments survive reopening.
 
-```bash
-roughdraft open ./path/to/my-essay/draft.md
-```
-
-For scripts and agents that need a URL without launching a browser:
-
-```bash
-roughdraft open ./path/to/my-essay/draft.md --print-url
-roughdraft status --json
-```
-
-Check or stop the background server:
-
-```bash
-roughdraft status
-roughdraft stop
-```
-
-`roughdraft open` will reuse the running server and auto-start it if needed. You can also use `roughdraft ./path/to/file.md` as a shortcut when the input clearly looks like a path.
-
-Roughdraft does not edit `~/CLAUDE.md`, `~/AGENTS.md`, or other user-level agent files. The setup prompt asks your agent to update its own guidance.
-
-If the local server is already running, you can also open a file directly by URL:
-
-```text
-http://localhost:7373/?path=/absolute/path/to/my-essay/draft.md
-```
-
-That makes an agent-friendly workflow possible:
-
-1. Your AI writes or updates markdown files on disk.
-  
-2. You tell it to open a markdown file in Roughdraft.
-  
-3. Roughdraft opens locally on your machine.
-  
-4. You read, edit, leave comments, and suggest changes.
-  
-5. You click **Done Reviewing** in Roughdraft, and the AI can respond to your comments or revise the document.
-  
-
-Agents can watch that handoff directly:
-
-```bash
-roughdraft open ./path/to/my-essay/draft.md --json
-```
-
-`roughdraft open` starts or reuses the local server, opens the document, registers a fresh watcher, blocks until the next `review.completed` event, then prints event JSON with the document path, file version, feedback counts, and any optional `overallComment` you submit at handoff. By default there is no watch timeout; pass `--timeout <seconds>` when you want one. Use `--no-watch` when you only want to open the document and return immediately. If no watcher is active when you click **Done Reviewing**, Roughdraft shows a fallback prompt you can copy into the agent. Overall comments are written to Markdown as document-level YAML endmatter comments before the handoff event is emitted, so Markdown remains the durable source of truth.
-
-Experimental MCP clients can start the stdio server with:
-
-```bash
-roughdraft mcp
-```
-
-The MCP server exposes tools to read the review index, list pending feedback, watch review events, append replies, and mark items resolved. CriticMarkup in the Markdown file remains the durable source of truth.
 ## Review file changes
-Use a comparison when you want to choose which changes reach a Markdown file. Comparisons use Roughdraft’s rendered document and suggestion sidebar: headings, lists, links and formatting appear as they do in the editor, with changes highlighted in place.
 
-Unchanged text appears once. Highlights pick out the words added or removed, including within lists and table cells; formatting and link changes remain visible too. The header stays at the top while you scroll, showing the filename, review mode, remaining decisions and save status. Use its arrows to move between visible changes and its final Apply or Revert button to save your selection. Show reviewed changes also makes settled choices available to the arrows.
+A comparison shows inline highlights and **Keep**/**Revert** cards in the same editor. **Keep** chooses New for that passage; **Revert** chooses Old. Everything else stays as it was in the chosen file. You can read, comment, and suggest before choosing a file. On your first decision or when you click **Edit**, pick either writable input or make a copy. A copy starts from Old unless you choose New.
 
-| What you want | Command | What the final action does |
-| --- | --- | --- |
-| Propose edits before changing the file | `roughdraft propose AGENTS.md --after AGENTS.proposed.md` | **Accept / Skip** each change, then **Apply** writes accepted changes to `AGENTS.md`. |
-| Review edits that are already in the file | `roughdraft review AGENTS.md --before AGENTS.before.md` | **Keep / Revert** each change, then **Revert** writes the selected reversions to `AGENTS.md`. |
-| Compare any two versions | `roughdraft compare BEFORE.md AFTER.md` | Shows the differences and saves review comments. It has no destination and does not write either file. |
+| What you want to review | Command |
+| --- | --- |
+| A proposed update | `roughdraft propose AGENTS.md --after AGENTS.proposed.md` |
+| Changes already made | `roughdraft review AGENTS.md --before AGENTS.before.md` |
+| Any two versions | `roughdraft compare BEFORE.md AFTER.md` |
 
-Choices and submitted comments save in a separate comparison record. Use the comment editor’s **Save** button or Ctrl/⌘+Enter to submit a reply. These choices and comments do not change the Markdown file. The final write button names the destination and how many changes it will apply or revert. **Finish without applying** ends a review without writing the file. Saving a file does not commit, install, or deploy it.
+Use `roughdraft snapshot AGENTS.md --out AGENTS.before.md` before making changes you plan to review. A snapshot preserves the exact bytes and won't overwrite an existing snapshot.
 
-Use the sidebar’s change controls and reply threads as you would in the editor. Choosing a change shows its selected result; **Show reviewed changes** brings the original highlights and controls back so you can revise your choices. Changes within one list, table or other complete block may be linked; the sidebar states how many source changes its choice covers. The comparison document itself is read-only. Applying uses the original Markdown bytes, preserving untouched spacing and line endings.
+**Send feedback** sends a snapshot and submitted comments without saving or authorizing an agent to write a file. `--json` prints the review URL and ID, then `comparison.completed` with `comparison.feedback`. Check `feedback.saved` to tell whether the sent Markdown matches the destination. `completion.fileWritten` is false because Send itself does not write. Agents should reread the destination before any separately authorized edits. Use `--timeout SECONDS` to change the 30-minute wait. A timeout is not approval. `roughdraft comparison ID` reopens a saved review.
 
-For proposed edits, prepare a separate candidate and leave the destination unchanged. For changes you will make first, save a snapshot before editing:
-
-```bash
-roughdraft snapshot AGENTS.md --out AGENTS.before.md
-# Make the intended edits to AGENTS.md, then show what changed:
-roughdraft review AGENTS.md --before AGENTS.before.md
-```
-
-Snapshots preserve the file bytes exactly and refuse to overwrite an existing output. Choose a new snapshot name for each review round.
-
-Every comparison captures both versions when it starts. Later source edits do not silently change the displayed diff. If the destination changes during review, Roughdraft blocks writes. **Refresh comparison** explicitly reloads the destination, keeps choices for identical change blocks, and leaves changed blocks for another decision. Comments and replies remain saved; feedback whose original change has disappeared is shown as document feedback.
-
-A plain comparison can become a proposal through **Propose these edits**. Enter the destination explicitly; it must match the comparison's before version. That creates a separate proposal for review.
-
-Comparison commands print the URL immediately and wait for up to 30 minutes. Use `--no-open` on a headless machine, `--no-watch` to return immediately, or `--timeout SECONDS` to change the wait. A timeout is not approval. Resume with the ID from the command output:
-
-```bash
-roughdraft propose AGENTS.md --after AGENTS.proposed.md --no-open --json
-roughdraft comparison COMPARISON_ID --no-open --json
-```
-
-With `--json`, each output line is a JSON event. `comparison.opened` contains the URL and comparison ID; `comparison.completed` contains `completion.fileWritten`, the destination, the counts, and the saved review including comments. `comparison.timeout` returns exit status 1 and leaves the saved review open. A completed review that wrote no file reports `fileWritten: false`.
-
-Ordinary `roughdraft open` still saves edits directly to its opened file. Use the comparison commands when the user needs Accept/Skip or Keep/Revert decisions before a final write. Agents should reread the destination after completion, respond to saved comments, and handle any separate commit or deployment step through the source's normal workflow.
+Older comparison links still open their original review. `roughdraft open` and `roughdraft mcp` continue to support the original inline CriticMarkup workflow for tools that use it.
 
 ## Local development
 ```bash
@@ -200,7 +122,7 @@ my-essay/
   draft-2.md            # Another file you can open separately
 ```
 
-Roughdraft reads and writes the markdown file directly.
+Roughdraft reads and writes the selected Markdown file directly. It keeps comments, suggestions, and review progress in its server state under `comparisons/` (by default `~/.roughdraft/comparisons/`), so they reopen with the review without adding files to your project.
 ## Agent setup
 If you want your local agent to remember the Roughdraft workflow, ask it to read the live setup prompt:
 

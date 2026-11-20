@@ -136,7 +136,7 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     };
   }
 
-  it("proposes through the real command, waits, and reports the actual final write", async () => {
+  it("proposes through the real command and reports whether the sent snapshot matches disk", async () => {
     const target = path.join(directory, "AGENTS.md");
     const candidate = path.join(directory, "AGENTS.proposed.md");
     fs.writeFileSync(target, "# Rules\r\nOriginal");
@@ -146,22 +146,27 @@ describe("comparison CLI actual subprocess and filesystem", () => {
       async (event) => {
         expect(fs.readFileSync(target, "utf8")).toBe("# Rules\r\nOriginal");
         const review = event.comparison;
-        const decided = await api(`/${review.id}/decisions`, {
+        const draft = {
+          markdown: review.afterText,
+          decisions: { wording: "kept" },
+        };
+        const base = await api(`/${review.id}/base`, {
           revision: review.revision,
-          decisions: review.segments
-            .filter((segment: { kind: string }) => segment.kind === "change")
-            .map((segment: { id: string }) => ({
-              id: segment.id,
-              decision: "after",
-            })),
+          choice: "old",
         });
-        await api(`/${review.id}/apply`, { revision: decided.revision });
+        const saved = await api(`/${review.id}/save`, {
+          revision: base.revision,
+          ...draft,
+        });
+        expect(fs.readFileSync(target, "utf8")).toBe("# Rules\r\nNew rule");
+        await api(`/${review.id}/send`, { revision: saved.revision, ...draft });
       },
     );
     expect(result.code, result.errors).toBe(0);
     expect(result.events.at(-1)).toMatchObject({
       event: "comparison.completed",
-      completion: { fileWritten: true, targetPath: target, accepted: 1 },
+      completion: { fileWritten: false, targetPath: target, accepted: 1 },
+      comparison: { feedback: { saved: true, destinationPath: target } },
     });
     expect(fs.readFileSync(target, "utf8")).toBe("# Rules\r\nNew rule");
     const resumed = await command([
@@ -174,7 +179,7 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     );
   }, 15000);
 
-  it("keeps the target unchanged on timeout and reverts already-applied edits only at the final action", async () => {
+  it("keeps the target unchanged until a base is selected and a change is reverted", async () => {
     const target = path.join(directory, "AGENTS.md");
     const before = path.join(directory, "AGENTS.before.md");
     fs.writeFileSync(target, "Already changed\n");
@@ -197,23 +202,28 @@ describe("comparison CLI actual subprocess and filesystem", () => {
       ["comparison", timedOut.events[0].comparisonId, "--timeout", "5"],
       async (event) => {
         const review = event.comparison;
-        const decided = await api(`/${review.id}/decisions`, {
+        const draft = { markdown: review.beforeText, decisions: {} };
+        const recovered = await api(`/${review.id}/draft`, {
           revision: review.revision,
-          decisions: review.segments
-            .filter((segment: { kind: string }) => segment.kind === "change")
-            .map((segment: { id: string }) => ({
-              id: segment.id,
-              decision: "before",
-            })),
+          ...draft,
         });
         expect(fs.readFileSync(target, "utf8")).toBe("Already changed\n");
-        await api(`/${review.id}/apply`, { revision: decided.revision });
+        const base = await api(`/${review.id}/base`, {
+          revision: recovered.revision,
+          choice: "new",
+        });
+        expect(fs.readFileSync(target, "utf8")).toBe("Already changed\n");
+        const saved = await api(`/${review.id}/save`, {
+          revision: base.revision,
+          ...draft,
+        });
+        await api(`/${review.id}/send`, { revision: saved.revision, ...draft });
       },
     );
     expect(result.code).toBe(0);
     expect(result.events.at(-1).completion).toMatchObject({
-      fileWritten: true,
-      reverted: 1,
+      fileWritten: false,
+      targetPath: target,
     });
     expect(fs.readFileSync(target, "utf8")).toBe("Original\n");
   }, 15000);
@@ -242,13 +252,16 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     expect(review.beforeText).toBe(before);
     expect(review.afterText).toBe(after);
     expect(fs.readFileSync(target, "utf8")).toBe(before);
-    const decided = await api(`/${review.id}/decisions`, {
+    const draft = { markdown: after, decisions: { ending: "kept" } };
+    const base = await api(`/${review.id}/base`, {
       revision: review.revision,
-      decisions: review.segments
-        .filter((segment) => segment.kind === "change")
-        .map((segment) => ({ id: segment.id, decision: "after" })),
+      choice: "old",
     });
-    await api(`/${review.id}/apply`, { revision: decided.revision });
+    const saved = await api(`/${review.id}/save`, {
+      revision: base.revision,
+      ...draft,
+    });
+    await api(`/${review.id}/send`, { revision: saved.revision, ...draft });
     const resumed = await command(["comparison", review.id]);
     expect(resumed.code, resumed.errors).toBe(0);
     expect(resumed.events).toHaveLength(2);
@@ -258,7 +271,8 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     }
     expect(resumed.events[1]).toMatchObject({
       event: "comparison.completed",
-      completion: { fileWritten: true, targetPath: target },
+      completion: { fileWritten: false, targetPath: target },
+      comparison: { feedback: { saved: true } },
     });
     expect(fs.readFileSync(target, "utf8")).toBe(after);
   }, 15000);
@@ -272,8 +286,10 @@ describe("comparison CLI actual subprocess and filesystem", () => {
       ["compare", before, after, "--timeout", "5"],
       async (event) => {
         expect(event.comparison.targetPath).toBe(null);
-        await api(`/${event.comparison.id}/complete`, {
+        await api(`/${event.comparison.id}/send`, {
           revision: event.comparison.revision,
+          markdown: event.comparison.afterText,
+          decisions: {},
         });
       },
     );
@@ -284,5 +300,35 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     });
     expect(fs.readFileSync(before, "utf8")).toBe("Before");
     expect(fs.readFileSync(after, "utf8")).toBe("After");
+  }, 15000);
+  it("reopens a file draft and waits for new feedback instead of replaying the old snapshot", async () => {
+    const target = path.join(directory, "notes.md");
+    fs.writeFileSync(target, "live file");
+    const opened = await command(["edit", target, "--no-watch"]);
+    const review = opened.events[0].comparison;
+    expect(review).toMatchObject({ mode: "document", destinationPath: target });
+    const first = await api(`/${review.id}/send`, {
+      revision: review.revision,
+      markdown: "first draft",
+      decisions: {},
+    });
+    const received = await command(
+      ["edit", target, "--timeout", "5"],
+      async (event) => {
+        expect(event.comparisonId).toBe(review.id);
+        expect(event.comparison.feedback).toEqual(first.feedback);
+        await api(`/${review.id}/send`, {
+          revision: event.comparison.revision,
+          markdown: "second draft",
+          decisions: {},
+        });
+      },
+    );
+    expect(received.code, received.errors).toBe(0);
+    expect(received.events.at(-1)?.comparison.feedback).toMatchObject({
+      draft: { markdown: "second draft" },
+      saved: false,
+    });
+    expect(fs.readFileSync(target, "utf8")).toBe("live file");
   }, 15000);
 });

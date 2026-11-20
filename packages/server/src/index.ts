@@ -500,7 +500,10 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       options.comparisonsDir ??
         process.env.ROUGHDRAFT_COMPARISONS_DIR ??
         path.join(homeDir, ".roughdraft", "comparisons"),
-      { allowFileBindMountWrites: options.allowFileBindMountWrites },
+      {
+        allowFileBindMountWrites: options.allowFileBindMountWrites,
+        documentRoot: options.assetRoot,
+      },
     ),
   );
 

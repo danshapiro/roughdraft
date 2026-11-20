@@ -10,16 +10,28 @@ import { TableHeader } from "@tiptap/extension-table-header";
 import { TableRow } from "@tiptap/extension-table-row";
 import TaskItem from "@tiptap/extension-task-item";
 import TaskList from "@tiptap/extension-task-list";
-import type {
-  Mark as ProseMirrorMark,
-  Node as ProseMirrorNode,
+import {
+  type DOMOutputSpec,
+  DOMSerializer,
+  type Mark as ProseMirrorMark,
+  type Node as ProseMirrorNode,
 } from "@tiptap/pm/model";
-import { Plugin, PluginKey, type Transaction } from "@tiptap/pm/state";
+import {
+  type EditorState,
+  Plugin,
+  PluginKey,
+  type Transaction,
+} from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
 import { browserAnchorPath } from "./browser-base-path";
 import { noteId } from "./endnotes";
-import { rawMarkdownBlockAttribute } from "./markdown";
+import {
+  type MarkdownOptions,
+  rawMarkdownBlockAttribute,
+  renderedMarkdownImageUrl,
+  renderedMarkdownLinkUrl,
+} from "./markdown";
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
@@ -206,6 +218,8 @@ function resolveCriticBoundaries(
     tr.replaceWith(pos, pos + node.nodeSize, node.content);
   }
 }
+
+export const explicitReviewEdit = "roughdraftExplicitReviewEdit";
 
 export const SUGGESTED_PARAGRAPH_SENTINEL = "\u2060";
 
@@ -436,6 +450,61 @@ function isOnlyTextblockContent(
   );
 }
 
+// Project pending suggestions back to their original text without mutating the
+// editor. The native Revert action also uses these steps to resolve boundaries.
+export function rejectCriticChangeTransaction(
+  state: EditorState,
+  changeId: string,
+): Transaction | null {
+  const markType = state.schema.marks.criticChange;
+  if (!markType) return null;
+
+  const ranges = collectCriticChangeRanges(state.doc, changeId);
+  if (ranges.length === 0) return null;
+
+  const tr = state.tr;
+
+  for (const range of [...ranges].reverse()) {
+    if (range.block) {
+      if (range.kind === "addition" || range.kind === "substitution-new") {
+        tr.delete(range.from, range.to);
+      } else {
+        tr.removeMark(range.from, range.to, range.mark);
+        const block = tr.doc.nodeAt(range.from);
+        if (block) tr.replaceWith(range.from, range.to, block.content);
+      }
+      continue;
+    }
+    if (range.kind === "addition" || range.kind === "substitution-new") {
+      const sentinelPositions = findSuggestedParagraphSentinels(
+        state.doc,
+        range.from,
+        range.to,
+      );
+      if (
+        sentinelPositions.length > 0 &&
+        isOnlyTextblockContent(state.doc, range.from, range.to)
+      ) {
+        const $from = state.doc.resolve(range.from);
+        tr.delete($from.before(), $from.after());
+      } else {
+        tr.delete(range.from, range.to);
+      }
+    } else {
+      tr.removeMark(range.from, range.to, markType);
+    }
+  }
+
+  resolveCriticBoundaries(
+    tr,
+    changeId,
+    ranges.some(
+      (range) => range.kind === "deletion" || range.kind === "substitution-old",
+    ),
+  );
+  return tr;
+}
+
 const CriticChange = Mark.create({
   name: "criticChange",
   priority: 1090,
@@ -572,66 +641,15 @@ const CriticChange = Mark.create({
                 range.kind === "addition" || range.kind === "substitution-new",
             ),
           );
-          if (dispatch) dispatch(tr);
+          if (dispatch) dispatch(tr.setMeta(explicitReviewEdit, true));
           return true;
         },
       rejectCriticChange:
         (changeId) =>
         ({ state, dispatch }) => {
-          const markType = state.schema.marks.criticChange;
-          if (!markType) return false;
-
-          const ranges = collectCriticChangeRanges(state.doc, changeId);
-          if (ranges.length === 0) return false;
-
-          const tr = state.tr;
-
-          for (const range of [...ranges].reverse()) {
-            if (range.block) {
-              if (
-                range.kind === "addition" ||
-                range.kind === "substitution-new"
-              ) {
-                tr.delete(range.from, range.to);
-              } else {
-                tr.removeMark(range.from, range.to, range.mark);
-                const block = tr.doc.nodeAt(range.from);
-                if (block) tr.replaceWith(range.from, range.to, block.content);
-              }
-              continue;
-            }
-            if (
-              range.kind === "addition" ||
-              range.kind === "substitution-new"
-            ) {
-              const sentinelPositions = findSuggestedParagraphSentinels(
-                state.doc,
-                range.from,
-                range.to,
-              );
-              if (
-                sentinelPositions.length > 0 &&
-                isOnlyTextblockContent(state.doc, range.from, range.to)
-              ) {
-                const $from = state.doc.resolve(range.from);
-                tr.delete($from.before(), $from.after());
-              } else {
-                tr.delete(range.from, range.to);
-              }
-            } else {
-              tr.removeMark(range.from, range.to, markType);
-            }
-          }
-
-          resolveCriticBoundaries(
-            tr,
-            changeId,
-            ranges.some(
-              (range) =>
-                range.kind === "deletion" || range.kind === "substitution-old",
-            ),
-          );
-          if (dispatch) dispatch(tr);
+          const tr = rejectCriticChangeTransaction(state, changeId);
+          if (!tr) return false;
+          if (dispatch) dispatch(tr.setMeta(explicitReviewEdit, true));
           return true;
         },
     };
@@ -1153,6 +1171,60 @@ const ComparisonReadingAnchor = Extension.create({
     ];
   },
 });
+
+function renderPreviewView(document: Document, spec?: DOMOutputSpec) {
+  if (!spec) throw new Error("The Markdown preview has no HTML renderer.");
+  const { dom, contentDOM } = DOMSerializer.renderSpec(document, spec);
+  if (!(dom instanceof HTMLElement))
+    throw new Error("The Markdown preview must render an HTML element.");
+  return { dom, contentDOM };
+}
+
+export const markdownPreviewUrlsKey = new PluginKey("markdownPreviewUrls");
+
+// Display URLs follow the current file, including when history restores an
+// older link or image. The saved Markdown and editor history stay untouched.
+export function markdownPreviewUrlsPlugin(options: MarkdownOptions) {
+  return new Plugin({
+    key: markdownPreviewUrlsKey,
+    props: {
+      markViews: {
+        link(mark, view, inline) {
+          const { dataMarkdownSrc } = mark.attrs;
+          const rendered = dataMarkdownSrc
+            ? mark.type.create({
+                ...mark.attrs,
+                href: renderedMarkdownLinkUrl(dataMarkdownSrc, options),
+              })
+            : mark;
+          return renderPreviewView(
+            view.dom.ownerDocument,
+            mark.type.spec.toDOM?.(rendered, inline),
+          );
+        },
+      },
+      nodeViews: {
+        image(node, view) {
+          const { dataMarkdownSrc } = node.attrs;
+          const rendered = dataMarkdownSrc
+            ? node.type.create(
+                {
+                  ...node.attrs,
+                  src: renderedMarkdownImageUrl(dataMarkdownSrc, options),
+                },
+                node.content,
+                node.marks,
+              )
+            : node;
+          return renderPreviewView(
+            view.dom.ownerDocument,
+            node.type.spec.toDOM?.(rendered),
+          );
+        },
+      },
+    },
+  });
+}
 
 export function createEditorExtensions(placeholder: string) {
   return [

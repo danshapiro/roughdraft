@@ -23,3 +23,11 @@ Within a source group, rendered nodes are aligned so unchanged blocks and inline
 Comparison records must be preserved along with other application data. They contain source text and review comments, so their filesystem access follows the application's local-file trust model. They are not a global document index, collaboration service, or version-control database.
 
 Agents can consume the complete record through the comparison API or CLI JSON output, including whether a file was actually written. CLI waiting polls durable completion rather than relying on an in-memory event. A timeout never implies approval. Source preparation, commits, skill installation, and deployments remain explicit operations outside the comparison review.
+
+## Single editor amendment
+
+File editing and comparisons use the same rendered editor. A comparison begins with no selected file. Reading, commenting and suggesting are available immediately. Editing and a first Keep/Revert decision require a file: the old input, the new input, or a new file seeded from one of them. Keep selects New for one passage; Revert selects Old. A no-op decision persists in the review without rewriting the selected file.
+
+Direct edits and text-changing decisions autosave to the selected file after a version check. Save As requires inspection and explicit replacement of existing files, switches the active file, and retains the in-session undo history. Undo and redo write to the current file. A write conflict preserves the working text and pauses writes. Comments, pending suggestions, recovery text and review decisions live in the server's `comparisons/` sidecar; no adjacent metadata files are needed. Copy and Download exclude pending suggestions and comments. Comment history is separate from document history.
+
+Send feedback freezes the current text, reference, comments and saved status. It does not authorize an agent to write. Existing comparison links and the original inline CriticMarkup editor remain supported.
