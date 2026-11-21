@@ -226,6 +226,96 @@ describe("cli", () => {
     };
   }
 
+  it("never discovers, starts, or opens a replacement when an explicit review server is unavailable", async () => {
+    const test = createTestDependencies();
+    let discoveryCalls = 0;
+    test.deps.fetchImpl = async () => {
+      throw new TypeError("ECONNREFUSED");
+    };
+    test.deps.findAvailablePortImpl = async () => {
+      discoveryCalls += 1;
+      return 12345;
+    };
+    const code = await runCli(
+      [
+        "comparison",
+        "saved-id",
+        "--server",
+        "http://127.0.0.1:1/",
+        "--read",
+        "--json",
+      ],
+      test.deps,
+    );
+    expect(code).toBe(1);
+    expect(test.getSpawnCount()).toBe(0);
+    expect(discoveryCalls).toBe(0);
+    expect(test.getLastOpenedUrl()).toBe(null);
+    expect(test.logs).toEqual([]);
+  });
+
+  it.each([
+    {
+      backend: "remote-documents",
+      instanceId: "server",
+      capabilities: { fileComparisons: true },
+    },
+    {
+      backend: "local-files",
+      instanceId: "server",
+      capabilities: { fileComparisons: false },
+    },
+    { backend: "local-files", capabilities: { fileComparisons: true } },
+  ])("rejects an explicit server without the file review capability and identity: %j", async (status) => {
+    const test = createTestDependencies();
+    let requestCount = 0;
+    test.deps.fetchImpl = async () => {
+      requestCount += 1;
+      return Response.json(status);
+    };
+    expect(
+      await runCli(
+        [
+          "comparison",
+          "saved-id",
+          "--server",
+          "http://127.0.0.1:12345/",
+          "--read",
+        ],
+        test.deps,
+      ),
+    ).toBe(1);
+    expect(requestCount).toBe(1);
+    expect(test.getSpawnCount()).toBe(0);
+    expect(test.getLastOpenedUrl()).toBe(null);
+  });
+
+  it("reports the actual review server and preferred-port fallback in JSON and stderr", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, "# Real review\n");
+    fs.writeFileSync(
+      path.join(projectDir, "index.html"),
+      '<html><head><title>Roughdraft</title></head><body><div id="root"></div><script type="module" src="/app.js"></script></body></html>',
+    );
+    const selectedPort = await test.deps.findAvailablePortImpl(15000);
+    test.deps.findAvailablePortImpl = async () => selectedPort;
+    test.deps.env.ROUGHDRAFT_PUBLIC_URL = "";
+    test.deps.env.ROUGHDRAFT_PORT = "14999";
+    expect(
+      await runCli(["edit", documentPath, "--no-open", "--json"], test.deps),
+    ).toBe(0);
+    expect(JSON.parse(test.logs[0])).toMatchObject({
+      event: "comparison.opened",
+      serverUrl: `http://localhost:${selectedPort}/`,
+      port: selectedPort,
+      preferredPort: 14999,
+      portChanged: true,
+    });
+    expect(test.errors.join("\n")).toContain(`using ${selectedPort}`);
+    expect(test.errors.join("\n")).toContain("--server URL");
+  });
+
   it("writes server state and reuses a running background server", async () => {
     const test = createTestDependencies();
 

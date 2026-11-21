@@ -28,7 +28,7 @@
     "test:coverage": "pnpm --filter @roughdraft/app exec vitest run --coverage && pnpm --filter @roughdraft/server exec vitest run --coverage",
     "check": "pnpm lint && pnpm test:selectors && pnpm test && pnpm build",
     "build": "pnpm --filter @roughdraft/rfm build && pnpm --filter @roughdraft/app build && pnpm --filter @roughdraft/server build",
-    "preview": "node packages/server/bin/roughdraft.mjs open README.md"
+    "preview": "node scripts/preview.mjs"
   },
   "files": [
     "packages/app/dist",
@@ -41,14 +41,16 @@
   ],
   "dependencies": {
     "@roughdraft/rfm": "file:packages/rfm",
-    "express": "^5.1.0",
-    "diff": "8.0.2"
+    "diff": "8.0.2",
+    "express": "^5.1.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.12",
     "@playwright/test": "^1.59.1",
     "@vitest/coverage-v8": "^4.1.5",
+    "esbuild": "^0.27.7",
     "knip": "^6.7.0",
+    "marked": "^15.0.12",
     "tsx": "^4.21.0",
     "typescript": "^5.8.3"
   },

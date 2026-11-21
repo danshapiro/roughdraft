@@ -39,7 +39,7 @@ roughdraft edit ./draft.md
 roughdraft edit --autosave none  # start a draft without writing a file
 ```
 
-Roughdraft starts its local server if needed, prints the review URL and ID, and returns immediately. Use `--no-open` on a headless machine. Tell your agent in chat when you are ready for it to read your feedback.
+Roughdraft starts its local server if needed, checks that the complete review link reaches the saved review, prints it, and returns immediately. Use `--no-open` on a headless machine. Tell your agent in chat when you are ready for it to read your feedback.
 
 - **Edit** puts your typing in the document. **Suggest** marks proposed wording inline. **Keep** adds a suggestion to the document; **Revert** discards it. Switch between Edit and Suggest without leaving the page.
 - Your agent chooses the autosave file before opening a review, or chooses `none` to keep edits in the review without writing a Markdown file. **Review details** shows the full source paths and save destination. A quiet check indicates saved work; saving failures remain visible. If a file changes on disk, Roughdraft preserves your draft and pauses file writes. If another browser changes the review, **Preserve this review** saves your complete feedback separately for the agent, without writing a Markdown file.
@@ -60,11 +60,26 @@ Use `roughdraft snapshot AGENTS.md --out AGENTS.before.md` before making changes
 
 Agents should always provide a title understandable to someone new to the project and an explicit `--autosave PATH` or `--autosave none`. Keep the review request in chat. Friendly version labels appear in the header; full paths are available on hover and through keyboard-accessible **Review details**.
 
-When the user returns to chat, read the current saved review with `roughdraft comparison ID --read --json`. This returns `comparison.read` with the complete review, including its latest `draft`, `reviewComments`, decisions, save destination, and current file state. Preserved copies are included in `recoveredReviews`. It opens no browser, waits for no button, and freezes no snapshot. Reread the destination before any separately authorized changes; reading feedback does not imply approval to apply suggestions.
+Keep the complete returned URL unchanged. When the user returns to chat, read the current saved review with `roughdraft comparison "FULL_REVIEW_URL" --read --json`. The URL selects both the review and the server that owns it, even from another checkout. Bare IDs remain available for local workflows. This returns `comparison.read` with the complete review, including its latest `draft`, `reviewComments`, decisions, save destination, and current file state. Preserved copies are included in `recoveredReviews`. It opens no browser, waits for no button, and freezes no snapshot. Reread the destination before any separately authorized changes; reading feedback does not imply approval to apply suggestions.
 
-Integrations that need a button can explicitly pass `--watch`. Those reviews show **Send feedback**, which freezes a snapshot and returns `comparison.completed` with `comparison.feedback`. Sending does not itself write a Markdown file. Use `--timeout SECONDS` to change the 30-minute wait; a timeout is not approval. `roughdraft comparison ID --watch` reopens a review for this button flow. Older saved waiting sessions retain their button.
+Integrations that need a button can explicitly pass `--watch`. Those reviews show **Send feedback**, which freezes a snapshot and returns `comparison.completed` with `comparison.feedback`. Sending does not itself write a Markdown file. Use `--timeout SECONDS` to change the 30-minute wait; a timeout is not approval. `roughdraft comparison "FULL_REVIEW_URL" --watch` reopens the original review for this button flow. Older saved waiting sessions retain their button.
 
 Older comparison links still open their original review. `roughdraft open` and `roughdraft mcp` continue to support the original inline CriticMarkup workflow for tools that use it.
+
+## Open a review on an existing server
+
+Use `--server` when a preview or integration has already started the server:
+
+```bash
+roughdraft edit ./draft.md --server https://your-preview-server/ --title "Review the customer welcome guide" --autosave none --json
+roughdraft comparison "https://your-preview-server/?comparison=REVIEW_ID" --read --json
+```
+
+`--server` uses that exact existing server or reports an error. It never starts another server or chooses a different port. The server must support file reviews and have access to the supplied paths. Connecting does not give the CLI ownership of that server.
+
+`--port` remains a preferred port for automatic local startup. It can choose another port when the requested one belongs to another checkout; use `--server` to select an existing destination exactly.
+
+Roughdraft checks the saved review and the application route through the final browser address before reporting a successful link. `ROUGHDRAFT_PUBLIC_URL` can name a public alias, but that address must reach the same review server. If creation succeeds and the public check fails, the error retains the created review ID and actual server so it can be recovered without creating another review.
 
 ## Local development
 
@@ -96,6 +111,23 @@ You can refresh that wrapper manually with:
 pnpm dev:install-cli
 pnpm dev:install-cli --name api-redesign
 ```
+
+To review changes to Roughdraft itself, run:
+
+```bash
+pnpm preview
+```
+
+This builds the updated app, keeps an independent preview available, and opens the real README in the unified editor. Edits and feedback stay in the saved review by default. It returns the complete checked URL, which can be opened on the desktop or phone. Run it again to reopen the same review when its build and inputs have not changed; a changed build gets a separate preview so existing feedback remains available.
+
+Choose another document or a more specific title when useful:
+
+```bash
+pnpm preview --document ./README.md --title "Review Roughdraft editing and review links"
+pnpm --silent preview --json
+```
+
+The preview command uses the installed `devservers` helper and preserves its runtime, linked Markdown and referenced local assets outside the task worktree. Unsupported absolute local links or images above a document’s folder are reported before a preview starts. Return its URL unchanged. For agents, `pnpm --silent preview --json` also supplies a `readCommand` argument array; retain and execute it to retrieve feedback through the preserved runtime and its connection settings. The full URL remains the review handle. Production installation rollouts remain separate.
 
 Quality checks:
 
@@ -156,7 +188,7 @@ edit [path]        Open the editor; return the review URL and ID
 review <path>      Review edits against --before SNAPSHOT
 propose <path>     Review proposed text from --after PROPOSED
 compare <a> <b>    Compare two versions
-comparison <id>    Reopen a review; --read --json retrieves feedback
+comparison <url|id> Reopen a review; --read --json retrieves feedback
 open <path>        Open an inline CriticMarkup session; wait for Done Reviewing
 start              Start or reuse the background server
 status             Show server status

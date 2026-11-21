@@ -15,15 +15,19 @@ roughdraft compare "/absolute/path/to/before.md" "/absolute/path/to/after.md" --
 
 Choose a title that makes sense to someone new to the project. Keep the actual review request in your chat message; do not duplicate it in the app. Use friendly version labels and always choose the autosave destination yourself. `none` keeps edits, comments, decisions, and suggestions in the review without writing a Markdown file. A new output path starts from the revised version unless you pass `--autosave-base old`.
 
-The command starts Roughdraft if needed and returns immediately with the review URL and ID. Give the user the URL and tell them to return to chat when ready. Keep the ID. Do not start a waiting process or ask the user to select a file or press Send feedback.
+Without an explicit server, the command starts or reuses this checkout's Roughdraft and returns immediately with a checked review URL. Give the user that complete URL unchanged and tell them to return to chat when ready. Keep the full URL, including its server and review ID. Do not start a waiting process or ask the user to select a file or press Send feedback.
+
+If a preview or integration already supplied a server, pass `--server "EXACT_SERVER_URL"` to create the review there. An exact target fails if unavailable; it never starts a different server or changes ports. `--port` is a startup preference, not an exact destination. Never replace the server address in a returned review URL or join a new address with an old ID. A public-address override must pass the CLI's saved-review and server checks before handoff.
+
+For changes to the Roughdraft repository itself, use `pnpm --silent preview --json` to build, preserve, open, and verify the real README review in one operation. Use `--document` or `--title` when appropriate. Return its `url` unchanged and keep its `readCommand` argument array for retrieving feedback through the preserved runtime. Do not assemble a custom runtime or move review records between servers. Existing kept reviews remain available until the user accepts them.
 
 When the user returns, retrieve the latest saved review:
 
 ```bash
-roughdraft comparison REVIEW_ID --read --json
+roughdraft comparison "FULL_REVIEW_URL" --read --json
 ```
 
-Read the `comparison` object’s `draft` and `reviewComments`, along with decisions and save status. Also read `recoveredReviews`: these contain complete feedback preserved from conflicting browsers, including later recoveries. Read any selected destination from disk before making separately authorized changes. Pending suggestions are feedback; retrieval is not permission to apply them. If saving failed or another browser changed the review, preserve the user's work and address the visible error before assuming all feedback reached the server. The user can use Preserve this review to save conflicting feedback separately without selecting a file.
+The full URL returns to the original server even when your working directory changes. Read the `comparison` object’s `draft` and `reviewComments`, along with decisions and save status. Also read `recoveredReviews`: these contain complete feedback preserved from conflicting browsers, including later recoveries. Read any selected destination from disk before making separately authorized changes. Pending suggestions are feedback; retrieval is not permission to apply them. If saving failed or another browser changed the review, preserve the user's work and address the visible error before assuming all feedback reached the server. The user can use Preserve this review to save conflicting feedback separately without selecting a file.
 
 Use `--watch` only when an integration explicitly needs a Send feedback button and a blocking completion result. Existing inline CriticMarkup workflows remain available through `roughdraft open FILE.md`; that command keeps its original Done Reviewing wait. For that workflow, read the Markdown from disk after review and reply inline using the format below.
 

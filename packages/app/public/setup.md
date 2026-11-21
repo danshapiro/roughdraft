@@ -32,7 +32,7 @@ roughdraft edit "$example_file" --title "Try editing and commenting in Roughdraf
 
 If `curl` is unavailable, create a short Markdown file yourself with a heading, one or two sentences, and an invitation for the user to leave a comment or question.
 
-The command returns the review URL and ID immediately. Give the user the URL and invite them to edit, comment, or suggest changes, then tell you in chat when ready. Keep the review ID and retrieve the latest feedback with `roughdraft comparison REVIEW_ID --read --json`. No Send feedback button or file-selection step is needed.
+The command returns the review URL and ID immediately. Give the user the URL and invite them to edit, comment, or suggest changes, then tell you in chat when ready. Keep the complete returned URL unchanged and retrieve the latest feedback with `roughdraft comparison "FULL_REVIEW_URL" --read --json`. If an integration has already supplied a server, use `--server URL`; a preferred `--port` does not bind an existing destination. No Send feedback button or file-selection step is needed.
 
 ## Update Your Persistent Instructions
 
@@ -99,7 +99,7 @@ curl -fsSL https://roughdraft.md/prompt.md >> "$agent_instructions_file"
 
 If the instruction file already has Roughdraft guidance, merge in any missing guidance from https://roughdraft.md/prompt.md instead of duplicating the section.
 
-If you cannot use `curl`, read the bundled prompt with `roughdraft help agent` and merge its guidance into the selected instruction file. Always include the human-readable title, explicit autosave path or `none`, nonblocking open, and read-by-review-ID workflow. Reserve `--watch` for integrations that explicitly request a button handoff.
+If you cannot use `curl`, read the bundled prompt with `roughdraft help agent` and merge its guidance into the selected instruction file. Always include the human-readable title, explicit autosave path or `none`, nonblocking open, and read-by-full-review-URL workflow. Reserve `--watch` for integrations that explicitly request a button handoff.
 
 After updating your instructions, briefly tell the user which file you changed.
 

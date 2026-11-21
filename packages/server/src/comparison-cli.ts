@@ -2,6 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CliDependencies } from "./cli.js";
 import { logServerEvent } from "./diagnostics.js";
+import {
+  comparisonBrowserUrl,
+  comparisonEndpoint,
+  comparisonHandle,
+  comparisonServerStatus,
+  comparisonServerUrl,
+  verifyComparisonUrl,
+} from "./comparison-connection.js";
 
 export const COMPARISON_COMMANDS = [
   "edit",
@@ -44,6 +52,7 @@ interface ComparisonOptions {
   autosave?: string;
   autosaveBase?: string;
   port?: string;
+  server?: string;
   stateDir?: string;
   stateFile?: string;
   json: boolean;
@@ -56,6 +65,8 @@ interface ComparisonOptions {
 export interface ComparisonConnection {
   apiUrl: string;
   frontendUrl: string;
+  preferredPort?: number;
+  portChanged?: boolean;
 }
 type Connect = (deps: CliDependencies) => Promise<ComparisonConnection>;
 
@@ -72,7 +83,7 @@ export function printComparisonHelp(
     propose: "roughdraft propose TARGET.md --after CANDIDATE.md",
     review: "roughdraft review TARGET.md --before SNAPSHOT.md",
     compare: "roughdraft compare BEFORE.md AFTER.md",
-    comparison: "roughdraft comparison ID",
+    comparison: "roughdraft comparison ID|URL",
     snapshot: "roughdraft snapshot FILE.md --out SNAPSHOT.md",
   };
   log(`Usage: ${usages[command]}`);
@@ -111,7 +122,12 @@ export function printComparisonHelp(
   log(
     "  --json                Print JSON events, including the actual write result",
   );
-  log("  --port PORT           Preferred local server port");
+  log(
+    "  --server URL          Use this exact existing server; never start or fall back",
+  );
+  log(
+    "  --port PORT           Preferred local startup port (may change if busy)",
+  );
   log("  --state-dir DIR       Directory containing the local server state");
   log("  --state-file FILE     Local server state file");
   log(
@@ -139,6 +155,7 @@ function parseOptions(args: string[]): ComparisonOptions {
     ["--autosave", "autosave"],
     ["--autosave-base", "autosaveBase"],
     ["--port", "port"],
+    ["--server", "server"],
     ["--state-dir", "stateDir"],
     ["--state-file", "stateFile"],
   ] as const);
@@ -184,6 +201,23 @@ function parseOptions(args: string[]): ComparisonOptions {
   ) {
     throw new Error("--port must be an integer from 1 to 65535.");
   }
+  const handle = options.positionals[0]
+    ? comparisonHandle(options.positionals[0])
+    : null;
+  if (options.server) comparisonServerUrl(options.server);
+  if (
+    (options.server || handle) &&
+    (options.port || options.stateDir || options.stateFile)
+  )
+    throw new Error(
+      "An exact server or review URL cannot be combined with --port, --state-dir, or --state-file.",
+    );
+  if (
+    handle &&
+    options.server &&
+    comparisonServerUrl(options.server).toString() !== handle.serverUrl
+  )
+    throw new Error("The review URL and --server refer to different servers.");
   return options;
 }
 
@@ -243,6 +277,13 @@ function validateUsage(
   options: ComparisonOptions,
 ): void {
   const expected = command === "compare" ? 2 : 1;
+  if (options.server && command === "snapshot")
+    throw new Error("--server is not valid with snapshot.");
+  if (
+    command !== "comparison" &&
+    options.positionals.some((value) => comparisonHandle(value))
+  )
+    throw new Error("A review URL is only valid with comparison.");
   if (
     command === "edit"
       ? options.positionals.length > 1
@@ -340,6 +381,12 @@ export async function runComparisonCommand(
   const json = options.json || globalJson;
   try {
     const input = options.positionals[0];
+    const handle = command === "comparison" ? comparisonHandle(input) : null;
+    const exactServer =
+      handle?.serverUrl ??
+      (options.server
+        ? comparisonServerUrl(options.server).toString()
+        : undefined);
     if (command === "snapshot") {
       const source = markdownPath(deps.cwd, input);
       const output = path.resolve(deps.cwd, options.out ?? "");
@@ -357,7 +404,7 @@ export async function runComparisonCommand(
       );
       return 0;
     }
-    if (deps.env.ROUGHDRAFT_HOST?.trim()) {
+    if (deps.env.ROUGHDRAFT_HOST?.trim() && !exactServer) {
       throw new Error(
         "File comparisons require a local-files Roughdraft server with access to both source paths. Unset ROUGHDRAFT_HOST; remote document sessions do not support comparison writes.",
       );
@@ -414,18 +461,46 @@ export async function runComparisonCommand(
       autosaveEnabled:
         payload?.autosave !== undefined && payload.autosave !== "none",
     });
-    const connection = await connect(deps);
+    const connection = exactServer
+      ? { apiUrl: exactServer, frontendUrl: exactServer }
+      : await connect(deps);
+    const serverUrl = comparisonServerUrl(connection.apiUrl).toString();
+    const selected = await comparisonServerStatus(deps, serverUrl, {
+      allowLegacyRead: options.read && handle !== null,
+    });
+    // Validate a configured alias before creation; network verification follows creation.
+    const browserBase = options.read
+      ? serverUrl
+      : deps.env.ROUGHDRAFT_PUBLIC_URL ||
+        selected.publicUrl ||
+        connection.frontendUrl;
+    if (!handle) comparisonServerUrl(browserBase);
+    const port = Number(
+      new URL(serverUrl).port ||
+        (new URL(serverUrl).protocol === "https:" ? 443 : 80),
+    );
+    const connectionOutput = {
+      serverUrl,
+      port,
+      preferredPort: connection.preferredPort ?? null,
+      portChanged: connection.portChanged ?? false,
+    };
     const endpoint =
       command === "comparison"
-        ? `/api/comparisons/${encodeURIComponent(input)}`
+        ? `/api/comparisons/${encodeURIComponent(handle?.id ?? input)}`
         : command === "edit"
           ? "/api/comparisons/document"
           : "/api/comparisons";
     let opened = await request(
       deps,
-      new URL(endpoint, connection.apiUrl),
+      comparisonEndpoint(serverUrl, endpoint),
       payload,
     );
+    if (command === "comparison" && opened.id !== (handle?.id ?? input))
+      throw new Error("The selected server returned a different review ID.");
+    const url = handle
+      ? new URL(handle.url)
+      : comparisonBrowserUrl(browserBase, opened.id);
     if (options.read) {
       logServerEvent("comparison-cli", "review.read", {
         comparisonId: opened.id,
@@ -437,11 +512,46 @@ export async function runComparisonCommand(
           JSON.stringify({
             event: "comparison.read",
             comparisonId: opened.id,
+            url: url.toString(),
+            ...connectionOutput,
             comparison: opened,
           }),
         );
       else printSavedReview(opened, deps.log);
       return 0;
+    }
+    try {
+      await verifyComparisonUrl(deps, url, opened.id, selected);
+    } catch (error) {
+      const detail =
+        error instanceof Error
+          ? error.message
+          : "Review link verification failed.";
+      logServerEvent(
+        "comparison-cli",
+        "review.verification-failed",
+        {
+          comparisonId: opened.id,
+          serverUrl,
+          created: command !== "comparison",
+          error: detail,
+        },
+        "error",
+      );
+      if (json)
+        deps.log(
+          JSON.stringify({
+            event: "comparison.verification_failed",
+            comparisonId: opened.id,
+            ...connectionOutput,
+            created: command !== "comparison",
+            error: detail,
+          }),
+        );
+      deps.error(
+        `Review ${opened.id} is saved on ${serverUrl}, but its browser link could not be verified: ${detail} Reopen this ID with --server ${serverUrl}; do not create another review.`,
+      );
+      return 1;
     }
     const reviewPath = `/api/comparisons/${encodeURIComponent(opened.id)}`;
     if (
@@ -451,7 +561,7 @@ export async function runComparisonCommand(
     ) {
       opened = await request(
         deps,
-        new URL(`${reviewPath}/handoff`, connection.apiUrl),
+        comparisonEndpoint(serverUrl, `${reviewPath}/handoff`),
         {
           revision: opened.revision,
           handoff: "button",
@@ -459,9 +569,9 @@ export async function runComparisonCommand(
       );
     }
     const freshFeedback = opened.editor === "unified";
-    const watchUrl = new URL(
+    const watchUrl = comparisonEndpoint(
+      serverUrl,
       freshFeedback ? `${reviewPath}/watch` : reviewPath,
-      connection.apiUrl,
     );
     const feedbackKey = (result: ComparisonResult) =>
       result.feedback ? `${result.id}:${result.feedback.sentAt}` : null;
@@ -470,14 +580,6 @@ export async function runComparisonCommand(
         ? await request(deps, watchUrl)
         : opened;
     const previousFeedback = feedbackKey(comparison);
-    const url = new URL(
-      deps.env.ROUGHDRAFT_PUBLIC_URL || connection.frontendUrl,
-    );
-    if (url.protocol !== "http:" && url.protocol !== "https:")
-      throw new Error("ROUGHDRAFT_PUBLIC_URL must be an http or https URL.");
-    url.search = "";
-    url.hash = "";
-    url.searchParams.set("comparison", opened.id);
     if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1")
       deps.openUrl(url.toString());
     deps.log(
@@ -486,6 +588,7 @@ export async function runComparisonCommand(
             event: "comparison.opened",
             comparisonId: opened.id,
             url: url.toString(),
+            ...connectionOutput,
             comparison: opened,
           })
         : url.toString(),
@@ -515,7 +618,7 @@ export async function runComparisonCommand(
           );
         else
           deps.error(
-            `No new feedback was received for ${opened.id}. Resume waiting with roughdraft comparison ${opened.id} --watch, or read saved feedback with --read.`,
+            `No new feedback was received for ${opened.id}. Resume waiting with roughdraft comparison ${url.toString()} --watch, or read saved feedback with --read.`,
           );
         return 1;
       }

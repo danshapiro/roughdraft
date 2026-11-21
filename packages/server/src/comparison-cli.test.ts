@@ -17,11 +17,34 @@ describe("comparison CLI", () => {
     const logs: string[] = [];
     const errors: string[] = [];
     const fetchImpl = vi.fn<typeof fetch>();
+    let saved: Response | undefined;
+    const connectionFetch: typeof fetch = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/status")
+        return Response.json({
+          backend: "local-files",
+          instanceId: "same-server",
+          capabilities: { fileComparisons: true },
+        });
+      if (url.origin === "http://192.168.3.150:8811") {
+        if (url.pathname.startsWith("/api/comparisons/")) {
+          if (!saved) throw new Error("No created review to verify");
+          return saved.clone();
+        }
+        return new Response(
+          '<html><head><title>Roughdraft</title></head><body><div id="root"></div><script type="module" src="/app.js"></script></body></html>',
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      const response = await fetchImpl(input, init);
+      saved = response.clone();
+      return response;
+    };
     const openUrl = vi.fn(() => "disabled" as const);
     const deps = createCliDependencies({
       cwd: directory,
       env: { ROUGHDRAFT_PUBLIC_URL: "http://192.168.3.150:8811/" },
-      fetchImpl,
+      fetchImpl: connectionFetch,
       log: (message) => logs.push(message),
       error: (message) => errors.push(message),
       sleepImpl: async () => {},
@@ -120,6 +143,21 @@ describe("comparison CLI", () => {
       event: "comparison.completed",
       completion: { fileWritten: true, targetPath: target },
     });
+    expect(f.openUrl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "file:///tmp/viewer",
+    "https://user:secret@example.com/",
+    "https://example.com/?other=1",
+  ])("rejects an invalid public alias before creating a review: %s", async (alias) => {
+    const f = fixture();
+    f.deps.env.ROUGHDRAFT_PUBLIC_URL = alias;
+    expect(
+      await runComparisonCommand("edit", [], f.deps, true, f.connect),
+    ).toBe(1);
+    expect(f.fetchImpl).not.toHaveBeenCalled();
+    expect(f.logs).toEqual([]);
     expect(f.openUrl).not.toHaveBeenCalled();
   });
 
@@ -387,8 +425,14 @@ describe("comparison CLI", () => {
     );
     expect(f.fetchImpl.mock.calls[0][1]?.method).toBeUndefined();
     expect(f.openUrl).not.toHaveBeenCalled();
-    expect(f.logs.map((line) => JSON.parse(line))).toEqual([
-      { event: "comparison.read", comparisonId: latest.id, comparison: latest },
+    expect(f.logs.map((line) => JSON.parse(line))).toMatchObject([
+      {
+        event: "comparison.read",
+        comparisonId: latest.id,
+        comparison: latest,
+        url: "http://localhost:7373/?comparison=read-me",
+        serverUrl: "http://localhost:7373/",
+      },
     ]);
   });
 
@@ -494,6 +538,31 @@ describe("comparison CLI", () => {
     ["comparison", ["id", "--read", "--watch"]],
     ["edit", ["--read"]],
     ["edit", ["--autosave-base", "current"]],
+    [
+      "comparison",
+      ["id", "--server", "https://one.example/", "--port", "7373"],
+    ],
+    [
+      "comparison",
+      ["id", "--server", "https://one.example/", "--state-dir", "/tmp/state"],
+    ],
+    [
+      "comparison",
+      ["https://one.example/?comparison=id", "--state-file", "/tmp/state.json"],
+    ],
+    [
+      "comparison",
+      [
+        "https://one.example/?comparison=id",
+        "--server",
+        "https://two.example/",
+      ],
+    ],
+    [
+      "comparison",
+      ["https://one.example/?comparison=id&comparison=other", "--read"],
+    ],
+    ["comparison", ["id", "--server", "file:///tmp/app"]],
   ] as const)("rejects invalid review options for %s before connecting", async (command, args) => {
     const f = fixture();
     expect(

@@ -113,7 +113,9 @@ When changing UI behavior, routes, dialogs, popovers, banners, editor modes, rev
 
 Keep generated screenshot runs in `.context/ui-state-screenshots/` unless the user explicitly asks to commit visual artifacts.
 
-After every change, give Dan a working Roughdraft link to a real, complex Markdown document running on the updated app. Set a clear title and an explicit autosave destination or `none`. Verify the link, keep the review preview available until accepted, and preserve its runtime and documents outside disposable worktrees.
+After every change, give Dan a working Roughdraft link to a real, complex Markdown document running on the updated app. Use `pnpm --silent preview --json` to build and preserve that review, with the real README and autosave `none` by default; pass `--document` or `--title` when useful. Return its complete verified `url` unchanged and retain its `readCommand` argument array for later feedback retrieval. Keep the review until accepted.
+
+For an existing server, use `--server URL`; `--port` is only a startup preference. Never reconstruct a review link from a different address and a saved ID. Read feedback using `comparison "FULL_REVIEW_URL" --read --json`, so it returns to the original server. A healthy application alone does not verify that the linked review exists.
 
 ## Worktree-Specific CLI
 
@@ -182,17 +184,16 @@ Plan file guidelines:
 - Keep product-boundary decisions aligned with the ADRs; if the plan needs to change a recorded decision, call that out explicitly.
 - Use CriticMarkup for inline review notes when helpful.
 
-After writing the plan, open it in Roughdraft for review:
+After writing the plan, open it in the unified editor with a clear title and an explicit autosave choice:
 
 ```bash
 worktree_root="$(git rev-parse --show-toplevel)"
 worktree_name="$(basename "$worktree_root")"
 roughdraft_cmd="roughdraft-dev-$worktree_name"
-"$roughdraft_cmd" start
-"$roughdraft_cmd" open "$worktree_root/.context/<plan-file>.md"
+"$roughdraft_cmd" edit "$worktree_root/.context/<plan-file>.md" --title "Review the <task> plan" --autosave "$worktree_root/.context/<plan-file>.md" --json
 ```
 
-After the user finishes reviewing in Roughdraft, read the plan file from disk and address any CriticMarkup feedback before implementing.
+If an existing review server should own the review, add `--server URL`. Return the complete verified URL unchanged. When the user returns to chat, read that full URL with `comparison "FULL_REVIEW_URL" --read --json`, then read the plan file from disk. Address the saved comments and suggestions before implementing; sidecar feedback may not appear in the Markdown file.
 
 ## Implementation Notes Workflow
 
@@ -215,28 +216,13 @@ The user may refer to Roughdraft as `rd` in natural language. Treat `rd` as shor
 
 Preferred flow:
 
-1. Derive `roughdraft_cmd` for the current worktree.
-2. Start the local server if needed:
+1. Derive `roughdraft_cmd` for the current worktree and run its help when needed.
+2. For ordinary Markdown editing or review, use `edit` with a readable title and an explicit autosave path or `none`. It starts the appropriate local server if needed. Use `--server URL` to bind an existing destination exactly.
+3. Keep and return the complete verified review URL unchanged. The normal command returns immediately; the user tells the agent in chat when ready.
+4. Read current drafts, comments, suggestions and decisions with `comparison "FULL_REVIEW_URL" --read --json`, then read any autosave file before making separately authorized edits.
+5. For changes to Roughdraft itself, use `pnpm --silent preview --json` for the preserved real-document review and execute its emitted `readCommand` to read feedback, rather than assembling servers, links or connection settings manually.
 
-```bash
-"$roughdraft_cmd" start
-```
-
-3. Open the relevant Markdown file:
-
-```bash
-"$roughdraft_cmd" open "/absolute/path/to/file.md"
-```
-
-4. After the user finishes reviewing in Roughdraft, read the markdown file from disk and make the requested changes there.
-
-Useful commands:
-
-```bash
-"$roughdraft_cmd" status
-"$roughdraft_cmd" stop
-"$roughdraft_cmd" help
-```
+The original inline CriticMarkup workflow remains available through `open FILE.md` when specifically needed. That command retains its Done Reviewing wait and file-based feedback. `start`, `status` and `stop` remain available for process management; connecting with `--server` does not authorize stopping a server owned by another task.
 
 ## CriticMarkup
 
