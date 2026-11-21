@@ -16,6 +16,7 @@ import {
   ROUGHDRAFT_PUBLIC_HOST,
 } from "./network.js";
 import { findAvailablePort } from "./ports.js";
+import { logServerEvent } from "./diagnostics.js";
 import {
   COMPARISON_COMMANDS,
   isComparisonCommand,
@@ -1343,10 +1344,16 @@ async function runRemoteOpen(
   eventsUrl.searchParams.set("role", "cli");
 
   let eventsResponse: Response;
+  const connectAbort = new AbortController();
+  const connectTimeout = setTimeout(
+    () =>
+      connectAbort.abort(new Error("Remote event stream connection timed out")),
+    SSE_CONNECT_TIMEOUT_MS,
+  );
   try {
     eventsResponse = await deps.fetchImpl(eventsUrl.toString(), {
       headers: { Accept: "text/event-stream", ...authHeaders },
-      signal: AbortSignal.timeout(SSE_CONNECT_TIMEOUT_MS),
+      signal: connectAbort.signal,
     });
   } catch (error) {
     deps.error(
@@ -1355,6 +1362,10 @@ async function runRemoteOpen(
       }`,
     );
     return 1;
+  } finally {
+    // The deadline is for receiving response headers, not the lifetime of the
+    // save-back stream. An AbortSignal.timeout would also abort its body.
+    clearTimeout(connectTimeout);
   }
 
   if (!eventsResponse.ok || !eventsResponse.body) {
@@ -1365,6 +1376,7 @@ async function runRemoteOpen(
   }
 
   const reader = eventsResponse.body.getReader();
+  logServerEvent("cli", "remote-stream.connected", { sessionId });
   const decoder = new TextDecoder();
   let buffer = "";
 
@@ -1391,6 +1403,10 @@ async function runRemoteOpen(
           if (typeof payload.content === "string") {
             try {
               await atomicWriteFile(options.openPath, payload.content);
+              logServerEvent("cli", "remote-save.written", {
+                sessionId,
+                characters: payload.content.length,
+              });
               if (!options.json) {
                 deps.log(`Saved ${options.openPath} from remote.`);
               }
@@ -1416,6 +1432,7 @@ async function runRemoteOpen(
   if (!options.json) {
     deps.log("Remote session disconnected.");
   }
+  logServerEvent("cli", "remote-stream.disconnected", { sessionId });
   return 0;
 }
 
@@ -1748,7 +1765,11 @@ async function findReusableServer(
     const pidRunning = deps.isProcessRunning(persistedState.pid);
     const statusPayload = await getStatusPayload(persistedState.port, deps);
 
-    if (pidRunning && statusPayload && matchesServerRoot(statusPayload)) {
+    if (
+      pidRunning &&
+      statusPayload?.pid === persistedState.pid &&
+      matchesServerRoot(statusPayload)
+    ) {
       const normalizedState = await normalizeTrackedState(
         persistedState,
         stateFilePath,
@@ -1899,6 +1920,44 @@ async function stopTrackedServer(deps: CliDependencies): Promise<{
   }
 
   if (deps.isProcessRunning(persistedState.pid)) {
+    const status = await getStatusPayload(persistedState.port, deps);
+    if (!status) {
+      logServerEvent(
+        "cli",
+        "server-stop.ownership-unavailable",
+        {
+          pid: persistedState.pid,
+        },
+        "warn",
+      );
+      return {
+        failedPid: persistedState.pid,
+        persistedState,
+        portIsQuiet: false,
+        stopped: false,
+      };
+    }
+    if (
+      status.pid !== persistedState.pid ||
+      !status.serverRoot ||
+      path.resolve(status.serverRoot) !== currentServerRoot
+    ) {
+      // A state file outlives a crashed process, and its PID may be reused.
+      // A different listener does not establish ownership of this process.
+      logServerEvent(
+        "cli",
+        "server-stop.stale-state",
+        { pid: persistedState.pid, listenerPid: status.pid ?? null },
+        "warn",
+      );
+      removeServerStateFile(stateFilePath);
+      return {
+        failedPid: null,
+        persistedState: null,
+        portIsQuiet: false,
+        stopped: false,
+      };
+    }
     await deps.stopProcess(persistedState.pid);
   }
 
