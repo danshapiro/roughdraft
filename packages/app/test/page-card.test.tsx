@@ -508,6 +508,37 @@ describe("PageCard editor integration", () => {
     expect(rendered.onSaveStateChange.mock.calls.at(-1)?.[0]).toBe("saved");
   });
 
+  it("waits for an active autosave before saving newer edits", async () => {
+    const rendered = await renderPageCard();
+    const pendingSaves: Array<() => void> = [];
+    rendered.onSave.mockImplementation(
+      () => new Promise<void>((resolve) => pendingSaves.push(resolve)),
+    );
+    vi.useFakeTimers();
+
+    await insertTextAtEnd(rendered.getEditor(), " first");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+
+    await insertTextAtEnd(rendered.getEditor(), " second");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    const writesBeforeFirstSaveCompleted = rendered.onSave.mock.calls.length;
+    rendered.onSave.mockResolvedValue(undefined);
+    await act(async () => {
+      for (const resolve of pendingSaves) resolve();
+      await Promise.resolve();
+    });
+
+    expect(writesBeforeFirstSaveCompleted).toBe(1);
+    expect(rendered.onSave.mock.calls.at(-1)?.[1]).toContain(
+      "Start first second",
+    );
+  });
+
   it("manual save flushes pending rich-text autosave immediately", async () => {
     const rendered = await renderPageCard({
       page: {
