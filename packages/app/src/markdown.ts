@@ -58,6 +58,59 @@ function createRawMarkdownBlock(markdown: string): string {
   )}"></div>\n`;
 }
 
+/** Keep literal blocks intact while applying document-level rewrites. */
+function transformOutsideCode(
+  markdown: string,
+  transform: (prose: string) => string,
+): string {
+  // Marked normalizes CRLF and omits reference definitions from its token list.
+  // Use its code boundaries, but always transform slices of the original source.
+  const originalOffsets = [0];
+  for (let offset = 0; offset < markdown.length; offset += 1) {
+    if (markdown[offset] === "\r" && markdown[offset + 1] === "\n") offset += 1;
+    originalOffsets.push(offset + 1);
+  }
+  const normalized = markdown.replace(/\r\n?/g, "\n");
+  const ranges: Array<{ start: number; end: number }> = [];
+  let tokenOffset = 0;
+  for (const token of marked.lexer(normalized)) {
+    const start = normalized.indexOf(token.raw, tokenOffset);
+    if (start < 0) continue;
+    tokenOffset = start + token.raw.length;
+    let literalOffset = start;
+    marked.walkTokens([token], (nested) => {
+      if (nested.type !== "code" && nested.type !== "codespan") return;
+      let literalStart = normalized.indexOf(nested.raw, literalOffset);
+      let literalEnd = literalStart + nested.raw.length;
+      if (literalStart < 0 || literalEnd > tokenOffset) {
+        // Nested token sources omit list indentation and blockquote prefixes.
+        // Allow those prefixes between lines without excluding sibling HTML.
+        const pattern = nested.raw
+          .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+          .replace(/\n(?!$)/g, "\n[ \\t]*(?:>[ \\t]*)*");
+        const match = normalized
+          .slice(literalOffset, tokenOffset)
+          .match(new RegExp(pattern));
+        if (!match || match.index === undefined) return;
+        literalStart = literalOffset + match.index;
+        literalEnd = literalStart + match[0].length;
+      }
+      ranges.push({ start: literalStart, end: literalEnd });
+      literalOffset = literalEnd;
+    });
+  }
+  let output = "";
+  let sourceOffset = 0;
+  for (const range of ranges) {
+    const originalStart = originalOffsets[range.start];
+    const originalEnd = originalOffsets[range.end];
+    output += transform(markdown.slice(sourceOffset, originalStart));
+    output += markdown.slice(originalStart, originalEnd);
+    sourceOffset = originalEnd;
+  }
+  return output + transform(markdown.slice(sourceOffset));
+}
+
 function protectRawHtmlBlocks(markdown: string): string {
   return markdown
     .replace(
@@ -116,14 +169,17 @@ function protectPipeSensitiveTables(markdown: string): string {
 }
 
 export function protectRichTextRoundTripMarkdown(markdown: string): string {
-  return protectPipeSensitiveTables(
-    protectIndentedCodeAfterLists(protectRawHtmlBlocks(markdown)),
+  return transformOutsideCode(markdown, (prose) =>
+    protectPipeSensitiveTables(
+      protectIndentedCodeAfterLists(protectRawHtmlBlocks(prose)),
+    ),
   );
 }
 
 function normalizeMarkdownPath(path: string): string {
-  if (path.startsWith("./") || path.startsWith("../")) return path;
-  return `./${path.replace(/^\/+/, "")}`;
+  if (path.startsWith("/") || path.startsWith("./") || path.startsWith("../"))
+    return path;
+  return `./${path}`;
 }
 
 /** Give equivalent relative destinations the same editor mark attributes. */
@@ -435,7 +491,7 @@ export function createTurndownService(): TurndownService {
       const trimmed = content
         .replace(/^\n+/, "")
         .replace(/\n+$/, "\n")
-        .replace(/\n/gm, "\n  ");
+        .replace(/\n(?!$)/g, "\n  ");
 
       let prefix = `${options.bulletListMarker} `;
       const parent = node.parentNode;
@@ -481,9 +537,6 @@ export function createTurndownService(): TurndownService {
       return `\n\n${caption}${lines.join("\n")}\n\n`;
     },
   });
-
-  // We own the markdown parser and want stable round-trips without doubled escapes.
-  service.escape = (value: string) => value;
 
   service.addRule("markdownAwareLinks", {
     filter: "a",
@@ -596,12 +649,12 @@ const turndown = createTurndownService();
  * gratuitous whitespace changes.
  */
 export function normalizeBlockSpacing(md: string): string {
-  let normalized = md.replace(/\n{3,}/g, "\n\n");
-  // Remove blank line immediately before a heading.
-  normalized = normalized.replace(/\n\n(#{1,6} )/g, "\n$1");
-  // Remove blank line immediately after a heading line.
-  normalized = normalized.replace(/(^#{1,6} [^\n]+)\n\n/gm, "$1\n");
-  return normalized;
+  return transformOutsideCode(md, (prose) =>
+    prose
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/\n\n(#{1,6} )/g, "\n$1")
+      .replace(/(^#{1,6} [^\n]+)\n\n/gm, "$1\n"),
+  );
 }
 
 export function toMarkdown(html: string): string {

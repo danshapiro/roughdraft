@@ -1,7 +1,7 @@
 import { basicSetup } from "codemirror";
 import { markdown } from "@codemirror/lang-markdown";
 import { yamlFrontmatter } from "@codemirror/lang-yaml";
-import { EditorState, type Extension } from "@codemirror/state";
+import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { useEffect, useRef } from "react";
 import { cn } from "./lib/utils";
@@ -19,13 +19,19 @@ export function createMarkdownCodeEditorExtensions(
   readOnly: boolean,
   onDocumentChange: (value: string) => void,
   lastValueRef: { current: string },
+  editableCompartment?: Compartment,
 ): Extension[] {
+  const editableExtensions = [
+    EditorState.readOnly.of(readOnly),
+    EditorView.editable.of(!readOnly),
+  ];
   return [
     basicSetup,
     yamlFrontmatter({ content: markdown() }),
     EditorView.lineWrapping,
-    EditorState.readOnly.of(readOnly),
-    EditorView.editable.of(!readOnly),
+    editableCompartment
+      ? editableCompartment.of(editableExtensions)
+      : editableExtensions,
     EditorView.updateListener.of((update) => {
       if (!update.docChanged) return;
 
@@ -96,7 +102,9 @@ export function MarkdownCodeEditor({
   const editorViewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   const initialValueRef = useRef(value);
+  const initialReadOnlyRef = useRef(readOnly);
   const lastValueRef = useRef(value);
+  const editableCompartmentRef = useRef(new Compartment());
 
   useEffect(() => {
     onChangeRef.current = onChange;
@@ -111,9 +119,10 @@ export function MarkdownCodeEditor({
       state: EditorState.create({
         doc: initialValueRef.current,
         extensions: createMarkdownCodeEditorExtensions(
-          readOnly,
+          initialReadOnlyRef.current,
           (nextValue) => onChangeRef.current(nextValue),
           lastValueRef,
+          editableCompartmentRef.current,
         ),
       }),
     });
@@ -121,15 +130,24 @@ export function MarkdownCodeEditor({
     editorViewRef.current = view;
     lastValueRef.current = view.state.doc.toString();
 
-    if (autoFocus) {
-      view.focus();
-    }
-
     return () => {
       editorViewRef.current = null;
       view.destroy();
     };
-  }, [autoFocus, readOnly]);
+  }, []);
+
+  useEffect(() => {
+    editorViewRef.current?.dispatch({
+      effects: editableCompartmentRef.current.reconfigure([
+        EditorState.readOnly.of(readOnly),
+        EditorView.editable.of(!readOnly),
+      ]),
+    });
+  }, [readOnly]);
+
+  useEffect(() => {
+    if (autoFocus) editorViewRef.current?.focus();
+  }, [autoFocus]);
 
   useEffect(() => {
     const view = editorViewRef.current;

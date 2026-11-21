@@ -28,14 +28,82 @@ describe("rich text Markdown preservation", () => {
     expect(reloaded.doc).toEqual(original.doc);
   });
 
+  it("preserves HTML in indented code and nested fenced examples", () => {
+    const indented = "    <!-- a literal source comment -->\n";
+    const nested =
+      "- Example:\n\n  ```html\n  <!-- a literal source comment -->\n  ```\n";
+    for (const input of [indented, nested]) {
+      const state = criticMarkdownToEditorState(input);
+      expect(JSON.stringify(state.doc)).toContain(
+        "<!-- a literal source comment -->",
+      );
+      expect(JSON.stringify(state.doc)).not.toContain(
+        "data-markdown-raw-block",
+      );
+      expect(criticMarkdownToEditorState(roundTrip(input)).doc).toEqual(
+        state.doc,
+      );
+    }
+  });
+
+  it("keeps reference definitions after code blocks and preserves CRLF code contents", () => {
+    const reference =
+      "```text\nExample\n```\n\n[Reference][target]\n\n[target]: /home/user/target.md\n";
+    const saved = roundTrip(reference);
+    const link = criticMarkdownToEditorState(
+      saved,
+    ).doc.content?.[1]?.content?.[0]?.marks?.find(
+      (mark) => mark.type === "link",
+    );
+    expect(link?.attrs?.href).toBe("/home/user/target.md");
+
+    const crlf =
+      "```html\r\n<!-- literal -->\r\n\r\n\r\n# example\r\n\r\nText\r\n```\r\n";
+    const state = criticMarkdownToEditorState(crlf);
+    expect(state.doc.content?.[0]?.content?.[0]?.text).toBe(
+      "<!-- literal -->\n\n\n# example\n\nText",
+    );
+    expect(criticMarkdownToEditorState(roundTrip(crlf)).doc).toEqual(state.doc);
+  });
+
   it("preserves code block whitespace through an unrelated rich text edit", () => {
     const input = "```text\n# Heading example\n\nBody\n\n\nMore\n```\n";
     const state = criticMarkdownToEditorState(input);
-    state.doc.content?.push({ type: "paragraph", content: [{ type: "text", text: "An unrelated edit." }] });
+    state.doc.content?.push({
+      type: "paragraph",
+      content: [{ type: "text", text: "An unrelated edit." }],
+    });
     const saved = editorStateToCriticMarkdown(state.doc, state.comments);
 
     expect(criticMarkdownToEditorState(saved).doc.content?.[0]).toEqual(
       state.doc.content?.[0],
+    );
+  });
+
+  it("preserves literal punctuation in fenced code with review anchors", () => {
+    const input =
+      '```ts\nconst foo_bar = "{==a[0] * b==}{>>check<<}{id="c1" by="AI" at="2026-04-28T12:00:00.000Z"}";\n```\n';
+    const original = criticMarkdownToEditorState(input);
+    const saved = roundTrip(input);
+
+    expect(saved).toBe(input);
+    expect(criticMarkdownToEditorState(saved).doc).toEqual(original.doc);
+  });
+
+  it.each([
+    "- Use `example`\n\n  <!-- retain source note -->\n",
+    "- Use `example`\n\n  <details>\n  <summary>More</summary>\n\n  Secret body\n\n  </details>\n",
+  ])("preserves protected HTML beside inline code in a list: %s", (input) => {
+    expect(roundTrip(input)).toBe(input);
+  });
+
+  it("preserves sibling HTML and literal code inside the same list", () => {
+    const input =
+      "- Example:\n\n  ```html\n  <!-- literal in code -->\n  # Example\n\n\n  Body\n  ```\n\n  <!-- retained sibling -->\n";
+    const saved = roundTrip(input);
+    expect(saved).toContain("<!-- retained sibling -->");
+    expect(criticMarkdownToEditorState(saved).doc).toEqual(
+      criticMarkdownToEditorState(input).doc,
     );
   });
 
@@ -48,18 +116,24 @@ describe("rich text Markdown preservation", () => {
     "A literal \\\\ backslash.\n",
   ])("preserves literal Markdown punctuation: %s", (input) => {
     const original = criticMarkdownToEditorState(input);
-    expect(criticMarkdownToEditorState(roundTrip(input)).doc).toEqual(original.doc);
+    expect(criticMarkdownToEditorState(roundTrip(input)).doc).toEqual(
+      original.doc,
+    );
   });
 
   it("preserves absolute link and image paths", () => {
-    const input = "[Absolute draft](/home/user/draft.md)\n\n![Absolute image](/home/user/image.png)\n";
+    const input =
+      "[Absolute draft](/home/user/draft.md)\n\n![Absolute image](/home/user/image.png)\n";
     expect(roundTrip(input)).toBe(input);
   });
 
   it.each([4, 5, 6])("preserves level %i headings", (level) => {
     const input = `${"#".repeat(level)} A heading\n`;
     const state = criticMarkdownToEditorState(input);
-    expect(state.doc.content?.[0]).toMatchObject({ type: "heading", attrs: { level } });
+    expect(state.doc.content?.[0]).toMatchObject({
+      type: "heading",
+      attrs: { level },
+    });
     expect(roundTrip(input)).toBe(input);
   });
 });
