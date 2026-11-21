@@ -3,7 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { diffLines } from "diff";
 import { Router, type Request, type Response } from "express";
-import { extractRoughdraftReviewIndex } from "@roughdraft/rfm";
+import {
+  cleanRoughdraftMarkdown,
+  extractRoughdraftReviewIndex,
+} from "@roughdraft/rfm";
+import { logServerEvent } from "./diagnostics.js";
 import {
   atomicWrite,
   FileChangedError,
@@ -63,6 +67,8 @@ export interface Comparison {
   title: string;
   beforeLabel: string;
   afterLabel: string;
+  beforePath?: string | null;
+  afterPath?: string | null;
   targetPath: string | null;
   beforeText: string;
   afterText: string;
@@ -73,6 +79,11 @@ export interface Comparison {
   completion: ComparisonCompletion | null;
   targetChanged: boolean;
   editor?: "unified";
+  handoff?: "chat" | "button";
+  autosave?: string;
+  autosaveBase?: BaseVersion;
+  recoveredFrom?: string;
+  recoveredReviews?: Comparison[];
   draft?: EditorDraft | null;
   destinationPath?: string | null;
   savedPath?: string | null;
@@ -81,7 +92,8 @@ export interface Comparison {
   baseOptions?: BaseOptions;
   feedback?: EditorFeedback | null;
 }
-interface StoredComparison extends Omit<Comparison, "targetChanged"> {
+interface StoredComparison
+  extends Omit<Comparison, "targetChanged" | "recoveredReviews"> {
   targetVersion: string | null;
   pendingApply?: { outputHash: string; completion: ComparisonCompletion };
   destinationVersion?: string | null;
@@ -111,10 +123,12 @@ function hash(text: string): string {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
 function log(event: string, fields: Record<string, unknown> = {}): void {
+  const severity =
+    event === "error" ? "error" : event === "conflict" ? "warn" : "info";
+  logServerEvent("server/comparisons", event, fields, severity);
   console.info(
     JSON.stringify({
-      severity:
-        event === "error" ? "error" : event === "conflict" ? "warn" : "info",
+      severity,
       component: "comparisons",
       event,
       ...fields,
@@ -135,6 +149,34 @@ function objectBody(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new ComparisonError(400, "A JSON object is required");
   return value as Record<string, unknown>;
+}
+function launchPolicy(body: Record<string, unknown>): {
+  handoff: "chat" | "button" | undefined;
+  autosave: string | undefined;
+  autosaveBase: BaseVersion | undefined;
+} {
+  const handoff = stringField(body, "handoff");
+  if (handoff !== undefined && handoff !== "chat" && handoff !== "button")
+    throw new ComparisonError(400, "handoff must be chat or button");
+  const autosave = stringField(body, "autosave");
+  if (
+    autosave !== undefined &&
+    autosave !== "none" &&
+    (!path.isAbsolute(autosave) ||
+      path.extname(autosave).toLowerCase() !== ".md")
+  )
+    throw new ComparisonError(
+      400,
+      "autosave must be an absolute .md path or none",
+    );
+  const autosaveBase = stringField(body, "autosaveBase");
+  if (
+    autosaveBase !== undefined &&
+    autosaveBase !== "old" &&
+    autosaveBase !== "new"
+  )
+    throw new ComparisonError(400, "autosaveBase must be old or new");
+  return { handoff, autosave, autosaveBase };
 }
 function reviewCommentsField(
   value: unknown,
@@ -448,6 +490,12 @@ class ComparisonStore {
   private watchChildren(id: string): string {
     return path.join(this.directory, `watch-${id}`);
   }
+  private registerChild(parent: string, child: string): void {
+    const children = this.watchChildren(parent);
+    if (fs.mkdirSync(children, { recursive: true, mode: 0o700 }))
+      syncDirectory(this.directory);
+    atomicWrite(path.join(children, child), "");
+  }
   watch(id: string): StoredComparison {
     const root = this.load(id);
     if (root.editor !== "unified") return root;
@@ -538,6 +586,12 @@ class ComparisonStore {
       fs.readFileSync(filename, "utf8"),
     ) as StoredComparison;
     review.reviewComments ??= [];
+    // Old callers can still be waiting for the explicit Send operation.
+    // Normalize only in memory: reading a review never changes its policy.
+    if (review.editor === "unified") {
+      review.handoff ??= "button";
+      review.autosave ??= review.destinationPath ?? "none";
+    }
     return review;
   }
   load(id: string): StoredComparison {
@@ -611,7 +665,7 @@ class ComparisonStore {
     }
     return review;
   }
-  view(review: StoredComparison): Comparison {
+  view(review: StoredComparison, includeRecoveries = true): Comparison {
     const {
       targetVersion,
       destinationVersion,
@@ -634,18 +688,52 @@ class ComparisonStore {
         targetChanged = true;
       }
     }
-    return { ...result, targetChanged };
+    const recoveredReviews: Comparison[] = [];
+    if (includeRecoveries) {
+      const pending = [review.id];
+      const visited = new Set([review.id]);
+      for (let parent = pending.pop(); parent; parent = pending.pop()) {
+        let children: string[] = [];
+        try {
+          children = fs.readdirSync(this.watchChildren(parent));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        for (const id of children) {
+          if (visited.has(id)) continue;
+          visited.add(id);
+          const child = this.loadIndexedReview(id);
+          if (!child) continue;
+          pending.push(child.id);
+          if (child.recoveredFrom === parent)
+            recoveredReviews.push(this.view(child, false));
+        }
+      }
+    }
+    return {
+      ...result,
+      targetChanged,
+      ...(recoveredReviews.length ? { recoveredReviews } : {}),
+    };
   }
   openDocument(body: Record<string, unknown>): StoredComparison {
     const targetPath = stringField(body, "targetPath");
-    const input = { mode: "document", editor: "unified", targetPath };
+    const policy = launchPolicy(body);
+    const title = stringField(body, "title");
+    const beforeLabel = stringField(body, "beforeLabel");
+    const afterLabel = stringField(body, "afterLabel");
+    const input = { ...body, mode: "document", editor: "unified", targetPath };
     if (targetPath === undefined) return this.create(input);
     const { path: filename, current: disk } =
       this.inspectDestination(targetPath);
     this.recoverDocumentMove(filename);
     const index = this.documentIndex(filename);
     const current = this.loadIndexedReview(this.indexOwner(index));
-    if (current?.mode === "document" && current.destinationPath === filename) {
+    if (
+      current?.mode === "document" &&
+      (current.destinationPath === filename ||
+        (current.autosave === "none" && current.savedPath === filename))
+    ) {
       const draft = current.draft;
       const hasWork =
         current.feedback ||
@@ -655,8 +743,44 @@ class ComparisonStore {
             containsReviewMarkup(draft.markdown)));
       // Opening the source again should show external changes if there is
       // no unfinished draft or feedback to protect. Existing links stay valid.
-      if (!disk || disk.version === current.destinationVersion || hasWork)
+      if (!disk || disk.version === current.destinationVersion || hasWork) {
+        let changed = false;
+        const revision = current.revision;
+        for (const [key, value] of [
+          ["title", title],
+          ["beforeLabel", beforeLabel],
+          ["afterLabel", afterLabel],
+        ] as const) {
+          if (value !== undefined && current[key] !== value) {
+            current[key] = value;
+            changed = true;
+          }
+        }
+        if (
+          policy.handoff !== undefined &&
+          current.handoff !== policy.handoff
+        ) {
+          current.handoff = policy.handoff;
+          changed = true;
+        }
+        if (
+          policy.autosave !== undefined &&
+          policy.autosave !== current.autosave
+        ) {
+          this.configureAutosave(current, policy.autosave, policy.autosaveBase);
+          changed = true;
+        }
+        if (changed) {
+          if (current.revision === revision) current.revision++;
+          this.save(current);
+          log("document-reconfigured", {
+            id: current.id,
+            autosave: current.autosave,
+            handoff: current.handoff,
+          });
+        }
         return current;
+      }
     }
     const review = this.create(input);
     atomicWrite(index, review.id);
@@ -665,6 +789,7 @@ class ComparisonStore {
   create(body: Record<string, unknown>): StoredComparison {
     const mode = body.mode;
     const editor = body.editor;
+    const policy = launchPolicy(body);
     if (editor !== undefined && editor !== "unified")
       throw new ComparisonError(400, "editor must be unified");
     if (
@@ -777,6 +902,12 @@ class ComparisonStore {
         afterPath ??
         (mode === "applied" ? target?.path : undefined) ??
         "After",
+      beforePath:
+        (mode === "proposal" ? target?.path : beforeFile?.path) ?? null,
+      afterPath:
+        (mode === "applied" || mode === "document"
+          ? target?.path
+          : afterFile?.path) ?? null,
       targetPath: target?.path ?? null,
       targetVersion: target?.version ?? null,
       beforeText,
@@ -790,6 +921,8 @@ class ComparisonStore {
       ...(editor === "unified"
         ? {
             editor,
+            handoff: policy.handoff ?? "chat",
+            autosave: initial?.path ?? "none",
             draft: null,
             destinationPath: initial?.path ?? null,
             destinationVersion: initial?.version ?? null,
@@ -808,15 +941,130 @@ class ComparisonStore {
           }
         : {}),
     };
+    if (editor === "unified" && policy.autosave !== undefined)
+      this.configureAutosave(review, policy.autosave, policy.autosaveBase);
     this.save(review);
     log("created", {
       id: review.id,
       mode,
       targetPath: review.targetPath,
+      handoff: review.handoff,
+      autosave: review.autosave,
       changes: review.segments.filter((segment) => segment.kind === "change")
         .length,
     });
     return review;
+  }
+  private seedDraft(
+    review: StoredComparison,
+    markdown: string,
+    clean = false,
+  ): EditorDraft {
+    if (review.draft) return review.draft;
+    const existing = new Set(
+      review.reviewComments.map((comment) => comment.id),
+    );
+    const createdAt = new Date().toISOString();
+    for (const item of extractRoughdraftReviewIndex(markdown).items) {
+      if (item.kind === "suggestion" || existing.has(item.id)) continue;
+      review.reviewComments.push({
+        id: item.id,
+        changeId: item.parentId ?? "document",
+        content: item.text,
+        createdAt: item.createdAt ?? createdAt,
+        authorType: item.author?.toLowerCase() === "ai" ? "ai" : "user",
+        authorId: item.author,
+        parentCommentId: item.parentId,
+        ...(!item.anchorText && !item.parentId
+          ? { scope: "document" as const }
+          : {}),
+      });
+      existing.add(item.id);
+    }
+    return {
+      markdown,
+      ...(clean ? { cleanMarkdown: cleanRoughdraftMarkdown(markdown) } : {}),
+      decisions: {},
+    };
+  }
+  private configureAutosave(
+    review: StoredComparison,
+    filename: string,
+    seed: BaseVersion = "new",
+  ): void {
+    if (filename === "none") {
+      review.autosave = "none";
+      review.destinationPath = null;
+      // Keep the saved snapshot/version so a later rebind still detects
+      // external edits. The Markdown source is never written on detach.
+      return;
+    }
+    const selected = this.inspectDestination(filename);
+    if (selected.path === review.destinationPath) return;
+    if (selected.current) {
+      const side =
+        review.mode === "document" &&
+        (selected.path === review.targetPath ||
+          selected.path === review.savedPath)
+          ? "new"
+          : selected.path === review.baseOptions?.old
+            ? "old"
+            : selected.path === review.baseOptions?.new
+              ? "new"
+              : null;
+      if (!side)
+        throw new ComparisonError(
+          409,
+          "A file already exists at that path. Choose an input file or a new path.",
+        );
+      const expectedVersion =
+        selected.path === review.savedPath
+          ? review.destinationVersion
+          : review.mode === "document"
+            ? review.targetVersion
+            : review.baseInputVersions?.[side];
+      if (selected.current.version !== expectedVersion)
+        throw new ComparisonError(
+          409,
+          "The selected file changed on disk. Choose a copy or open a new review.",
+        );
+      review.baseVersion = side;
+      review.autosaveBase = side;
+      const draft = this.seedDraft(
+        review,
+        side === "old" ? review.beforeText : review.afterText,
+      );
+      this.recordSave(review, draft, review.reviewComments, selected.current);
+      return;
+    }
+    if (
+      [
+        review.targetPath,
+        review.savedPath,
+        review.baseOptions?.old,
+        review.baseOptions?.new,
+      ].includes(selected.path)
+    )
+      throw new ComparisonError(
+        409,
+        "The selected file disappeared. Choose a copy or open a new review.",
+      );
+    const draft = this.seedDraft(
+      review,
+      seed === "old" ? review.beforeText : review.afterText,
+      true,
+    );
+    assertPlainMarkdown(cleanDraft(draft));
+    review.autosaveBase = seed;
+    this.publishDraft(
+      review,
+      draft,
+      review.reviewComments,
+      filename,
+      selected.path,
+      null,
+      seed,
+    );
   }
   private requireRevision(
     review: StoredComparison,
@@ -891,6 +1139,21 @@ class ComparisonStore {
     this.save(review);
     return review;
   }
+  setHandoff(
+    review: StoredComparison,
+    body: Record<string, unknown>,
+  ): StoredComparison {
+    this.requireEditorRevision(review, body);
+    const { handoff } = launchPolicy(body);
+    if (!handoff) throw new ComparisonError(400, "handoff is required");
+    if (review.handoff !== handoff) {
+      review.handoff = handoff;
+      review.revision++;
+      this.save(review);
+      log("handoff-changed", { id: review.id, handoff });
+    }
+    return review;
+  }
   private requireEditor(review: StoredComparison): void {
     if (review.editor !== "unified")
       throw new ComparisonError(
@@ -930,6 +1193,13 @@ class ComparisonStore {
     review.reviewComments = reviewComments;
     review.revision++;
     this.save(review);
+    log("draft-persisted", {
+      id: review.id,
+      revision: review.revision,
+      autosave: review.autosave,
+      decisions: Object.keys(draft.decisions).length,
+      comments: reviewComments.length,
+    });
     return review;
   }
   inspect(review: StoredComparison, filename: string | undefined) {
@@ -958,7 +1228,7 @@ class ComparisonStore {
     if (review.destinationPath)
       throw new ComparisonError(
         409,
-        "This review already has a base file. Use Save As to change it.",
+        "This review already has an autosave file. Ask the agent to change its destination.",
       );
     if (
       choice === "copy" &&
@@ -1046,6 +1316,7 @@ class ComparisonStore {
     review.draft = draft;
     review.reviewComments = reviewComments;
     review.destinationPath = current.path;
+    review.autosave = current.path;
     review.destinationVersion = current.version;
     review.savedPath = current.path;
     review.savedText = current.text;
@@ -1075,7 +1346,7 @@ class ComparisonStore {
       resolved === review.destinationPath ||
       path.resolve(filename) === review.destinationPath;
     const errorMessage =
-      "The destination changed on disk. Inspect it or use Save As to save somewhere else.";
+      "The destination changed on disk. Preserve this review before choosing another file.";
     if (
       (requested !== undefined && body.expectedVersion !== version) ||
       (sameDestination &&
@@ -1107,14 +1378,7 @@ class ComparisonStore {
     // if an earlier request on that review is still awaiting recovery.
     const review = this.readReview(id);
     this.requireEditor(review);
-    const filename = stringField(body, "path");
-    if (!filename) throw new ComparisonError(400, "Choose a path for the copy");
-    const expectedVersion = body.expectedVersion;
-    if (expectedVersion !== null && typeof expectedVersion !== "string")
-      throw new ComparisonError(
-        400,
-        "Inspect the destination before saving to it",
-      );
+    const noFile = launchPolicy(body).autosave === "none";
     const selectedSide = body.baseVersion;
     if (
       selectedSide !== undefined &&
@@ -1123,20 +1387,8 @@ class ComparisonStore {
       selectedSide !== "new"
     )
       throw new ComparisonError(400, "baseVersion must be old, new, or null");
-    const { path: resolved, current } = this.inspectDestination(filename);
-    if (
-      [review.destinationPath, review.pendingSave?.path].some(
-        (active) => active === resolved || active === path.resolve(filename),
-      )
-    )
-      throw new ComparisonError(409, "Choose a different file for the copy");
-    if (expectedVersion !== (current?.version ?? null))
-      throw new ComparisonError(
-        409,
-        "The destination changed on disk. Inspect it or choose another file.",
-      );
     const draft = draftField(body);
-    assertPlainMarkdown(cleanDraft(draft));
+    if (!noFile) assertPlainMarkdown(cleanDraft(draft));
     const comments =
       reviewCommentsField(body.reviewComments, review, true) ?? [];
     const fork: StoredComparison = {
@@ -1146,12 +1398,17 @@ class ComparisonStore {
       title: review.title,
       beforeLabel: review.beforeLabel,
       afterLabel: review.afterLabel,
+      beforePath: review.beforePath,
+      afterPath: review.afterPath,
       beforeText: review.beforeText,
       afterText: review.afterText,
       targetPath: review.targetPath,
       targetVersion: review.targetVersion,
       segments: review.segments,
       editor: "unified",
+      handoff: review.handoff,
+      autosave: "none",
+      ...(noFile ? { recoveredFrom: review.id } : {}),
       baseVersion:
         selectedSide === undefined
           ? (review.baseVersion ?? null)
@@ -1169,12 +1426,42 @@ class ComparisonStore {
       status: "open",
       completion: null,
     };
+    if (noFile) {
+      // This is a durable review copy, including annotations and decisions,
+      // without creating or replacing a Markdown file or the shared review.
+      this.registerChild(review.id, fork.id);
+      this.save(fork);
+      log("review-recovered", {
+        id: fork.id,
+        recoveredFrom: review.id,
+        decisions: Object.keys(draft.decisions).length,
+        comments: comments.length,
+      });
+      return fork;
+    }
+    const filename = stringField(body, "path");
+    if (!filename) throw new ComparisonError(400, "Choose a path for the copy");
+    const expectedVersion = body.expectedVersion;
+    if (expectedVersion !== null && typeof expectedVersion !== "string")
+      throw new ComparisonError(
+        400,
+        "Inspect the destination before saving to it",
+      );
+    const { path: resolved, current } = this.inspectDestination(filename);
+    if (
+      [review.destinationPath, review.pendingSave?.path].some(
+        (active) => active === resolved || active === path.resolve(filename),
+      )
+    )
+      throw new ComparisonError(409, "Choose a different file for the copy");
+    if (expectedVersion !== (current?.version ?? null))
+      throw new ComparisonError(
+        409,
+        "The destination changed on disk. Inspect it or choose another file.",
+      );
     // Register the copy before publishing it so a restart cannot strand a
     // watch. Failed or incomplete copies have no readable review to report.
-    const children = this.watchChildren(review.id);
-    if (fs.mkdirSync(children, { recursive: true, mode: 0o700 }))
-      syncDirectory(this.directory);
-    atomicWrite(path.join(children, fork.id), "");
+    this.registerChild(review.id, fork.id);
     return this.publishDraft(
       fork,
       draft,
@@ -1194,7 +1481,7 @@ class ComparisonStore {
     baseVersion?: BaseVersion,
   ): StoredComparison {
     const errorMessage =
-      "The destination changed on disk. Inspect it or use Save As to save somewhere else.";
+      "The destination changed on disk. Preserve this review before choosing another file.";
     const verify = () => {
       const latest = this.inspectDestination(filename);
       if (
@@ -1554,6 +1841,12 @@ export function comparisonRouter(
     "/:id/draft",
     handle((req, res) => {
       res.json(store.view(store.recoverDraft(load(req), objectBody(req.body))));
+    }),
+  );
+  router.post(
+    "/:id/handoff",
+    handle((req, res) => {
+      res.json(store.view(store.setHandoff(load(req), objectBody(req.body))));
     }),
   );
   router.post(

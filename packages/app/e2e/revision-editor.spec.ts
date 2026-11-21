@@ -28,15 +28,23 @@ async function openReview(
   page: Page,
   request: APIRequestContext,
   files: { targetPath: string } | { beforePath: string; afterPath: string },
+  options: {
+    autosave?: string;
+    autosaveBase?: "old" | "new";
+    handoff?: "chat" | "button";
+  } = {},
 ): Promise<string> {
   const response = await request.post(
     "targetPath" in files ? `${api}/document` : api,
     {
       headers: fixtureHeaders,
-      data:
-        "targetPath" in files
+      data: {
+        ...("targetPath" in files
           ? files
-          : { ...files, editor: "unified", mode: "compare" },
+          : { ...files, editor: "unified", mode: "compare" }),
+        autosave: "targetPath" in files ? files.targetPath : "none",
+        ...options,
+      },
     },
   );
   await expect(response).toBeOK();
@@ -68,7 +76,42 @@ function contents(filename: string) {
 }
 
 function saved(page: Page) {
-  return expect(page.getByTestId("revision-file-status")).toHaveText("Saved");
+  return expect(page.getByTestId("revision-file-status")).toHaveAttribute(
+    "aria-label",
+    /^(Saved to file|Review saved)$/,
+  );
+}
+
+async function destination(page: Page, filename: string) {
+  await page.getByTestId("revision-details").click();
+  await expect(page.getByTestId("revision-details-autosave")).toHaveText(
+    filename,
+  );
+  await page.keyboard.press("Escape");
+}
+
+async function selectMode(page: Page, mode: "edit" | "suggest") {
+  await page.getByTestId("revision-mode").click();
+  await page.getByTestId(`revision-mode-${mode}`).click();
+}
+
+async function recoverCopy(
+  page: Page,
+  request: APIRequestContext,
+  id: string,
+  output: string,
+) {
+  await page.getByTestId("revision-format").click();
+  const markdown = await page.getByTestId("revision-markdown").textContent();
+  expect(markdown).not.toBeNull();
+  const response = await request.post(`${api}/${id}/fork`, {
+    headers: fixtureHeaders,
+    data: { path: output, expectedVersion: null, markdown, decisions: {} },
+  });
+  await expect(response).toBeOK();
+  const copy = await response.json();
+  await page.goto(`/?comparison=${copy.id}`);
+  await destination(page, output);
 }
 
 test.describe("the single revision editor", () => {
@@ -96,8 +139,8 @@ test.describe("the single revision editor", () => {
     const initial = "# Notes\n\nUse old wording.\n";
     const filename = writeProjectFile(project, "notes.md", initial);
     const id = await openReview(page, request, { targetPath: filename });
-    await expect(page.getByTestId("revision-path")).toHaveText(filename);
-    await page.getByTestId("revision-suggest").click();
+    await destination(page, filename);
+    await selectMode(page, "suggest");
     await selectRichText(page, "old");
     await page.keyboard.type("new");
     await expect(page.getByTestId("revision-pending")).toHaveText("1");
@@ -130,7 +173,7 @@ test.describe("the single revision editor", () => {
     await page.getByTestId("revision-redo").click();
     await expect.poll(() => contents(filename)).toBe(accepted);
 
-    await page.getByTestId("revision-edit").click();
+    await selectMode(page, "edit");
     await selectRichText(page, "new");
     await page.keyboard.type("direct");
     await expect(page.getByTestId("revision-pending")).toBeEmpty();
@@ -149,27 +192,25 @@ test.describe("the single revision editor", () => {
       request,
     }) => {
       const { beforePath, afterPath } = compareFiles();
-      await openReview(page, request, { beforePath, afterPath });
-      await expect(page.getByTestId("revision-file-status")).toHaveText(
-        "No file",
+      const changed = fromOld ? beforePath : afterPath;
+      await openReview(
+        page,
+        request,
+        { beforePath, afterPath },
+        { autosave: changed },
       );
       await expect(page.getByTestId("revision-pending")).toHaveText("2");
+      expect(contents(beforePath)).toBe(oldText);
+      expect(contents(afterPath)).toBe(newText);
       await page
         .getByTestId(fromOld ? keep : revert)
         .first()
         .click();
-      const confirm = page.getByTestId("revision-base-confirm");
-      await expect(confirm).toBeVisible();
-      expect(contents(beforePath)).toBe(oldText);
-      expect(contents(afterPath)).toBe(newText);
-      await page.getByTestId(`revision-base-${choice}`).click();
-      await confirm.click();
-      const changed = fromOld ? beforePath : afterPath;
       const untouched = fromOld ? afterPath : beforePath;
       const expected = fromOld
         ? oldText.replace("red", "blue")
         : newText.replace("blue", "red");
-      await expect(page.getByTestId("revision-path")).toHaveText(changed);
+      await destination(page, changed);
       await expect.poll(() => contents(changed)).toBe(expected);
       await expect(page.getByTestId("revision-pending")).toHaveText("1");
       await saved(page);
@@ -189,22 +230,16 @@ test.describe("the single revision editor", () => {
       const accept = decision === "Accept";
       const file = accept ? beforePath : afterPath;
       const all = page.getByTestId(`revision-${decision.toLowerCase()}-all`);
-      const confirm = page.getByTestId("revision-base-confirm");
-      await openReview(page, request, { beforePath, afterPath });
-      await all.click();
-      await expect(confirm).toBeVisible();
-      await page.keyboard.press("Escape");
-      await expect(page.getByTestId("revision-file-status")).toHaveText(
-        "No file",
+      await openReview(
+        page,
+        request,
+        { beforePath, afterPath },
+        { autosave: file },
       );
       expect(contents(beforePath)).toBe(oldText);
       expect(contents(afterPath)).toBe(newText);
 
       await all.click();
-      await page
-        .getByTestId(accept ? "revision-base-old" : "revision-base-new")
-        .click();
-      await confirm.click();
       await expect.poll(() => contents(file)).toBe(accept ? newText : oldText);
       await expect(page.getByTestId("revision-pending")).toBeEmpty();
       await saved(page);
@@ -219,13 +254,16 @@ test.describe("the single revision editor", () => {
     request,
   }) => {
     const { beforePath, afterPath } = compareFiles();
-    await openReview(page, request, { beforePath, afterPath });
+    await openReview(
+      page,
+      request,
+      { beforePath, afterPath },
+      { autosave: afterPath },
+    );
     const next = page.getByTestId("revision-next-change");
     const modifier = process.platform === "darwin" ? "Meta" : "Control";
     await next.click();
     await page.keyboard.press(`${modifier}+Alt+A`);
-    await page.getByTestId("revision-base-new").click();
-    await page.getByTestId("revision-base-confirm").click();
     await expect(page.getByTestId("revision-pending")).toHaveText("1");
     expect(contents(afterPath)).toBe(newText);
 
@@ -247,14 +285,17 @@ test.describe("the single revision editor", () => {
     const after = newText + same;
     const beforePath = writeProjectFile(project, "before.md", before);
     const afterPath = writeProjectFile(project, "after.md", after);
-    await openReview(page, request, { beforePath, afterPath });
-    await page.getByTestId("revision-suggest").click();
+    await openReview(
+      page,
+      request,
+      { beforePath, afterPath },
+      { autosave: afterPath },
+    );
+    await selectMode(page, "suggest");
     await selectRichText(page, "original");
     await page.keyboard.type("updated");
     await expect(page.getByTestId("revision-pending")).toHaveText("3");
     await page.getByTestId("revision-accept-all").click();
-    await page.getByTestId("revision-base-new").click();
-    await page.getByTestId("revision-base-confirm").click();
     await expect
       .poll(() => contents(afterPath))
       .toBe(after.replace("original", "updated"));
@@ -265,41 +306,59 @@ test.describe("the single revision editor", () => {
     await expect(page.getByTestId("revision-pending")).toHaveText("3");
   });
 
-  test("canceling a decision does not choose a file; a new copy can start from either input", async ({
+  test("review-only decisions persist without writing either input or opening a file chooser", async ({
     page,
     request,
   }) => {
     const { beforePath, afterPath } = compareFiles();
-    await openReview(page, request, { beforePath, afterPath });
-    const output = path.join(project, "selected.md");
+    const id = await openReview(page, request, { beforePath, afterPath });
     await page.getByTestId(keep).first().click();
-    const confirm = page.getByTestId("revision-base-confirm");
-    await expect(confirm).toBeVisible();
-    await page.getByTestId("revision-base-copy").click();
-    await page.getByTestId("revision-base-path").fill(output);
-    await page.keyboard.press("Escape");
-    await expect(confirm).toBeHidden();
-    await expect(page.getByTestId("revision-file-status")).toHaveText(
-      "No file",
-    );
-    await expect(page.getByTestId("revision-pending")).toHaveText("2");
-    expect(contents(output)).toBeNull();
-
-    await page.getByTestId(revert).first().click();
-    await page.getByTestId("revision-base-copy").click();
-    await page.getByTestId("revision-copy-seed-new").click();
-    await page.getByTestId("revision-base-path").fill(output);
-    await confirm.click();
-    await expect(page.getByTestId("revision-path")).toHaveText(output);
+    await expect(page.getByTestId("revision-pending")).toHaveText("1");
+    await saved(page);
     await expect
-      .poll(() => contents(output))
-      .toBe(newText.replace("blue", "red"));
+      .poll(async () =>
+        Object.keys((await readReview(request, id)).draft?.decisions ?? {}),
+      )
+      .toHaveLength(1);
+    await page.reload();
     await expect(page.getByTestId("revision-pending")).toHaveText("1");
     expect(contents(beforePath)).toBe(oldText);
     expect(contents(afterPath)).toBe(newText);
   });
 
-  test("Save As keeps the current contents and sends later undo and redo to the copy", async ({
+  for (const seed of ["old", "new"] as const) {
+    test(`an agent-selected copy starts from ${seed} without changing either input`, async ({
+      page,
+      request,
+    }) => {
+      const { beforePath, afterPath } = compareFiles();
+      const output = path.join(project, `selected-${seed}.md`);
+      await openReview(
+        page,
+        request,
+        { beforePath, afterPath },
+        { autosave: output, autosaveBase: seed },
+      );
+      expect(contents(output)).toBe(seed === "old" ? oldText : newText);
+      await page
+        .getByTestId(seed === "old" ? keep : revert)
+        .first()
+        .click();
+      await expect
+        .poll(() => contents(output))
+        .toBe(
+          seed === "old"
+            ? oldText.replace("red", "blue")
+            : newText.replace("blue", "red"),
+        );
+      await destination(page, output);
+      await expect(page.getByTestId("revision-pending")).toHaveText("1");
+      expect(contents(beforePath)).toBe(oldText);
+      expect(contents(afterPath)).toBe(newText);
+    });
+  }
+
+  test("an agent-selected autosave copy receives edits, undo, and redo while preserving the source", async ({
     page,
     request,
   }) => {
@@ -309,20 +368,19 @@ test.describe("the single revision editor", () => {
       "Original wording.\n",
     );
     const output = path.join(project, "copy.md");
-    await openReview(page, request, { targetPath: filename });
+    await openReview(
+      page,
+      request,
+      { targetPath: filename },
+      { autosave: output },
+    );
     await selectRichText(page, "Original");
     await page.keyboard.type("Updated");
-    await expect.poll(() => contents(filename)).toBe("Updated wording.\n");
-    await saved(page);
-
-    await page.getByTestId("revision-save-as").click();
-    await page.getByTestId("revision-output").fill(output);
-    await page.getByTestId("revision-save-confirm").click();
-    await expect(page.getByTestId("revision-path")).toHaveText(output);
-    expect(contents(output)).toBe("Updated wording.\n");
+    await expect.poll(() => contents(output)).toBe("Updated wording.\n");
+    await destination(page, output);
     await page.getByTestId("revision-undo").click();
     await expect.poll(() => contents(output)).toBe("Original wording.\n");
-    expect(contents(filename)).toBe("Updated wording.\n");
+    expect(contents(filename)).toBe("Original wording.\n");
     await page.getByTestId("revision-redo").click();
     await expect.poll(() => contents(output)).toBe("Updated wording.\n");
     await saved(page);
@@ -333,7 +391,12 @@ test.describe("the single revision editor", () => {
     request,
   }) => {
     const { beforePath, afterPath } = compareFiles();
-    const id = await openReview(page, request, { beforePath, afterPath });
+    const id = await openReview(
+      page,
+      request,
+      { beforePath, afterPath },
+      { handoff: "button" },
+    );
     await page.getByTestId("revision-send").click();
     await page
       .getByTestId("revision-feedback")
@@ -348,13 +411,7 @@ test.describe("the single revision editor", () => {
       comment: "Please check the terminology.",
     });
     await page.getByTestId(keep).first().click();
-    await page.getByTestId("revision-base-copy").click();
-    const output = path.join(project, "after-feedback.md");
-    await page.getByTestId("revision-base-path").fill(output);
-    await page.getByTestId("revision-base-confirm").click();
-    await expect
-      .poll(() => contents(output))
-      .toBe(oldText.replace("red", "blue"));
+    await expect(page.getByTestId("revision-pending")).toHaveText("1");
     await saved(page);
     expect((await readReview(request, id)).feedback).toEqual(feedback);
     expect(contents(beforePath)).toBe(oldText);
@@ -450,7 +507,7 @@ test.describe("the single revision editor", () => {
         { raw, scroll, target },
       );
     const original = await locate(false, true);
-    await page.getByTestId("revision-suggest").click();
+    await selectMode(page, "suggest");
     expect(await locate(false, false)).toEqual(original);
     await page.getByTestId("revision-format").click();
     await expect(page.getByTestId("revision-markdown")).toBeVisible();
@@ -476,11 +533,13 @@ test.describe("the single revision editor", () => {
     request,
   }) => {
     const { beforePath, afterPath } = compareFiles();
-    const id = await openReview(page, request, { beforePath, afterPath });
-    await page.getByTestId("revision-save-as").click();
-    await page.getByTestId("revision-base-new").click();
-    await page.getByTestId("revision-base-confirm").click();
-    await expect(page.getByTestId("revision-path")).toHaveText(afterPath);
+    const id = await openReview(
+      page,
+      request,
+      { beforePath, afterPath },
+      { autosave: afterPath },
+    );
+    await destination(page, afterPath);
     await page
       .getByTestId(/^comment-rail-.*-action-reply$/)
       .first()
@@ -512,13 +571,13 @@ test.describe("the single revision editor", () => {
     expect(contents(beforePath)).toBe(oldText);
   });
 
-  test("an external edit pauses writes and Save As recovers the local changes", async ({
+  test("an external edit pauses writes and the agent can recover local changes into a copy", async ({
     page,
     request,
   }) => {
     const filename = writeProjectFile(project, "notes.md", "Original\n");
     const copy = path.join(project, "recovered.md");
-    await openReview(page, request, { targetPath: filename });
+    const id = await openReview(page, request, { targetPath: filename });
     await selectRichText(page, "Original");
     fs.writeFileSync(filename, "External revision\n");
     await page.keyboard.type("My draft");
@@ -531,16 +590,13 @@ test.describe("the single revision editor", () => {
     await expect(richTextEditor(page)).toContainText("My draft");
     expect(contents(filename)).toBe("External revision\n");
 
-    await page.getByTestId("revision-save-as").click();
-    await page.getByTestId("revision-output").fill(copy);
-    await page.getByTestId("revision-save-confirm").click();
-    await expect(page.getByTestId("revision-path")).toHaveText(copy);
+    await recoverCopy(page, request, id, copy);
     await saved(page);
     expect(contents(copy)).toBe("My draft\n");
     expect(contents(filename)).toBe("External revision\n");
   });
 
-  test("a stale tab preserves its own edits across reload without overwriting the saved file", async ({
+  test("a stale tab preserves its edits, suggestions, and comments for the agent without overwriting the saved file", async ({
     page,
     request,
     context,
@@ -550,40 +606,87 @@ test.describe("the single revision editor", () => {
     await expect(richTextEditor(page)).toHaveText("Original");
     const second = await context.newPage();
     await second.goto(`/?comparison=${id}`);
-    await selectRichText(second, "Original");
-    await second.keyboard.type("Saved by the second tab");
-    await expect.poll(() => contents(file)).toBe("Saved by the second tab\n");
+    let releaseSave = () => {};
+    const delayedSave = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    const saveRoute = `**/api/comparisons/${id}/save`;
+    await page.route(saveRoute, async (route) => {
+      await delayedSave;
+      await route.continue();
+    });
 
     await selectRichText(page, "Original");
-    await page.keyboard.type("Unsaved from the first tab");
+    await page.keyboard.insertText("Unsaved from the first tab");
+    await selectMode(page, "suggest");
+    await selectRichText(page, "first");
+    await page.keyboard.insertText("recovered");
+    await expect(page.getByTestId("revision-pending")).toHaveText("1");
+    await page
+      .getByTestId(/^comment-rail-.*-action-reply$/)
+      .first()
+      .click();
+    const reply = page.getByTestId(/^comment-rail-.*-editor$/);
+    const comment = "Keep this note from the stale tab";
+    await reply.fill(comment);
+    await reply.press("Control+Enter");
+    const rail = page.getByTestId("document-review-rail");
+    await expect(rail).toContainText(comment);
+    await selectRichText(second, "Original");
+    await second.keyboard.insertText("Saved by the second tab");
+    await expect.poll(() => contents(file)).toBe("Saved by the second tab\n");
+    releaseSave();
     await expect(page.getByTestId("revision-conflict")).toContainText(
       "another browser",
     );
+    await page.unroute(saveRoute);
     await page.reload();
-    await expect(richTextEditor(page)).toHaveText("Unsaved from the first tab");
+    await expect(richTextEditor(page)).toContainText("Unsaved from the");
+    await expect(page.getByTestId("revision-pending")).toHaveText("1");
+    await expect(rail).toContainText(comment);
     await expect(page.getByTestId("revision-conflict")).toContainText(
       "another browser",
     );
     expect(contents(file)).toBe("Saved by the second tab\n");
 
-    const copy = path.join(project, "recovered.md");
-    await page.getByTestId("revision-save-as").click();
-    await page.getByTestId("revision-output").fill(copy);
-    await page.getByTestId("revision-save-confirm").click();
-    await expect(page.getByTestId("revision-path")).toHaveText(copy);
+    await expect(page.getByTestId("revision-recover")).toBeVisible();
+    await page.getByTestId("revision-recover").click();
     await expect
-      .poll(() => contents(copy))
-      .toBe("Unsaved from the first tab\n");
+      .poll(() => new URL(page.url()).searchParams.get("comparison"))
+      .not.toBe(id);
+    const recoveredId = new URL(page.url()).searchParams.get("comparison");
+    if (!recoveredId)
+      throw new Error("The recovered review URL is missing its ID");
+    await saved(page);
+    await expect(page.getByTestId("revision-pending")).toHaveText("1");
+    await expect(rail).toContainText(comment);
+    const recovered = await readReview(request, recoveredId);
+    expect(recovered.draft?.markdown).toContain("{~~first~>recovered~~}");
+    expect(recovered.reviewComments?.map((item) => item.content)).toEqual([
+      comment,
+    ]);
+    const originalResponse = await request.get(`${api}/${id}`, {
+      headers: fixtureHeaders,
+    });
+    await expect(originalResponse).toBeOK();
+    expect((await originalResponse.json()).recoveredReviews).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: recoveredId })]),
+    );
     expect(contents(file)).toBe("Saved by the second tab\n");
-    expect(new URL(page.url()).searchParams.get("comparison")).not.toBe(id);
     await second.reload();
-    await expect(second.getByTestId("revision-path")).toHaveText(file);
+    await destination(second, file);
     await expect(richTextEditor(second)).toHaveText("Saved by the second tab");
     await page.reload();
-    await expect(page.getByTestId("revision-path")).toHaveText(copy);
-    await selectRichText(page, "Unsaved from the first tab");
-    await page.keyboard.type("Editing the copy");
-    await expect.poll(() => contents(copy)).toBe("Editing the copy\n");
+    await expect(rail).toContainText(comment);
+    await expect(page.getByTestId("revision-pending")).toHaveText("1");
+    await selectMode(page, "edit");
+    await selectRichText(page, "Unsaved");
+    await page.keyboard.insertText("Preserved");
+    await expect
+      .poll(
+        async () => (await readReview(request, recoveredId)).draft?.markdown,
+      )
+      .toContain("Preserved from the");
     expect(contents(file)).toBe("Saved by the second tab\n");
   });
 
@@ -608,7 +711,7 @@ test.describe("the single revision editor", () => {
     await richTextEditor(page)
       .getByRole("link", { name: "Second file" })
       .click();
-    await expect(page.getByTestId("revision-path")).toHaveText(second);
+    await destination(page, second);
     await expect(richTextEditor(page)).toContainText("Linked document");
     expect(contents(first)).toBe(
       `Edited.\n\n[Second file](second.md)\n\n${body}\n`,
@@ -634,11 +737,14 @@ test.describe("the single revision editor", () => {
     }) => {
       const beforePath = writeProjectFile(project, "before.md", original);
       const afterPath = writeProjectFile(project, "after.md", proposed);
-      await openReview(page, request, { beforePath, afterPath });
+      await openReview(
+        page,
+        request,
+        { beforePath, afterPath },
+        { autosave: beforePath },
+      );
       await page.getByTestId(keep).first().click();
-      await page.getByTestId("revision-base-old").click();
-      await page.getByTestId("revision-base-confirm").click();
-      await expect(page.getByTestId("revision-path")).toHaveText(beforePath);
+      await destination(page, beforePath);
       await expect.poll(() => contents(beforePath)).toBe(expected ?? proposed);
       expect(contents(afterPath)).toBe(proposed);
     });
@@ -649,7 +755,12 @@ test.describe("the single revision editor", () => {
     request,
   }) => {
     const file = writeProjectFile(project, "mode.md", "Original\n");
-    const id = await openReview(page, request, { targetPath: file });
+    const id = await openReview(
+      page,
+      request,
+      { targetPath: file },
+      { handoff: "button" },
+    );
     await expect(richTextEditor(page)).toHaveText("Original");
     await page.clock.install();
     await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1000);

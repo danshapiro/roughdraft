@@ -13,7 +13,7 @@ Or install and open a file yourself:
 
 ```bash
 npm i -g roughdraft
-roughdraft edit /absolute/path/to/file.md --no-watch
+roughdraft edit /absolute/path/to/file.md
 ```
 ## What is this?
 Roughdraft is a local-first markdown editor and viewer that runs on your computer.
@@ -35,30 +35,34 @@ Roughdraft edits one Markdown document at a time, with optional comments, sugges
 ## Open the editor
 
 ```bash
-roughdraft edit ./draft.md --no-watch
-roughdraft edit --no-watch  # start an untitled draft
+roughdraft edit ./draft.md
+roughdraft edit --autosave none  # start a draft without writing a file
 ```
 
-Roughdraft starts its local server if needed. Use `--no-open` on a headless machine. Without `--no-watch`, the command prints the URL and waits for **Send feedback**.
+Roughdraft starts its local server if needed, prints the review URL and ID, and returns immediately. Use `--no-open` on a headless machine. Tell your agent in chat when you are ready for it to read your feedback.
 
 - **Edit** puts your typing in the document. **Suggest** marks proposed wording inline. **Keep** adds a suggestion to the document; **Revert** discards it. Switch between Edit and Suggest without leaving the page.
-- Edits and **Keep**/**Revert** changes save automatically to the full path in the toolbar. **Save As** copies the current text and continues editing the copy. It asks before replacing a file. If a file changes on disk, Roughdraft pauses saving so you can inspect it or save your work elsewhere.
-- **Copy Markdown** and **Download Markdown** use the same Markdown as autosave. Pending suggestions and comments stay in the review. Use **Markdown** to see exactly what would be exported and **Formatted** to return to editing.
-- **Undo** and **Redo** cover document edits and Keep/Revert choices while the editor stays open, including after a save. Comment history is separate. The draft and submitted comments survive reopening.
+- Your agent chooses the autosave file before opening a review, or chooses `none` to keep edits in the review without writing a Markdown file. **Review details** shows the full source paths and save destination. A quiet check indicates saved work; saving failures remain visible. If a file changes on disk, Roughdraft preserves your draft and pauses file writes. If another browser changes the review, **Preserve this review** saves your complete feedback separately for the agent, without writing a Markdown file.
+- **Copy Markdown** and **Download Markdown** use the same Markdown as autosave. Pending suggestions and comments stay in the review. Use the **Markdown** icon to see exactly what would be exported; toggle it again to return to formatted editing.
+- **Undo** and **Redo** cover document edits and Keep/Revert choices while the editor stays open, including after a save. Comment history is separate. Edits and comment drafts save as you type and survive reopening. Cancel restores a comment to its text before editing.
 
 ## Review file changes
 
-A comparison shows inline highlights and **Keep**/**Revert** cards in the same editor. **Keep** chooses New for that passage; **Revert** chooses Old. Everything else stays as it was in the chosen file. You can read, comment, and suggest before choosing a file. On your first decision or when you click **Edit**, pick either writable input or make a copy. A copy starts from Old unless you choose New.
+A comparison shows inline highlights and **Keep**/**Revert** cards in the same editor. **Keep** chooses the revised wording for that passage; **Revert** chooses the original wording. The agent selects the save destination, so reading, commenting, suggesting, editing, and decisions need no file-selection step. With `--autosave none`, all of that stays in the saved review and neither input file changes.
 
 | What you want to review | Command |
 | --- | --- |
-| A proposed update | `roughdraft propose AGENTS.md --after AGENTS.proposed.md` |
-| Changes already made | `roughdraft review AGENTS.md --before AGENTS.before.md` |
-| Any two versions | `roughdraft compare BEFORE.md AFTER.md` |
+| A proposed update | `roughdraft propose AGENTS.md --after AGENTS.proposed.md --title "Review the agent working instructions" --autosave AGENTS.md` |
+| Changes already made | `roughdraft review AGENTS.md --before AGENTS.before.md --title "Review the updated agent instructions" --autosave AGENTS.md` |
+| Any two versions, without writing either | `roughdraft compare BEFORE.md AFTER.md --title "Compare the product page revisions" --before-label Original --after-label Revised --autosave none` |
 
-Use `roughdraft snapshot AGENTS.md --out AGENTS.before.md` before making changes you plan to review. A snapshot preserves the exact bytes and won't overwrite an existing snapshot.
+Use `roughdraft snapshot AGENTS.md --out AGENTS.before.md` before making changes you plan to review. A snapshot preserves the exact bytes and won't overwrite an existing snapshot. A new autosave output starts from the revised version; use `--autosave-base old` to start from the original. Existing unrelated output files are never replaced implicitly.
 
-**Send feedback** sends a snapshot and submitted comments without saving or authorizing an agent to write a file. `--json` prints the review URL and ID, then `comparison.completed` with `comparison.feedback`. Check `feedback.saved` to tell whether the sent Markdown matches the destination. `completion.fileWritten` is false because Send itself does not write. Agents should reread the destination before any separately authorized edits. Use `--timeout SECONDS` to change the 30-minute wait. A timeout is not approval. `roughdraft comparison ID` reopens a saved review and waits for the next Send feedback. Add `--no-watch` to inspect the existing review without waiting. Feedback from a recovered copy returns the copy’s path and review ID.
+Agents should always provide a title understandable to someone new to the project and an explicit `--autosave PATH` or `--autosave none`. Keep the review request in chat. Friendly version labels appear in the header; full paths are available on hover and through keyboard-accessible **Review details**.
+
+When the user returns to chat, read the current saved review with `roughdraft comparison ID --read --json`. This returns `comparison.read` with the complete review, including its latest `draft`, `reviewComments`, decisions, save destination, and current file state. Preserved copies are included in `recoveredReviews`. It opens no browser, waits for no button, and freezes no snapshot. Reread the destination before any separately authorized changes; reading feedback does not imply approval to apply suggestions.
+
+Integrations that need a button can explicitly pass `--watch`. Those reviews show **Send feedback**, which freezes a snapshot and returns `comparison.completed` with `comparison.feedback`. Sending does not itself write a Markdown file. Use `--timeout SECONDS` to change the 30-minute wait; a timeout is not approval. `roughdraft comparison ID --watch` reopens a review for this button flow. Older saved waiting sessions retain their button.
 
 Older comparison links still open their original review. `roughdraft open` and `roughdraft mcp` continue to support the original inline CriticMarkup workflow for tools that use it.
 
@@ -148,7 +152,12 @@ roughdraft <path>
 Commands:
 
 ```text
-open <path>        Open one Markdown file and wait for Done Reviewing
+edit [path]        Open the editor; return the review URL and ID
+review <path>      Review edits against --before SNAPSHOT
+propose <path>     Review proposed text from --after PROPOSED
+compare <a> <b>    Compare two versions
+comparison <id>    Reopen a review; --read --json retrieves feedback
+open <path>        Open an inline CriticMarkup session; wait for Done Reviewing
 start              Start or reuse the background server
 status             Show server status
 stop               Stop the managed background server

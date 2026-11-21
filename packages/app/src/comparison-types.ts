@@ -33,6 +33,11 @@ export interface ComparisonReviewData {
   title: string;
   beforeLabel: string;
   afterLabel: string;
+  beforePath?: string | null;
+  afterPath?: string | null;
+  autosave?: string;
+  handoff?: "chat" | "button";
+  recoveredReviews?: ComparisonReviewData[];
   targetPath: string | null;
   beforeText: string;
   afterText: string;

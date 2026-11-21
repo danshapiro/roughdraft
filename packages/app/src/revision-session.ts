@@ -5,9 +5,10 @@ import type {
   ComparisonReviewData,
   EditorDraft,
 } from "./comparison-types";
+import { equalRevisionDraft as equalDraft } from "./revision-draft";
 import { cleanRevisionMarkdown } from "./revision-markdown";
 
-export class RevisionRequestError extends Error {
+class RevisionRequestError extends Error {
   constructor(
     message: string,
     readonly status: number,
@@ -16,10 +17,8 @@ export class RevisionRequestError extends Error {
   }
 }
 
-export async function revisionRequest<T>(
-  path: string,
-  body?: object,
-): Promise<T> {
+async function revisionRequest<T>(path: string, body?: object): Promise<T> {
+  const serialized = body === undefined ? undefined : JSON.stringify(body);
   const response = await fetch(
     browserPath(`/api/comparisons${path}`),
     body === undefined
@@ -27,7 +26,13 @@ export async function revisionRequest<T>(
       : {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: serialized,
+          // Small pending reviews can finish syncing when the tab closes.
+          // Larger drafts retain normal fetch and browser recovery; keepalive
+          // has a browser-wide quota of 64 KiB for outstanding request bodies.
+          keepalive:
+            document.visibilityState === "hidden" &&
+            new TextEncoder().encode(serialized).byteLength <= 60 * 1024,
         },
   );
   const data = await response.json();
@@ -53,16 +58,6 @@ function storedDraft(review: ComparisonReviewData): RevisionDraft | null {
   return review.draft
     ? { ...review.draft, reviewComments: review.reviewComments ?? [] }
     : null;
-}
-
-function equalDraft(a: RevisionDraft, b: RevisionDraft | null | undefined) {
-  return Boolean(
-    b &&
-      a.markdown === b.markdown &&
-      a.cleanMarkdown === b.cleanMarkdown &&
-      JSON.stringify(a.decisions) === JSON.stringify(b.decisions) &&
-      JSON.stringify(a.reviewComments) === JSON.stringify(b.reviewComments),
-  );
 }
 
 interface BrowserRecovery {
@@ -220,7 +215,7 @@ export function useRevisionSession(
 
   const run = useCallback(
     (
-      action: "sync" | "base" | "save" | "send",
+      action: "sync" | "base" | "save" | "send" | "recover",
       snapshot: RevisionDraft,
       fields?: object,
     ) => {
@@ -229,9 +224,9 @@ export function useRevisionSession(
           return server.current;
         if (stale.current) {
           if (action === "sync") return server.current;
-          if (action !== "save")
+          if (action !== "save" && action !== "recover")
             throw new Error(
-              "This review changed in another browser. Save As to preserve your version.",
+              "This review changed in another browser. Preserve this review separately before continuing.",
             );
         }
         const current = server.current;
@@ -247,7 +242,7 @@ export function useRevisionSession(
             ? saveFile
               ? "save"
               : "draft"
-            : action === "save" && stale.current
+            : action === "recover" || (action === "save" && stale.current)
               ? "fork"
               : action;
         if (
@@ -271,6 +266,11 @@ export function useRevisionSession(
           );
           if (!fresh || fresh.revision === current.revision) return false;
           server.current = fresh;
+          // A closing page may finish this exact save after the replacement
+          // page reads its initial revision. Acknowledge it without mistaking
+          // our own completed request for another browser's different work.
+          if (action === "sync" && equalDraft(snapshot, storedDraft(fresh)))
+            return "acknowledged";
           stale.current = true;
           paused.current = true;
           if (mounted.current) {
@@ -285,26 +285,31 @@ export function useRevisionSession(
             next = await request(endpoint);
           } catch (error) {
             const changed = await checkReviewChanged(error);
-            if (!saveFile || changed) throw error;
-            // An outside write (or a failed filesystem write) stops automatic
-            // writes immediately. Try to preserve the unsaved work in the sidecar.
-            paused.current = true;
-            if (mounted.current) {
-              setWritePaused(true);
-              setRecoveryError(
-                error instanceof Error ? error.message : String(error),
-              );
-            }
-            try {
-              next = await request("draft");
-            } catch (draftError) {
-              await checkReviewChanged(draftError);
-              throw draftError;
+            if (changed === "acknowledged") {
+              next = server.current;
+            } else {
+              if (!saveFile || changed) throw error;
+              // An outside write (or a failed filesystem write) stops automatic
+              // writes immediately. Try to preserve the unsaved work in the sidecar.
+              paused.current = true;
+              if (mounted.current) {
+                setWritePaused(true);
+                setRecoveryError(
+                  error instanceof Error ? error.message : String(error),
+                );
+              }
+              try {
+                next = await request("draft");
+              } catch (draftError) {
+                const draftChanged = await checkReviewChanged(draftError);
+                if (draftChanged === "acknowledged") next = server.current;
+                else throw draftError;
+              }
             }
           }
           server.current = next;
           if (action === "base") latest.current = storedDraft(next) ?? snapshot;
-          if (action === "save" || action === "base") {
+          if (action === "save" || action === "base" || action === "recover") {
             paused.current = false;
             stale.current = false;
             storageIdentity.current.baseVersion = next.baseVersion ?? null;

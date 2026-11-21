@@ -6,7 +6,6 @@ import type {
 } from "@tiptap/pm/model";
 import { Plugin, PluginKey, TextSelection } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
-import type { ControlledDocumentReview } from "./controlled-review";
 import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import {
@@ -19,9 +18,10 @@ import {
   useRef,
   useState,
 } from "react";
-
-import { Button } from "./components/ui/button";
+import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
 import { CommentEditorList } from "./CommentEditorList";
+import { Button } from "./components/ui/button";
+import type { ControlledDocumentReview } from "./controlled-review";
 import {
   type CriticChangeAttrs,
   type CriticComment,
@@ -52,11 +52,10 @@ import {
   readCriticBlockChange,
   SUGGESTED_PARAGRAPH_SENTINEL,
 } from "./editor-extensions";
+import { LinkAffordances } from "./LinkAffordances";
 import { cn } from "./lib/utils";
 import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
-import { LinkAffordances } from "./LinkAffordances";
-import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
-import { toHtml, splitYamlDocumentMetadata } from "./markdown";
+import { splitYamlDocumentMetadata, toHtml } from "./markdown";
 import { resolveSuggestionsSource } from "./resolve-suggestion";
 import {
   applySuggestionDecisions,
@@ -2617,6 +2616,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
             )}
           {activeComments.length > 0 ? (
             <CommentEditorList
+              autosave={isEditableReview}
               comments={activeComments}
               readOnly={controlledReview?.disabled}
               className={fallbackClass}
@@ -2725,6 +2725,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
                 : undefined
           }
           testId="document-review-rail"
+          autosaveComments={isEditableReview}
           commentGroups={reviewCommentGroups}
           comments={comments}
           suggestions={reviewSuggestions}

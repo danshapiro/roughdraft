@@ -8,19 +8,77 @@
   padding: 6px 16px;
 }
 .revision-identity {
+  align-items: center;
+  display: flex;
   flex: 1 1 15rem;
+  gap: 4px;
   min-width: 0;
-  overflow-wrap: anywhere;
+}
+.revision-title-copy {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .revision-identity h1 {
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
+  line-height: 1.4;
   margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.revision-identity span {
+.revision-version-labels {
+  align-items: center;
   color: var(--muted-foreground);
-  display: block;
-  font-size: 10px;
+  display: flex;
+  font-size: 12px;
+  gap: 5px;
+  line-height: 1.5;
+  min-width: 0;
+}
+.revision-version-labels span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.revision-identity > button,
+.revision-tools button,
+.revision-mode-select,
+.revision-more-actions button {
+  min-height: 44px;
+  min-width: 44px;
+}
+.revision-identity .revision-file-status {
+  align-items: center;
+  color: var(--muted-foreground);
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 12px;
+}
+.revision-file-status svg {
+  height: 14px;
+  width: 14px;
+}
+.revision-mode-select {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 14px;
+  gap: 8px;
+  padding-inline: 10px;
+}
+.revision-details-list {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.revision-details-list dt {
+  font-weight: 600;
+}
+.revision-details-list dd {
+  color: var(--muted-foreground);
+  margin: 0 0 8px;
+  user-select: text;
 }
 .revision-tools,
 .revision-tool-group {
@@ -72,10 +130,6 @@
   line-height: 1.75;
 }
 
-.revision-identity .revision-file-status {
-  font-size: 12px;
-}
-
 .revision-more-actions .revision-tool-group {
   flex-wrap: wrap;
   gap: 8px;
@@ -96,29 +150,6 @@
 
   .revision-identity {
     flex: 1 1 100%;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 2px 8px;
-    align-items: center;
-  }
-
-  .revision-identity h1,
-  .revision-identity .revision-reference-label {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 14px;
-  }
-
-  .revision-identity .revision-reference-label {
-    grid-column: 1 / -1;
-    grid-row: 2;
-  }
-
-  .revision-identity .revision-file-status {
-    font-size: 14px;
-    grid-column: 2;
-    grid-row: 1;
   }
 
   .revision-tools {

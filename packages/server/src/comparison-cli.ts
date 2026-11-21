@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { CliDependencies } from "./cli.js";
+import { logServerEvent } from "./diagnostics.js";
 
 export const COMPARISON_COMMANDS = [
   "edit",
@@ -23,7 +24,13 @@ interface ComparisonResult {
     completedAt: string;
   } | null;
   editor?: "unified";
+  handoff?: "chat" | "button";
+  revision?: number;
   feedback?: { sentAt: string; saved: boolean } | null;
+  title?: string;
+  afterText?: string;
+  draft?: { markdown: string; decisions: Record<string, "kept"> } | null;
+  reviewComments?: unknown[];
   [key: string]: unknown;
 }
 interface ComparisonOptions {
@@ -31,12 +38,18 @@ interface ComparisonOptions {
   before?: string;
   after?: string;
   out?: string;
+  title?: string;
+  beforeLabel?: string;
+  afterLabel?: string;
+  autosave?: string;
+  autosaveBase?: string;
   port?: string;
   stateDir?: string;
   stateFile?: string;
   json: boolean;
   noOpen: boolean;
   noWatch: boolean;
+  read: boolean;
   help: boolean;
   timeout: number;
 }
@@ -71,12 +84,26 @@ export function printComparisonHelp(
     return;
   }
   log(
-    "Direct edits and Keep/Revert save to the selected file. Comments and pending suggestions stay in the review.",
+    "Opens a saved review and returns immediately. Tell the agent in chat when ready.",
   );
-  log(
-    "Send feedback returns a snapshot without writing or authorizing an agent to write.",
-  );
-  log("  --no-watch            Print the review URL and return immediately");
+  if (command === "comparison") {
+    log(
+      "  --read                Read the latest saved draft and comments without opening a browser",
+    );
+  } else {
+    log("  --title TEXT          Review title understandable to a new reader");
+    log("  --before-label TEXT   Friendly name for the previous version");
+    log("  --after-label TEXT    Friendly name for the updated version");
+    log(
+      "  --autosave PATH|none  Save edits to this Markdown file, or only save the review",
+    );
+    log(
+      "  --autosave-base old|new  Seed a new destination from this version (default new)",
+    );
+    log("edit FILE defaults autosave to FILE; other reviews default to none.");
+  }
+  log("  --watch               Wait for the user to press Send feedback");
+  log("  --no-watch            Return immediately (default)");
   log(
     "  --timeout SECONDS     Maximum wait (default 1800); timeout is not approval",
   );
@@ -88,7 +115,7 @@ export function printComparisonHelp(
   log("  --state-dir DIR       Directory containing the local server state");
   log("  --state-file FILE     Local server state file");
   log(
-    "Use `roughdraft comparison ID` to resume a saved review after a timeout.",
+    "Use `roughdraft comparison ID --read --json` to read saved edits, suggestions, and comments.",
   );
 }
 
@@ -97,7 +124,8 @@ function parseOptions(args: string[]): ComparisonOptions {
     positionals: [],
     json: false,
     noOpen: false,
-    noWatch: false,
+    noWatch: true,
+    read: false,
     help: false,
     timeout: 1800,
   };
@@ -105,6 +133,11 @@ function parseOptions(args: string[]): ComparisonOptions {
     ["--before", "before"],
     ["--after", "after"],
     ["--out", "out"],
+    ["--title", "title"],
+    ["--before-label", "beforeLabel"],
+    ["--after-label", "afterLabel"],
+    ["--autosave", "autosave"],
+    ["--autosave-base", "autosaveBase"],
     ["--port", "port"],
     ["--state-dir", "stateDir"],
     ["--state-file", "stateFile"],
@@ -119,6 +152,7 @@ function parseOptions(args: string[]): ComparisonOptions {
     else if (arg === "--no-open") options.noOpen = true;
     else if (arg === "--no-watch") options.noWatch = true;
     else if (arg === "--watch") options.noWatch = false;
+    else if (arg === "--read") options.read = true;
     else if (arg === "--help" || arg === "-h") options.help = true;
     else if (arg.startsWith("--")) {
       const separator = arg.indexOf("=");
@@ -229,6 +263,46 @@ function validateUsage(
     throw new Error("--after is only valid with propose.");
   if (options.out && command !== "snapshot")
     throw new Error("--out is only valid with snapshot.");
+  if (options.read && command !== "comparison")
+    throw new Error("--read is only valid with comparison ID.");
+  if (options.read && !options.noWatch)
+    throw new Error("Use either --read or --watch, not both.");
+  if (options.autosaveBase && !["old", "new"].includes(options.autosaveBase))
+    throw new Error("--autosave-base must be old or new.");
+  if (
+    (command === "snapshot" || command === "comparison") &&
+    [
+      options.title,
+      options.beforeLabel,
+      options.afterLabel,
+      options.autosave,
+      options.autosaveBase,
+    ].some((value) => value !== undefined)
+  )
+    throw new Error(
+      "Review metadata and autosave options are only valid when opening a new review.",
+    );
+}
+
+function autosavePath(cwd: string, value: string): string {
+  if (value === "none") return value;
+  const absolute = path.resolve(cwd, value);
+  if (path.extname(absolute).toLowerCase() !== ".md")
+    throw new Error("Autosave output must have a .md extension or be none.");
+  return absolute;
+}
+
+function printSavedReview(
+  comparison: ComparisonResult,
+  log: (message: string) => void,
+): void {
+  log(comparison.title || `Review ${comparison.id}`);
+  log(`Review ID: ${comparison.id}`);
+  log(`Draft:\n${comparison.draft?.markdown ?? comparison.afterText ?? ""}`);
+  log(
+    `Decisions:\n${JSON.stringify(comparison.draft?.decisions ?? {}, null, 2)}`,
+  );
+  log(`Comments:\n${JSON.stringify(comparison.reviewComments ?? [], null, 2)}`);
 }
 
 export async function runComparisonCommand(
@@ -312,6 +386,34 @@ export async function runComparisonCommand(
         beforePath: markdownPath(deps.cwd, input),
         afterPath: markdownPath(deps.cwd, options.positionals[1]),
       };
+    if (payload) {
+      Object.assign(payload, {
+        autosave: autosavePath(
+          deps.cwd,
+          options.autosave ??
+            (command === "edit" ? (payload.targetPath ?? "none") : "none"),
+        ),
+        handoff: options.noWatch ? "chat" : "button",
+        ...(options.title === undefined ? {} : { title: options.title }),
+        ...(options.beforeLabel === undefined
+          ? {}
+          : { beforeLabel: options.beforeLabel }),
+        ...(options.afterLabel === undefined
+          ? {}
+          : { afterLabel: options.afterLabel }),
+        ...(options.autosaveBase === undefined
+          ? {}
+          : { autosaveBase: options.autosaveBase }),
+      });
+    }
+    logServerEvent("comparison-cli", "review.request", {
+      command,
+      read: options.read,
+      watch: !options.noWatch,
+      handoff: payload?.handoff ?? null,
+      autosaveEnabled:
+        payload?.autosave !== undefined && payload.autosave !== "none",
+    });
     const connection = await connect(deps);
     const endpoint =
       command === "comparison"
@@ -319,12 +421,43 @@ export async function runComparisonCommand(
         : command === "edit"
           ? "/api/comparisons/document"
           : "/api/comparisons";
-    const opened = await request(
+    let opened = await request(
       deps,
       new URL(endpoint, connection.apiUrl),
       payload,
     );
+    if (options.read) {
+      logServerEvent("comparison-cli", "review.read", {
+        comparisonId: opened.id,
+        hasDraft: opened.draft != null,
+        commentCount: opened.reviewComments?.length ?? 0,
+      });
+      if (json)
+        deps.log(
+          JSON.stringify({
+            event: "comparison.read",
+            comparisonId: opened.id,
+            comparison: opened,
+          }),
+        );
+      else printSavedReview(opened, deps.log);
+      return 0;
+    }
     const reviewPath = `/api/comparisons/${encodeURIComponent(opened.id)}`;
+    if (
+      command === "comparison" &&
+      !options.noWatch &&
+      opened.handoff === "chat"
+    ) {
+      opened = await request(
+        deps,
+        new URL(`${reviewPath}/handoff`, connection.apiUrl),
+        {
+          revision: opened.revision,
+          handoff: "button",
+        },
+      );
+    }
     const freshFeedback = opened.editor === "unified";
     const watchUrl = new URL(
       freshFeedback ? `${reviewPath}/watch` : reviewPath,
@@ -357,6 +490,10 @@ export async function runComparisonCommand(
           })
         : url.toString(),
     );
+    logServerEvent("comparison-cli", "review.opened", {
+      comparisonId: opened.id,
+      watch: !options.noWatch,
+    });
     if (options.noWatch) return 0;
     const deadline = Date.now() + options.timeout * 1000;
     const awaitingFeedback = () =>
@@ -378,7 +515,7 @@ export async function runComparisonCommand(
           );
         else
           deps.error(
-            `No new feedback was received for ${opened.id}. Resume with roughdraft comparison ${opened.id}.`,
+            `No new feedback was received for ${opened.id}. Resume waiting with roughdraft comparison ${opened.id} --watch, or read saved feedback with --read.`,
           );
         return 1;
       }
@@ -424,6 +561,16 @@ export async function runComparisonCommand(
     );
     return 0;
   } catch (error) {
+    logServerEvent(
+      "comparison-cli",
+      "review.failed",
+      {
+        command,
+        error:
+          error instanceof Error ? error.message : "File comparison failed.",
+      },
+      "error",
+    );
     deps.error(
       error instanceof Error ? error.message : "File comparison failed.",
     );

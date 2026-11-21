@@ -5,8 +5,7 @@ import {
   undoDepth,
 } from "@tiptap/pm/history";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
-import { Plugin, PluginKey } from "@tiptap/pm/state";
-import { EditorState } from "@tiptap/pm/state";
+import { EditorState, Plugin, PluginKey } from "@tiptap/pm/state";
 import { DecorationSet } from "@tiptap/pm/view";
 import type { Editor } from "@tiptap/react";
 import {
@@ -15,6 +14,8 @@ import {
   Check,
   Copy,
   Download,
+  FileCode2,
+  Info,
   MessageSquare,
   MoreHorizontal,
   Redo2,
@@ -35,13 +36,20 @@ import {
   DialogFooter,
   DialogTitle,
 } from "./components/ui/dialog";
-import { Input } from "./components/ui/input";
-import { Textarea } from "./components/ui/textarea";
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from "./components/ui/popover";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectItemText,
+  SelectTrigger,
+  SelectValue,
+} from "./components/ui/select";
+import { Textarea } from "./components/ui/textarea";
 import {
   Tooltip,
   TooltipContent,
@@ -62,31 +70,31 @@ import {
   RichTextEditorSurface,
 } from "./PageCard";
 import {
-  acceptedDocument,
-  cleanRevisionMarkdown,
-  copyRevisionMarkdown,
-  downloadRevisionMarkdown,
-  editableMarkdownOptions,
-  createSourceSpellingPreserver,
-} from "./revision-markdown";
-import {
   applySuggestionDecisions,
   type ReviewDecision,
   reviewShortcut,
   reviewShortcutLabel,
 } from "./review-decisions";
+import { equalRevisionDraft } from "./revision-draft";
+import {
+  acceptedDocument,
+  cleanRevisionMarkdown,
+  copyRevisionMarkdown,
+  createSourceSpellingPreserver,
+  downloadRevisionMarkdown,
+  editableMarkdownOptions,
+} from "./revision-markdown";
 import { suggestionPositions } from "./revision-projection";
 import {
   type BaseSide,
-  type ReferenceChange,
   createReferenceComparison,
+  type ReferenceChange,
   referenceDecorations,
   revertReferenceChange,
 } from "./revision-reference";
 import {
   type InspectedDestination,
   type RevisionDraft,
-  RevisionRequestError,
   useRevisionSession,
 } from "./revision-session";
 import "./RevisionEditor.css";
@@ -241,13 +249,6 @@ function TipButton({
   );
 }
 
-type BaseAction =
-  | { kind: "edit" }
-  | { kind: "suggestion"; id: string; keep: boolean }
-  | { kind: "reference"; pairId: string; keep: boolean }
-  | { kind: "all"; decision: ReviewDecision };
-type BaseSelection = BaseSide | "copy";
-
 export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const seed = useMemo<RevisionDraft>(() => {
     const parsed = criticMarkdownToEditorState(initial.afterText);
@@ -284,19 +285,23 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   useEffect(() => {
     const preserve = () => {
       markdownFlushRef.current?.();
+      void flush().catch((error: unknown) => {
+        setActionError(error instanceof Error ? error.message : String(error));
+      });
     };
     const preserveWhenHidden = () => {
       if (document.visibilityState === "hidden") preserve();
     };
     document.addEventListener("visibilitychange", preserveWhenHidden);
     window.addEventListener("pagehide", preserve);
+    window.addEventListener("blur", preserve);
     return () => {
       document.removeEventListener("visibilitychange", preserveWhenHidden);
       window.removeEventListener("pagehide", preserve);
+      window.removeEventListener("blur", preserve);
     };
-  }, []);
-  const [source, setSource] = useState(draft);
-  const [editorGeneration, restartEditor] = useState(0);
+  }, [flush]);
+  const [source] = useState(draft);
   const commentHistory = useRef<{
     past: ComparisonReviewComment[][];
     future: ComparisonReviewComment[][];
@@ -367,19 +372,9 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     query.addEventListener("change", update);
     return () => query.removeEventListener("change", update);
   }, []);
-  const [saveAs, setSaveAs] = useState(false);
-  const [choosingBase, setChoosingBase] = useState(false);
-  const [baseChoice, setBaseChoice] = useState<BaseSelection>("copy");
-  const [copySeed, setCopySeed] = useState<BaseSide>("old");
-  const firstAction = useRef<BaseAction | null>(null);
-  const [afterBase, setAfterBase] = useState<{
-    action: BaseAction;
-    replacedEditor: Editor | null;
-  } | null>(null);
-  const [savePath, setSavePath] = useState("");
-  const [replace, setReplace] = useState<InspectedDestination | null>(null);
   const [disk, setDisk] = useState<InspectedDestination | null>(null);
   const [conflict, setConflict] = useState(initial.targetChanged);
+  const [preservedReview, setPreservedReview] = useState(false);
   const [sendOpen, setSendOpen] = useState(false);
   const [comment, setComment] = useState("");
   const [activeChange, setActiveChange] = useState<string | null>(null);
@@ -400,13 +395,21 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       : baseSide === "old"
         ? initial.afterText
         : initial.beforeText;
-  const referenceLabel =
-    baseSide === "old" ? initial.afterLabel : initial.beforeLabel;
   const sourcePath =
     destination ??
-    (initial.afterLabel.startsWith("/")
-      ? initial.afterLabel
-      : (initial.targetPath ?? ""));
+    (baseSide === "old" ? initial.beforePath : initial.afterPath) ??
+    initial.baseOptions?.[baseSide] ??
+    initial.targetPath ??
+    "";
+  const beforePath = initial.beforePath ?? initial.baseOptions?.old ?? null;
+  const afterPath = initial.afterPath ?? initial.baseOptions?.new ?? null;
+  const beforeLabel = initial.beforeLabel.startsWith("/")
+    ? pathLeaf(initial.beforeLabel)
+    : initial.beforeLabel;
+  const afterLabel = initial.afterLabel.startsWith("/")
+    ? pathLeaf(initial.afterLabel)
+    : initial.afterLabel;
+  const buttonHandoff = session.handoff !== "chat";
   const backend = useMemo(
     () =>
       new ApiBackend({
@@ -465,16 +468,6 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     [updateDraft],
   );
 
-  const chooseFile = useCallback((action: BaseAction | null = null) => {
-    firstAction.current = action;
-    setActionError("");
-    setReplace(null);
-    setSavePath("");
-    setBaseChoice("copy");
-    setCopySeed("old");
-    setChoosingBase(true);
-  }, []);
-
   const deciding = useCallback(
     (changeId: string, keep: boolean) => {
       const live = ownEditor.current;
@@ -482,12 +475,6 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       const change = referenceKey
         .getState(live.state)
         ?.find((item) => item.item.changeId === changeId);
-      if (!destination) {
-        if (change)
-          chooseFile({ kind: "reference", pairId: change.pairId, keep });
-        else chooseFile({ kind: "suggestion", id: changeId, keep });
-        return true;
-      }
       if (!change) return false;
       const leaveAsIs = keep === (baseSide === "new");
       const transaction = leaveAsIs
@@ -505,17 +492,13 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       }
       return true;
     },
-    [baseSide, chooseFile, destination],
+    [baseSide],
   );
 
   const decideAll = useCallback(
     (decision: ReviewDecision) => {
       const live = ownEditor.current;
       if (!live) return;
-      if (!destination) {
-        chooseFile({ kind: "all", decision });
-        return;
-      }
       const existing = new Set(kept(live.state.doc));
       const changes = (referenceKey.getState(live.state) ?? noChanges).filter(
         (change) =>
@@ -562,34 +545,8 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       setActiveChange(null);
       setActionError("");
     },
-    [baseSide, chooseFile, destination],
+    [baseSide],
   );
-
-  useEffect(() => {
-    if (!afterBase || !editor || editor === afterBase.replacedEditor) return;
-    const { action } = afterBase;
-    setAfterBase(null);
-    if (action.kind === "edit") {
-      setInteraction("editing");
-    } else if (action.kind === "suggestion") {
-      editor.view.dispatch(closeHistory(editor.state.tr));
-      const decided = action.keep
-        ? editor.commands.acceptCriticChange(action.id)
-        : editor.commands.rejectCriticChange(action.id);
-      if (!decided)
-        setActionError("The suggestion moved. Review it before deciding.");
-      editor.view.dispatch(closeHistory(editor.state.tr));
-    } else if (action.kind === "all") {
-      decideAll(action.decision);
-    } else {
-      const match = referenceKey
-        .getState(editor.state)
-        ?.find((change) => change.pairId === action.pairId);
-      if (match && !match.overlapsSuggestion)
-        deciding(match.item.changeId, action.keep);
-      else setActionError("The change moved. Review it before choosing again.");
-    }
-  }, [afterBase, decideAll, deciding, editor]);
 
   const renderedChanges = editor
     ? (referenceKey.getState(editor.state) ?? noChanges)
@@ -608,9 +565,6 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   }, [renderedChanges, decisions]);
   const decisionsDisabled =
     busy ||
-    choosingBase ||
-    Boolean(afterBase) ||
-    saveAs ||
     sendOpen ||
     Boolean(disk) ||
     conflict ||
@@ -664,11 +618,21 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     () => cleanRevisionMarkdown(session.savedText ?? ""),
     [session.savedText],
   );
-  const saved =
+  const persistedDraft = session.draft ?? seed;
+  const reviewSaved =
     !markdownQueued &&
-    destination !== null &&
-    destination === session.savedPath &&
-    markdown === cleanSaved &&
+    !recoveryPending &&
+    !recoveryError &&
+    equalRevisionDraft(draft, {
+      ...persistedDraft,
+      reviewComments: session.draft
+        ? (session.reviewComments ?? [])
+        : seed.reviewComments,
+    });
+  const saved =
+    reviewSaved &&
+    (!destination ||
+      (destination === session.savedPath && markdown === cleanSaved)) &&
     !writePaused &&
     !session.targetChanged;
   const filename = pathLeaf(destination ?? (sourcePath || "Untitled.md"));
@@ -706,150 +670,35 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
 
   const reportError = (error: unknown) =>
     setActionError(error instanceof Error ? error.message : String(error));
-  function showSaveAs() {
-    if (!destination && !reviewChanged) {
-      chooseFile(interaction === "suggesting" ? null : { kind: "edit" });
-      return;
-    }
-    setActionError("");
-    setSavePath("");
-    setReplace(null);
-    setSaveAs(true);
-  }
-
-  async function save(output?: InspectedDestination) {
-    if (!destination && !output) {
-      showSaveAs();
-      return;
-    }
+  async function preserveReview() {
     setBusy(true);
     setActionError("");
     try {
-      const snapshot = currentDraft();
-      await (output
-        ? run("save", snapshot, {
-            path: output.path,
-            expectedVersion: output.version,
-            baseVersion: session.baseVersion ?? null,
-          })
-        : run("sync", snapshot));
+      await run("recover", currentDraft(), {
+        autosave: "none",
+        baseVersion: session.baseVersion ?? null,
+      });
       setConflict(false);
-      setSaveAs(false);
+      setDisk(null);
+      setPreservedReview(true);
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function save() {
+    setBusy(true);
+    setActionError("");
+    try {
+      await run("sync", currentDraft());
+      setConflict(false);
     } catch (error) {
       if (
-        output &&
-        error instanceof RevisionRequestError &&
-        error.status === 409
-      ) {
-        setReplace(null);
-      }
-      if (
-        !output &&
         error instanceof Error &&
         error.message.includes("destination changed")
       )
         setConflict(true);
-      reportError(error);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function inspectAndSave() {
-    if (replace) {
-      await save(replace);
-      return;
-    }
-    setBusy(true);
-    setActionError("");
-    try {
-      const output = await inspect(savePath.trim());
-      if (output.path === destination)
-        throw new Error("Choose a different file for the copy.");
-      if (output.version === null) await save(output);
-      else setReplace(output);
-    } catch (error) {
-      reportError(error);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function selectBase() {
-    setBusy(true);
-    setActionError("");
-    try {
-      const side = baseChoice === "copy" ? copySeed : baseChoice;
-      const draft = currentDraft();
-      let snapshot = draft;
-      if (side !== baseSide && initial.mode !== "document") {
-        const live = ownEditor.current;
-        if (!live) throw new Error("The editor is still loading.");
-        const raw = side === "old" ? initial.beforeText : initial.afterText;
-        const cleanMarkdown = cleanRevisionMarkdown(raw);
-        let annotated = raw;
-        if (draft.markdown !== (draft.cleanMarkdown ?? draft.markdown)) {
-          const parsed = criticMarkdownToEditorState(
-            raw,
-            editableMarkdownOptions,
-          );
-          const target = live.schema.nodeFromJSON(acceptedDocument(parsed.doc));
-          let state = EditorState.create({ doc: live.state.doc });
-          const changes = createReferenceComparison(target)(state.doc).sort(
-            (a, b) => b.from - a.from || b.to - a.to,
-          );
-          for (const change of changes) {
-            const replacement = revertReferenceChange(state, change);
-            if (!replacement)
-              throw new Error(
-                "A pending suggestion overlaps this version. Start from New to keep the suggestion.",
-              );
-            state = state.apply(replacement);
-          }
-          annotated = editorStateToCriticMarkdown(
-            state.doc.toJSON(),
-            commentMap,
-            {
-              frontmatter: parsed.frontmatter,
-              endmatter: parsed.endmatter,
-            },
-          );
-          if (
-            canonical(cleanRevisionMarkdown(annotated)) !==
-            canonical(cleanMarkdown)
-          )
-            throw new Error(
-              "This version cannot carry the current annotations. Choose the other version or discard the overlapping suggestion first.",
-            );
-        }
-        snapshot = {
-          ...snapshot,
-          markdown: annotated,
-          cleanMarkdown,
-          decisions: {},
-        };
-      }
-      const chosen = await run("base", snapshot, {
-        choice: baseChoice,
-        ...(baseChoice === "copy" ? { path: savePath.trim(), seed: side } : {}),
-      });
-      setConflict(false);
-      setChoosingBase(false);
-      const replacedEditor = side !== baseSide ? ownEditor.current : null;
-      if (replacedEditor) {
-        const draftForEditor = chosen.draft
-          ? { ...chosen.draft, reviewComments: chosen.reviewComments ?? [] }
-          : snapshot;
-        exactClean.current =
-          draftForEditor.cleanMarkdown ?? draftForEditor.markdown;
-        preserveSource.current = null;
-        setSource(draftForEditor);
-        restartEditor((generation) => generation + 1);
-      }
-      if (firstAction.current)
-        setAfterBase({ action: firstAction.current, replacedEditor });
-      firstAction.current = null;
-    } catch (error) {
       reportError(error);
     } finally {
       setBusy(false);
@@ -875,29 +724,21 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "s")
         return;
       event.preventDefault();
-      if (
-        !busy &&
-        !saveAs &&
-        !choosingBase &&
-        !sendOpen &&
-        !disk &&
-        !writePaused
-      )
-        void save();
+      if (!busy && !sendOpen && !disk && !writePaused) void save();
     };
     document.addEventListener("keydown", onSave);
     return () => document.removeEventListener("keydown", onSave);
   });
 
   const fileState = saved
-    ? "Saved"
+    ? destination
+      ? "Saved to file"
+      : "Review saved"
     : conflict || session.targetChanged
       ? "File changed"
       : writePaused
         ? "Paused"
-        : destination
-          ? "Saving…"
-          : "No file";
+        : "Saving…";
   const secondaryTools = (
     <>
       <div
@@ -908,10 +749,13 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         <TipButton
           tip={
             formatted
-              ? "Show the Markdown that Save would write."
-              : "Return to the rendered editor."
+              ? "Show Markdown without pending suggestions or comments."
+              : "Show the formatted document."
           }
           data-testid="revision-format"
+          aria-label={formatted ? "Show Markdown" : "Show formatted document"}
+          aria-pressed={!formatted}
+          size="icon"
           variant="ghost"
           onClick={() => {
             setMoreOpen(false);
@@ -920,10 +764,10 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
             setFormatted(!formatted);
           }}
         >
-          {formatted ? "Markdown" : "Formatted"}
+          <FileCode2 aria-hidden="true" />
         </TipButton>
         <TipButton
-          tip="Copy the Markdown that Save would write."
+          tip="Copy Markdown without pending suggestions or comments."
           aria-label="Copy Markdown"
           data-testid="revision-copy"
           variant="ghost"
@@ -941,7 +785,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           {copied ? <Check /> : <Copy />}
         </TipButton>
         <TipButton
-          tip="Download the Markdown that Save would write."
+          tip="Download Markdown without pending suggestions or comments."
           aria-label="Download Markdown"
           data-testid="revision-download"
           variant="ghost"
@@ -957,41 +801,27 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           <Download />
         </TipButton>
       </div>
-      <div
-        className="revision-tool-group"
-        aria-label="Save and send"
-        role="group"
-      >
-        <TipButton
-          tip="Send a snapshot and comments to the agent. This does not write a file."
-          data-testid="revision-send"
-          variant="outline"
-          disabled={busy || reviewChanged}
-          onClick={() => {
-            setMoreOpen(false);
-            setActionError("");
-            setSendOpen(true);
-          }}
+      {buttonHandoff && (
+        <div
+          className="revision-tool-group"
+          aria-label="Send feedback"
+          role="group"
         >
-          Send feedback
-        </TipButton>
-        <TipButton
-          tip={
-            destination
-              ? "Copy the current Markdown and continue editing the copy."
-              : "Choose which Markdown file to edit."
-          }
-          data-testid="revision-save-as"
-          variant="ghost"
-          disabled={busy}
-          onClick={() => {
-            setMoreOpen(false);
-            showSaveAs();
-          }}
-        >
-          {destination || reviewChanged ? "Save As…" : "Choose a file"}
-        </TipButton>
-      </div>
+          <TipButton
+            tip="Send a snapshot and comments to the agent. This does not write a file."
+            data-testid="revision-send"
+            variant="outline"
+            disabled={busy || reviewChanged}
+            onClick={() => {
+              setMoreOpen(false);
+              setActionError("");
+              setSendOpen(true);
+            }}
+          >
+            Send feedback
+          </TipButton>
+        </div>
+      )}
     </>
   );
   return (
@@ -1002,69 +832,129 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         data-testid="revision-header"
       >
         <div className="revision-header-inner">
-          <div className="revision-identity">
-            <h1
-              data-testid="revision-path"
-              title={destination ?? "No file selected"}
-            >
-              {destination ?? "No file selected"}
-            </h1>
-            {reference !== null && (
-              <span className="revision-reference-label">
-                Comparing with {referenceLabel}
-              </span>
-            )}
+          <div className="revision-identity" data-testid="revision-identity">
+            <div className="revision-title-copy">
+              <h1 data-testid="revision-path" title={initial.title}>
+                {initial.title}
+              </h1>
+              {reference !== null && (
+                <div className="revision-version-labels">
+                  <span
+                    data-testid="revision-before-label"
+                    title={beforePath ?? beforeLabel}
+                  >
+                    {beforeLabel}
+                  </span>
+                  <span aria-hidden="true">→</span>
+                  <span
+                    data-testid="revision-after-label"
+                    title={afterPath ?? afterLabel}
+                  >
+                    {afterLabel}
+                  </span>
+                </div>
+              )}
+            </div>
+            <Popover>
+              <PopoverTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Review details"
+                    data-testid="revision-details"
+                    title="Review details and file paths"
+                  />
+                }
+              >
+                <Info aria-hidden="true" />
+              </PopoverTrigger>
+              <PopoverContent
+                align="start"
+                collisionPadding={8}
+                aria-label="Review details"
+                data-testid="revision-details-content"
+              >
+                <p className="mb-3 font-semibold">{initial.title}</p>
+                <dl className="revision-details-list">
+                  {reference !== null && (
+                    <>
+                      <dt>{beforeLabel}</dt>
+                      <dd data-testid="revision-details-before">
+                        {beforePath ?? "Text supplied by the agent"}
+                      </dd>
+                    </>
+                  )}
+                  <dt>{afterLabel}</dt>
+                  <dd data-testid="revision-details-after">
+                    {afterPath ?? "Text supplied by the agent"}
+                  </dd>
+                  <dt>Autosave</dt>
+                  <dd data-testid="revision-details-autosave">
+                    {destination ??
+                      "No Markdown file writes. Your review is saved for the agent."}
+                  </dd>
+                </dl>
+              </PopoverContent>
+            </Popover>
             <span
               className="revision-file-status"
               data-testid="revision-file-status"
+              role="status"
+              aria-label={fileState}
               title={
-                recoveryPending
-                  ? "Saving changes."
-                  : "Status of the selected Markdown file."
+                saved
+                  ? destination
+                    ? `Saved to ${destination}`
+                    : "Review saved for the agent. No Markdown file writes."
+                  : fileState
               }
             >
-              {fileState}
+              {saved ? <Check aria-hidden="true" /> : fileState}
             </span>
           </div>
           <div className="revision-tools">
-            <div
-              className="revision-tool-group"
-              aria-label="Editing mode"
-              role="group"
+            <Select<DocumentInteractionMode>
+              value={interaction}
+              onValueChange={(mode) => {
+                if (mode !== "editing" && mode !== "suggesting") return;
+                setInteraction(mode);
+                setBlocked(false);
+              }}
             >
-              <TipButton
-                tip="Write edits to the selected Markdown file automatically."
-                data-testid="revision-edit"
-                variant={
-                  destination && interaction === "editing"
-                    ? "secondary"
-                    : "ghost"
-                }
-                aria-pressed={Boolean(destination && interaction === "editing")}
-                onClick={() => {
-                  if (!destination) chooseFile({ kind: "edit" });
-                  else {
-                    setInteraction("editing");
-                    setBlocked(false);
-                  }
-                }}
-              >
-                Edit
-              </TipButton>
-              <TipButton
-                tip={
+              <SelectTrigger
+                data-testid="revision-mode"
+                aria-label="Editing mode"
+                className="revision-mode-select"
+                title={
                   blocked
-                    ? "Use Edit for this formatting or structural change."
-                    : "Propose wording that stays out of saved and exported Markdown until you Keep it."
+                    ? "Use Edit for formatting or structural changes."
+                    : "Edit directly or suggest changes for review."
                 }
-                data-testid="revision-suggest"
-                variant={interaction === "suggesting" ? "secondary" : "ghost"}
-                aria-pressed={interaction === "suggesting"}
-                onClick={() => setInteraction("suggesting")}
               >
-                Suggest
-              </TipButton>
-            </div>
+                <SelectValue>
+                  {interaction === "suggesting" ? "Suggest" : "Edit"}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem
+                  value="editing"
+                  label="Edit"
+                  data-testid="revision-mode-edit"
+                  className="min-h-11 text-sm"
+                >
+                  <SelectItemText>Edit</SelectItemText>
+                </SelectItem>
+                <SelectItem
+                  value="suggesting"
+                  label="Suggest"
+                  data-testid="revision-mode-suggest"
+                  className="min-h-11 text-sm"
+                >
+                  <SelectItemText>Suggest</SelectItemText>
+                </SelectItem>
+              </SelectContent>
+            </Select>
             <div
               className="revision-tool-group"
               aria-label="Document history"
@@ -1202,8 +1092,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         className="revision-page comparison-page"
         data-testid="revision-page"
       >
-        {(recoveryError ||
-          (actionError && !saveAs && !choosingBase && !sendOpen)) && (
+        {(recoveryError || (actionError && !sendOpen)) && (
           <p
             role="alert"
             className="comparison-error"
@@ -1219,22 +1108,36 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 ? "This review changed in another browser. Your edits are still here."
                 : "Autosave paused."}
             </strong>{" "}
+            {destination && (
+              <Button
+                variant="outline"
+                data-testid="revision-inspect"
+                onClick={() => void inspect().then(setDisk, reportError)}
+              >
+                Inspect file
+              </Button>
+            )}{" "}
             <Button
               variant="outline"
-              data-testid="revision-inspect"
-              onClick={() => void inspect().then(setDisk, reportError)}
+              data-testid="revision-recover"
+              disabled={busy}
+              onClick={() => void preserveReview()}
             >
-              Inspect file
+              Preserve this review
             </Button>{" "}
-            <Button variant="outline" onClick={showSaveAs}>
-              Save As
-            </Button>
+            Save your complete feedback separately for the agent, without
+            writing a Markdown file.
           </div>
+        )}
+        {preservedReview && (
+          <p role="status" data-testid="revision-recovered">
+            Your complete review is saved separately for the agent. Edits here
+            save in this review without writing a Markdown file.
+          </p>
         )}
         <div ref={documentRef}>
           <div hidden={!formatted}>
             <RichTextEditorSurface
-              key={editorGeneration}
               page={page}
               activeDocumentPath={sourcePath ? pathLeaf(sourcePath) : null}
               selected
@@ -1242,11 +1145,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               focusRequestKey={null}
               sourceMarkdown={source.markdown}
               onMarkdownChange={changeMarkdown}
-              interactionMode={
-                !destination && interaction === "editing"
-                  ? "viewing"
-                  : interaction
-              }
+              interactionMode={interaction}
               beforeNavigate={async () => {
                 try {
                   currentDraft();
@@ -1312,195 +1211,6 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         </div>
       </main>
       <Dialog
-        open={choosingBase}
-        onOpenChange={(open) => {
-          if (busy) return;
-          if (!open) firstAction.current = null;
-          setChoosingBase(open);
-        }}
-      >
-        <DialogContent data-testid="revision-base-dialog">
-          <DialogTitle>Choose a file</DialogTitle>
-          <DialogDescription className="sr-only">
-            Edits and review choices save to this file as you work.
-          </DialogDescription>
-          <form
-            className="grid gap-3"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void selectBase();
-            }}
-          >
-            <div role="group" aria-label="File to edit" className="grid gap-2">
-              {(["old", "new"] as const).map((side) => {
-                const filename = session.baseOptions?.[side];
-                if (!filename) return null;
-                return (
-                  <Button
-                    key={side}
-                    type="button"
-                    data-testid={`revision-base-${side}`}
-                    variant={baseChoice === side ? "secondary" : "outline"}
-                    aria-pressed={baseChoice === side}
-                    className="h-auto justify-start whitespace-normal break-all text-left"
-                    onClick={() => {
-                      setActionError("");
-                      setBaseChoice(side);
-                    }}
-                  >
-                    {side === "old" ? "Old" : "New"}: {filename}
-                  </Button>
-                );
-              })}
-              <Button
-                type="button"
-                data-testid="revision-base-copy"
-                variant={baseChoice === "copy" ? "secondary" : "outline"}
-                aria-pressed={baseChoice === "copy"}
-                className="justify-start"
-                onClick={() => {
-                  setActionError("");
-                  setBaseChoice("copy");
-                }}
-              >
-                {initial.mode === "document" ? "New file" : "New copy"}
-              </Button>
-            </div>
-            {baseChoice === "copy" && (
-              <>
-                {initial.mode !== "document" && (
-                  <div
-                    className="flex gap-2"
-                    role="group"
-                    aria-label="Start from"
-                  >
-                    {(["old", "new"] as const).map((side) => (
-                      <Button
-                        key={side}
-                        type="button"
-                        size="sm"
-                        data-testid={`revision-copy-seed-${side}`}
-                        variant={copySeed === side ? "secondary" : "outline"}
-                        aria-pressed={copySeed === side}
-                        onClick={() => setCopySeed(side)}
-                      >
-                        Start from {side === "old" ? "Old" : "New"}
-                      </Button>
-                    ))}
-                  </div>
-                )}
-                <label htmlFor="revision-base-path">New file path</label>
-                <Input
-                  id="revision-base-path"
-                  data-testid="revision-base-path"
-                  value={savePath}
-                  placeholder="/absolute/path/to/document.md"
-                  onChange={(event) => setSavePath(event.target.value)}
-                  autoComplete="off"
-                />
-              </>
-            )}
-            {actionError && (
-              <p
-                role="alert"
-                className="text-destructive"
-                data-testid="revision-base-error"
-              >
-                {actionError}
-              </p>
-            )}
-            <DialogFooter>
-              <Button
-                type="submit"
-                data-testid="revision-base-confirm"
-                title="Edits and review choices autosave to this file"
-                disabled={busy || (baseChoice === "copy" && !savePath.trim())}
-              >
-                {baseChoice === "copy" ? "Create file" : "Use this file"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-      <Dialog
-        open={saveAs}
-        onOpenChange={(open) => {
-          if (!busy) setSaveAs(open);
-        }}
-      >
-        <DialogContent>
-          <DialogTitle>Save As</DialogTitle>
-          <DialogDescription className="sr-only">
-            Copy this Markdown and continue editing the copy.
-          </DialogDescription>
-          <form
-            className="grid gap-3"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void inspectAndSave();
-            }}
-          >
-            <label htmlFor="revision-output">Destination path</label>
-            <Input
-              id="revision-output"
-              data-testid="revision-output"
-              value={savePath}
-              onChange={(event) => {
-                setSavePath(event.target.value);
-                setReplace(null);
-                setActionError("");
-              }}
-              placeholder="/absolute/path/to/document.md"
-              autoComplete="off"
-            />
-            {initial.mode === "compare" && (
-              <div className="flex flex-wrap gap-2">
-                {[...new Set([initial.beforeLabel, initial.afterLabel])]
-                  .filter((label) => label.startsWith("/"))
-                  .map((label) => (
-                    <Button
-                      variant="outline"
-                      key={label}
-                      type="button"
-                      title={label}
-                      onClick={() => {
-                        setSavePath(label);
-                        setReplace(null);
-                      }}
-                    >
-                      {pathLeaf(label)}
-                    </Button>
-                  ))}
-              </div>
-            )}
-            {replace && (
-              <p role="alert" data-testid="revision-replace">
-                Replace the existing file at{" "}
-                <span className="break-all">{replace.path}</span>?
-              </p>
-            )}
-            {actionError && (
-              <p
-                role="alert"
-                className="text-destructive"
-                data-testid="revision-save-error"
-              >
-                {actionError}
-              </p>
-            )}
-            <DialogFooter>
-              <Button
-                type="submit"
-                disabled={busy || !savePath.trim()}
-                data-testid="revision-save-confirm"
-              >
-                {replace ? "Replace file" : "Save Markdown"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-      <Dialog
         open={disk !== null}
         onOpenChange={(open) => {
           if (!open) setDisk(null);
@@ -1520,7 +1230,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         </DialogContent>
       </Dialog>
       <Dialog
-        open={sendOpen}
+        open={buttonHandoff && sendOpen}
         onOpenChange={(open) => {
           if (!busy) setSendOpen(open);
         }}

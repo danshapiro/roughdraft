@@ -100,7 +100,7 @@ describe("comparison CLI", () => {
     expect(
       await runComparisonCommand(
         "propose",
-        ["AGENTS.md", "--after", candidate, "--no-open", "--json"],
+        ["AGENTS.md", "--after", candidate, "--watch", "--no-open", "--json"],
         f.deps,
         false,
         f.connect,
@@ -113,6 +113,8 @@ describe("comparison CLI", () => {
       mode: "proposal",
       targetPath: target,
       afterPath: candidate,
+      autosave: "none",
+      handoff: "button",
     });
     expect(JSON.parse(f.logs.at(-1) ?? "{}")).toMatchObject({
       event: "comparison.completed",
@@ -142,6 +144,8 @@ describe("comparison CLI", () => {
       mode: "applied",
       targetPath: target,
       beforePath: before,
+      autosave: "none",
+      handoff: "chat",
     });
     expect(
       await runComparisonCommand(
@@ -157,6 +161,8 @@ describe("comparison CLI", () => {
       mode: "compare",
       beforePath: before,
       afterPath: target,
+      autosave: "none",
+      handoff: "chat",
     });
   });
 
@@ -170,7 +176,7 @@ describe("comparison CLI", () => {
     expect(
       await runComparisonCommand(
         "propose",
-        [target, "--after", candidate, "--timeout", "0", "--json"],
+        [target, "--after", candidate, "--watch", "--timeout", "0", "--json"],
         f.deps,
         false,
         f.connect,
@@ -208,7 +214,7 @@ describe("comparison CLI", () => {
     expect(
       await runComparisonCommand(
         "comparison",
-        ["durable", "--json"],
+        ["durable", "--watch", "--json"],
         f.deps,
         false,
         f.connect,
@@ -239,7 +245,7 @@ describe("comparison CLI", () => {
     expect(
       await runComparisonCommand(
         "comparison",
-        ["already-finished", "--json"],
+        ["already-finished", "--watch", "--json"],
         f.deps,
         false,
         f.connect,
@@ -250,6 +256,250 @@ describe("comparison CLI", () => {
     expect(JSON.parse(f.logs.at(-1) ?? "{}")).toMatchObject({
       completion: { fileWritten: false },
     });
+  });
+
+  it("opens a chat review with friendly metadata and an absolute autosave destination without waiting", async () => {
+    const f = fixture();
+    const before = file("before.md", "Before");
+    const after = file("after.md", "After");
+    f.fetchImpl.mockResolvedValueOnce(
+      Response.json({
+        id: "chat",
+        editor: "unified",
+        status: "open",
+        completion: null,
+      }),
+    );
+    expect(
+      await runComparisonCommand(
+        "compare",
+        [
+          before,
+          after,
+          "--title",
+          "Review the customer welcome guide",
+          "--before-label",
+          "Previous guide",
+          "--after-label",
+          "Updated guide",
+          "--autosave",
+          "reviewed.md",
+          "--autosave-base",
+          "old",
+          "--timeout",
+          "0",
+          "--json",
+        ],
+        f.deps,
+        false,
+        f.connect,
+      ),
+    ).toBe(0);
+    expect(f.fetchImpl).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(f.fetchImpl.mock.calls[0][1]?.body))).toEqual({
+      editor: "unified",
+      mode: "compare",
+      beforePath: before,
+      afterPath: after,
+      title: "Review the customer welcome guide",
+      beforeLabel: "Previous guide",
+      afterLabel: "Updated guide",
+      autosave: path.join(directory, "reviewed.md"),
+      autosaveBase: "old",
+      handoff: "chat",
+    });
+    expect(JSON.parse(f.logs[0])).toMatchObject({
+      event: "comparison.opened",
+      comparisonId: "chat",
+    });
+    expect(f.openUrl).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(path.join(directory, "reviewed.md"))).toBe(false);
+  });
+
+  it.each([
+    undefined,
+    "none",
+  ])("uses the edit file as autosave unless explicitly disabled (%s)", async (autosave) => {
+    const f = fixture();
+    const target = file("notes.md", "Notes");
+    f.fetchImpl.mockResolvedValueOnce(
+      Response.json({
+        id: "edit",
+        editor: "unified",
+        status: "open",
+        completion: null,
+      }),
+    );
+    expect(
+      await runComparisonCommand(
+        "edit",
+        [
+          target,
+          "--timeout",
+          "0",
+          ...(autosave ? ["--autosave", autosave] : []),
+        ],
+        f.deps,
+        false,
+        f.connect,
+      ),
+    ).toBe(0);
+    expect(JSON.parse(String(f.fetchImpl.mock.calls[0][1]?.body))).toEqual({
+      targetPath: target,
+      autosave: autosave ?? target,
+      handoff: "chat",
+    });
+    expect(f.fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the latest saved draft and comments without opening a browser or registering a watch", async () => {
+    const f = fixture();
+    const latest = {
+      id: "read-me",
+      status: "open",
+      editor: "unified",
+      completion: null,
+      title: "Review the customer guide",
+      draft: {
+        markdown: "Current {++suggestion++}",
+        decisions: { first: "kept" },
+      },
+      reviewComments: [{ id: "c1", content: "Latest comment" }],
+      feedback: {
+        draft: { markdown: "Stale snapshot" },
+        sentAt: "earlier",
+        saved: false,
+      },
+    };
+    f.fetchImpl.mockResolvedValueOnce(Response.json(latest));
+    expect(
+      await runComparisonCommand(
+        "comparison",
+        [latest.id, "--read", "--json"],
+        f.deps,
+        false,
+        f.connect,
+      ),
+    ).toBe(0);
+    expect(f.fetchImpl).toHaveBeenCalledTimes(1);
+    expect(String(f.fetchImpl.mock.calls[0][0])).toBe(
+      "http://localhost:7373/api/comparisons/read-me",
+    );
+    expect(f.fetchImpl.mock.calls[0][1]?.method).toBeUndefined();
+    expect(f.openUrl).not.toHaveBeenCalled();
+    expect(f.logs.map((line) => JSON.parse(line))).toEqual([
+      { event: "comparison.read", comparisonId: latest.id, comparison: latest },
+    ]);
+  });
+
+  it("prints saved review content and comments in plain read output", async () => {
+    const f = fixture();
+    f.fetchImpl.mockResolvedValueOnce(
+      Response.json({
+        id: "read-me",
+        status: "open",
+        completion: null,
+        title: "Review the customer guide",
+        draft: {
+          markdown: "Current {++suggestion++}",
+          decisions: { first: "kept" },
+        },
+        reviewComments: [{ id: "c1", content: "Latest comment" }],
+      }),
+    );
+    expect(
+      await runComparisonCommand(
+        "comparison",
+        ["read-me", "--read"],
+        f.deps,
+        false,
+        f.connect,
+      ),
+    ).toBe(0);
+    expect(f.logs.join("\n")).toContain("Review the customer guide");
+    expect(f.logs.join("\n")).toContain("Current {++suggestion++}");
+    expect(f.logs.join("\n")).toContain("Latest comment");
+    expect(f.logs.join("\n")).toContain("kept");
+    expect(f.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("reopens a review without waiting unless --watch is explicit", async () => {
+    const f = fixture();
+    f.fetchImpl.mockResolvedValueOnce(
+      Response.json({
+        id: "resume",
+        editor: "unified",
+        status: "open",
+        completion: null,
+      }),
+    );
+    expect(
+      await runComparisonCommand(
+        "comparison",
+        ["resume", "--json", "--timeout", "0"],
+        f.deps,
+        false,
+        f.connect,
+      ),
+    ).toBe(0);
+    expect(f.fetchImpl).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(f.logs[0]).event).toBe("comparison.opened");
+  });
+
+  it("enables the feedback button before explicitly waiting on an existing chat review", async () => {
+    const f = fixture();
+    const chat = {
+      id: "chat-review",
+      editor: "unified",
+      handoff: "chat",
+      revision: 3,
+      status: "open",
+      completion: null,
+      feedback: null,
+    };
+    const button = { ...chat, handoff: "button", revision: 4 };
+    f.fetchImpl.mockResolvedValueOnce(Response.json(chat));
+    f.fetchImpl.mockImplementationOnce(async (url, init) => {
+      expect(String(url)).toBe(
+        "http://localhost:7373/api/comparisons/chat-review/handoff",
+      );
+      expect(JSON.parse(String(init?.body))).toEqual({
+        revision: 3,
+        handoff: "button",
+      });
+      expect(f.openUrl).not.toHaveBeenCalled();
+      return Response.json(button);
+    });
+    f.fetchImpl.mockResolvedValueOnce(Response.json(button));
+    f.fetchImpl.mockResolvedValueOnce(
+      Response.json({ ...button, feedback: { sentAt: "now", saved: false } }),
+    );
+    expect(
+      await runComparisonCommand(
+        "comparison",
+        [chat.id, "--watch", "--json"],
+        f.deps,
+        false,
+        f.connect,
+      ),
+    ).toBe(0);
+    expect(f.fetchImpl).toHaveBeenCalledTimes(4);
+    expect(JSON.parse(f.logs[0]).comparison.handoff).toBe("button");
+    expect(JSON.parse(f.logs.at(-1) ?? "{}").event).toBe(
+      "comparison.completed",
+    );
+  });
+
+  it.each([
+    ["comparison", ["id", "--read", "--watch"]],
+    ["edit", ["--read"]],
+    ["edit", ["--autosave-base", "current"]],
+  ] as const)("rejects invalid review options for %s before connecting", async (command, args) => {
+    const f = fixture();
+    expect(
+      await runComparisonCommand(command, [...args], f.deps, false, f.connect),
+    ).toBe(2);
+    expect(f.connect).not.toHaveBeenCalled();
   });
 
   it.each([

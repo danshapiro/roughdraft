@@ -597,6 +597,88 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
   };
 }
 
+/** Omit pending suggestions and review metadata while preserving source spelling. */
+export function cleanRoughdraftMarkdown(markdown: string): string {
+  const endmatter = parseRoughdraftEndmatter(markdown);
+  const end =
+    endmatter.offset === null
+      ? markdown.length
+      : markdown[endmatter.offset - 1] === "\r"
+        ? endmatter.offset - 1
+        : endmatter.offset;
+  let result = "";
+  let offset = 0;
+  let fence: FenceState | null = null;
+  const noopDiagnostic = () => {};
+  // Frontmatter belongs to the document, even when a value quotes markup.
+  const frontmatter = markdown.match(
+    /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/,
+  );
+  if (frontmatter) {
+    result = frontmatter[0];
+    offset = result.length;
+  }
+  while (offset < end) {
+    if (isLineStart(markdown, offset)) {
+      const marker = matchFence(markdown, offset, fence);
+      if (marker) fence = fence ? null : marker.fence;
+      if (marker || fence) {
+        const next = Math.min(nextLineOffset(markdown, offset), end);
+        result += markdown.slice(offset, next);
+        offset = next;
+        continue;
+      }
+    }
+    const codeEnd = matchInlineCodeSpan(markdown, offset);
+    if (codeEnd !== null) {
+      result += markdown.slice(offset, codeEnd);
+      offset = codeEnd;
+      continue;
+    }
+    if (markdown.startsWith("{==", offset)) {
+      const close = markdown.indexOf("==}", offset + 3);
+      if (close !== -1) {
+        result += cleanRoughdraftMarkdown(markdown.slice(offset + 3, close));
+        offset = close + 3;
+        continue;
+      }
+    }
+    const comment = markdown.startsWith("{>>", offset)
+      ? parseComment(markdown, offset, noopDiagnostic)
+      : null;
+    if (comment) {
+      offset = comment.endOffset;
+      continue;
+    }
+    const suggestion = parseSuggestion(markdown, offset, noopDiagnostic);
+    if (suggestion) {
+      result += cleanRoughdraftMarkdown(
+        suggestion.suggestionKind === "addition"
+          ? ""
+          : suggestion.suggestionKind === "substitution"
+            ? (suggestion.originalText ?? "")
+            : suggestion.text,
+      );
+      offset = suggestion.endOffset;
+      continue;
+    }
+    result += markdown[offset];
+    offset++;
+  }
+  if (endmatter.data) {
+    const {
+      comments: _comments,
+      suggestions: _suggestions,
+      ...other
+    } = endmatter.data;
+    if (Object.keys(other).length) {
+      const newline = markdown.includes("\r\n") ? "\r\n" : "\n";
+      result += `${newline}---${newline}${stringifyYaml(other).replaceAll("\n", newline)}`;
+    }
+  }
+  return result;
+}
+
 export function appendRoughdraftDocumentComment(
   markdown: string,
   options: AppendRoughdraftDocumentCommentOptions,

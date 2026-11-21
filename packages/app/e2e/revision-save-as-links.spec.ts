@@ -15,7 +15,7 @@ const pixel = Buffer.from(
   "base64",
 );
 
-test("Save As resolves links, images, and restored text from the copy's directory", async ({
+test("an agent-selected autosave copy resolves links, images, and restored text from its own directory", async ({
   page,
   request,
 }) => {
@@ -74,16 +74,23 @@ test("Save As resolves links, images, and restored text from the copy's director
       .poll(async () => (await linkTarget(neighbour)).searchParams.get("path"))
       .toBe(path.join(project, "A/next.md"));
     await expect.poll(assetDirectory).toBe(path.join(project, "A"));
+
+    const copied = await request.post(`${api}/document`, {
+      headers: { Connection: "close" },
+      data: { targetPath: source, autosave: output },
+    });
+    await expect(copied).toBeOK();
+    const copy = await copied.json();
+    await page.goto(`/?comparison=${copy.id}`);
+    await expect
+      .poll(async () => (await linkTarget(neighbour)).searchParams.get("path"))
+      .toBe(path.join(project, "B/next.md"));
+    await expect.poll(assetDirectory).toBe(path.join(project, "B"));
     await selectRichText(page, "Restore");
     await page.keyboard.press("Backspace");
     await expect
-      .poll(() => readProjectFile(project, "A/note.md"))
+      .poll(() => readProjectFile(project, "B/copy.md"))
       .toBe(changed);
-
-    await page.getByTestId("revision-save-as").click();
-    await page.getByTestId("revision-output").fill(output);
-    await page.getByTestId("revision-save-confirm").click();
-    await expect(page.getByTestId("revision-path")).toHaveText(output);
     expect(readProjectFile(project, "B/copy.md")).toBe(changed);
     await expect
       .poll(async () => (await linkTarget(neighbour)).searchParams.get("path"))
@@ -103,7 +110,7 @@ test("Save As resolves links, images, and restored text from the copy's director
     await expect
       .poll(async () => (await linkTarget(restored)).searchParams.get("path"))
       .toBe(path.join(project, "B/restore.md"));
-    expect(readProjectFile(project, "A/note.md")).toBe(changed);
+    expect(readProjectFile(project, "A/note.md")).toBe(original);
     await page.getByTestId("revision-redo").click();
     await expect
       .poll(() => readProjectFile(project, "B/copy.md"))

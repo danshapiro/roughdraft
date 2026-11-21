@@ -234,7 +234,7 @@ Before/Diff/After comparison views. Use only disposable fixture documents.
 
 ## Single editor
 
-Capture the rendered editor with no reference, a comparison with an unreviewed change, and a pending suggestion overlapping a reference change. In each state, include the compact header at a scrolled position. Capture the Markdown view at that same passage, the first-decision file picker opened by Accept all or Reject all (including a copy started from Old), then the Save As replacement confirmation and an external file conflict with the unsaved text still visible. Include a sent feedback snapshot followed by an edit that autosaves independently.
+Capture the rendered editor with no reference, a comparison with an unreviewed change, and a pending suggestion overlapping a reference change. In each state, include the compact header at a scrolled position. Capture the Markdown icon view at that same passage, the Edit/Suggest dropdown, and file details with friendly version labels and full source paths. Capture an agent-selected destination, explicit-none review-only editing, the quiet saved icon and an external file conflict with unsaved text visible. Capture a stale-browser conflict and its Preserve this review action, followed by the detached saved-review confirmation. Chat reviews have no Send feedback action; capture that action separately for explicit button handoff and legacy waiting reviews.
 
 
 ## Mobile and foldable layouts
@@ -246,9 +246,9 @@ comparison routes. Verify readable document text, 44px standalone touch controls
 full-width reading columns and no horizontal page scrolling.
 
 In the unified editor, capture the primary review toolbar and its More actions
-popover (Markdown, copy/download, feedback and Save As). Capture a long filename,
-comments with replies, and the file-choice dialog at 360px viewport height with
-its inputs and submit action reachable by scrolling. Check a pending suggestion
+popover (copy/download and optional button handoff). Capture the Markdown icon,
+Edit/Suggest dropdown, long review title and file-details popover at 360px viewport
+height with full paths wrapping and actions reachable. Include comment drafts and replies. Check a pending suggestion
 and selected text survive folded-to-unfolded resize without saving unaccepted
 wording to the original. Android's keyboard should resize the content viewport;
 confirm keyboard behavior on Dan's device as well as browser viewport emulation.
