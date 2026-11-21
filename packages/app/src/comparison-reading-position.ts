@@ -107,12 +107,28 @@ export function useComparisonReadingPosition(
     const line = headerBottom + (window.innerHeight - headerBottom) / 4;
     let first: HTMLElement | undefined;
     let firstTop = 0;
+    let candidates: ReturnType<typeof words> = [];
     for (const anchor of anchors(root)) {
       const rect = anchor.getBoundingClientRect();
       if (rect.bottom <= line || !rect.height || !anchor.textContent?.trim())
         continue;
+      const unit = anchor.dataset.comparisonAnchor ?? "";
+      const next = words(
+        textNodes(
+          visibleUnit(root, unit).filter((element) =>
+            element.textContent?.trim(),
+          ),
+        ),
+      );
+      // A paragraph's line box can extend below its last visible word. Follow
+      // the next passage once the reading line has passed the actual text.
+      // Literal Markdown may add a wrapped URL after that preceding word.
+      const last = next[next.length - 1];
+      if (last && wordRange(last).getBoundingClientRect().bottom <= line)
+        continue;
       first = anchor;
       firstTop = rect.top;
+      candidates = next;
       break;
     }
     if (!first || firstTop >= window.innerHeight) {
@@ -127,13 +143,6 @@ export function useComparisonReadingPosition(
       return;
     }
     const unit = first.dataset.comparisonAnchor ?? "";
-    const candidates = words(
-      textNodes(
-        visibleUnit(root, unit).filter((element) =>
-          element.textContent?.trim(),
-        ),
-      ),
-    );
     // Binary search the first reading line rather than measuring every word.
     let low = 0;
     let high = candidates.length;
@@ -143,7 +152,7 @@ export function useComparisonReadingPosition(
         low = middle + 1;
       else high = middle;
     }
-    // If the reading line falls in the gap between paragraphs, keep the
+    // If the reading line falls in a gap within the source unit, keep the
     // preceding line. Anchoring the next paragraph would let the one the
     // reader just saw drift by the difference in spacing between views.
     if (
