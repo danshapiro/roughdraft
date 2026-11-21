@@ -52,3 +52,37 @@ test("different text, decisions or feedback still require saving and cannot ackn
     false,
   );
 });
+
+test("saved reviewed decisions acknowledge the API's field order without hiding changed decisions", () => {
+  const reviewed = {
+    id: "decision-1",
+    decision: "accept" as const,
+    oldText: "old",
+    newText: "new",
+    keptId: "ref-1",
+    inverse: [],
+    guard: { from: 1, to: 4, slice: null },
+  };
+  const saved = {
+    id: reviewed.id,
+    decision: reviewed.decision,
+    oldText: reviewed.oldText,
+    newText: reviewed.newText,
+    inverse: reviewed.inverse,
+    guard: reviewed.guard,
+    keptId: reviewed.keptId,
+    stale: false,
+  };
+  expect(
+    equalRevisionDraft(
+      { ...draft, reviewed: [reviewed] },
+      { ...draft, reviewed: [saved] },
+    ),
+  ).toBe(true);
+  expect(
+    equalRevisionDraft(
+      { ...draft, reviewed: [reviewed] },
+      { ...draft, reviewed: [{ ...saved, decision: "reject" }] },
+    ),
+  ).toBe(false);
+});

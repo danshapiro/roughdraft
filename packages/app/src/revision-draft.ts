@@ -1,4 +1,8 @@
-import type { ComparisonReviewComment, EditorDraft } from "./comparison-types";
+import type {
+  ComparisonReviewComment,
+  EditorDraft,
+  ReviewedChange,
+} from "./comparison-types";
 
 interface ReviewDraft extends EditorDraft {
   reviewComments: ComparisonReviewComment[];
@@ -19,6 +23,30 @@ function commentValues(comments: ComparisonReviewComment[]) {
   ]);
 }
 
+function reviewValues(changes: ReviewedChange[] = []) {
+  return changes.map((change) => [
+    change.id,
+    change.decision,
+    change.oldText,
+    change.newText,
+    change.inverse,
+    change.guard.from,
+    change.guard.to,
+    change.guard.slice,
+    change.keptId ?? null,
+    change.keptIds ?? [],
+    change.metadata
+      ? [
+          change.metadata.before.frontmatter,
+          change.metadata.before.endmatter,
+          change.metadata.after.frontmatter,
+          change.metadata.after.endmatter,
+        ]
+      : null,
+    Boolean(change.stale),
+  ]);
+}
+
 export function equalRevisionDraft(
   a: ReviewDraft,
   b: ReviewDraft | null | undefined,
@@ -31,6 +59,8 @@ export function equalRevisionDraft(
       Object.entries(a.decisions).every(
         ([id, value]) => b.decisions[id] === value,
       ) &&
+      JSON.stringify(reviewValues(a.reviewed)) ===
+        JSON.stringify(reviewValues(b.reviewed)) &&
       JSON.stringify(commentValues(a.reviewComments)) ===
         JSON.stringify(commentValues(b.reviewComments)),
   );

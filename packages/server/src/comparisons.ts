@@ -46,10 +46,27 @@ export interface ComparisonReviewComment {
   parentCommentId?: string | null;
   scope?: "document";
 }
+export interface DocumentMetadata {
+  frontmatter: string | null;
+  endmatter: string | null;
+}
+export interface ReviewedChange {
+  id: string;
+  decision: "accept" | "reject";
+  oldText: string;
+  newText: string;
+  inverse: Record<string, unknown>[];
+  guard: { from: number; to: number; slice: unknown };
+  keptId?: string;
+  keptIds?: string[];
+  stale?: boolean;
+  metadata?: { before: DocumentMetadata; after: DocumentMetadata };
+}
 export interface EditorDraft {
   markdown: string;
   cleanMarkdown?: string;
   decisions: Record<string, "kept">;
+  reviewed?: ReviewedChange[];
 }
 export interface EditorFeedback {
   draft: EditorDraft;
@@ -278,6 +295,97 @@ function snapshot(filename: string, root?: string): FileSnapshot {
     );
   }
 }
+function documentMetadataField(value: unknown): DocumentMetadata {
+  const input = objectBody(value);
+  if (
+    (input.frontmatter !== null && typeof input.frontmatter !== "string") ||
+    (input.endmatter !== null && typeof input.endmatter !== "string")
+  )
+    throw new ComparisonError(
+      400,
+      "Document metadata needs frontmatter and endmatter strings or null",
+    );
+  return { frontmatter: input.frontmatter, endmatter: input.endmatter };
+}
+function reviewedField(value: unknown): ReviewedChange[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value))
+    throw new ComparisonError(400, "reviewed must be an array of changes");
+  const ids = new Set<string>();
+  return value.map((entry) => {
+    const input = objectBody(entry);
+    const id = stringField(input, "id");
+    const decision = stringField(input, "decision");
+    const oldText = stringField(input, "oldText");
+    const newText = stringField(input, "newText");
+    if (
+      !id ||
+      ids.has(id) ||
+      (decision !== "accept" && decision !== "reject") ||
+      oldText === undefined ||
+      newText === undefined ||
+      !Array.isArray(input.inverse)
+    )
+      throw new ComparisonError(
+        400,
+        "Reviewed changes need unique IDs, accept/reject decisions, text and inverse steps",
+      );
+    ids.add(id);
+    const guard = objectBody(input.guard);
+    if (
+      !Number.isSafeInteger(guard.from) ||
+      !Number.isSafeInteger(guard.to) ||
+      (guard.from as number) < 0 ||
+      (guard.to as number) < (guard.from as number) ||
+      !Object.hasOwn(guard, "slice") ||
+      (guard.slice !== null &&
+        (typeof guard.slice !== "object" || Array.isArray(guard.slice)))
+    )
+      throw new ComparisonError(
+        400,
+        "Reviewed change guards need ordered positions and a serialized slice",
+      );
+    const keptId = stringField(input, "keptId");
+    if (
+      input.keptIds !== undefined &&
+      (!Array.isArray(input.keptIds) ||
+        input.keptIds.some((id) => typeof id !== "string" || !id))
+    )
+      throw new ComparisonError(
+        400,
+        "Reviewed change keptIds must be change IDs",
+      );
+    if (input.stale !== undefined && typeof input.stale !== "boolean")
+      throw new ComparisonError(400, "Reviewed change stale must be boolean");
+    const metadata =
+      input.metadata === undefined ? undefined : objectBody(input.metadata);
+    return {
+      id,
+      decision,
+      oldText,
+      newText,
+      inverse: input.inverse.map(objectBody),
+      guard: {
+        from: guard.from as number,
+        to: guard.to as number,
+        slice: guard.slice,
+      },
+      ...(keptId !== undefined ? { keptId } : {}),
+      ...(input.keptIds !== undefined
+        ? { keptIds: [...(input.keptIds as string[])] }
+        : {}),
+      ...(input.stale !== undefined ? { stale: input.stale } : {}),
+      ...(metadata
+        ? {
+            metadata: {
+              before: documentMetadataField(metadata.before),
+              after: documentMetadataField(metadata.after),
+            },
+          }
+        : {}),
+    };
+  });
+}
 function draftField(body: Record<string, unknown>): EditorDraft {
   const markdown = stringField(body, "markdown");
   if (markdown === undefined)
@@ -286,10 +394,12 @@ function draftField(body: Record<string, unknown>): EditorDraft {
   const entries = Object.entries(objectBody(body.decisions));
   if (entries.some(([key, value]) => !key || value !== "kept"))
     throw new ComparisonError(400, "decisions must map change IDs to kept");
+  const reviewed = reviewedField(body.reviewed);
   return {
     markdown,
     ...(cleanMarkdown !== undefined ? { cleanMarkdown } : {}),
     decisions: Object.fromEntries(entries.map(([id]) => [id, "kept"] as const)),
+    ...(reviewed !== undefined ? { reviewed } : {}),
   };
 }
 function cleanDraft(draft: EditorDraft): string {
@@ -1198,6 +1308,7 @@ class ComparisonStore {
       revision: review.revision,
       autosave: review.autosave,
       decisions: Object.keys(draft.decisions).length,
+      reviewed: draft.reviewed?.length ?? 0,
       comments: reviewComments.length,
     });
     return review;
@@ -1435,6 +1546,7 @@ class ComparisonStore {
         id: fork.id,
         recoveredFrom: review.id,
         decisions: Object.keys(draft.decisions).length,
+        reviewed: draft.reviewed?.length ?? 0,
         comments: comments.length,
       });
       return fork;
@@ -1523,7 +1635,11 @@ class ComparisonStore {
     if (saved.path !== resolved || saved.text !== text)
       throw new ComparisonError(409, errorMessage);
     this.finishSave(review, draft, reviewComments, saved, baseVersion);
-    log("draft-saved", { id: review.id, destinationPath: resolved });
+    log("draft-saved", {
+      id: review.id,
+      destinationPath: resolved,
+      reviewed: draft.reviewed?.length ?? 0,
+    });
     return review;
   }
   private finishSave(
@@ -1590,7 +1706,12 @@ class ComparisonStore {
     };
     review.revision++;
     this.save(review);
-    log("feedback-sent", { id: review.id, destinationPath, saved });
+    log("feedback-sent", {
+      id: review.id,
+      destinationPath,
+      saved,
+      reviewed: draft.reviewed?.length ?? 0,
+    });
     return review;
   }
   private destination(review: StoredComparison): FileSnapshot {

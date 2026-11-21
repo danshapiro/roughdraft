@@ -101,9 +101,9 @@ async function recoverCopy(
   id: string,
   output: string,
 ) {
-  await page.getByTestId("revision-format").click();
-  const markdown = await page.getByTestId("revision-markdown").textContent();
-  expect(markdown).not.toBeNull();
+  const { draft } = await readReview(request, id);
+  if (!draft) throw new Error("Expected a saved review draft before recovery");
+  const markdown = draft.cleanMarkdown ?? draft.markdown;
   const response = await request.post(`${api}/${id}/fork`, {
     headers: fixtureHeaders,
     data: { path: output, expectedVersion: null, markdown, decisions: {} },

@@ -43,7 +43,7 @@ function textNodes(elements: HTMLElement[]) {
   for (const element of elements) {
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
     for (let node = walker.nextNode(); node; node = walker.nextNode())
-      nodes.push(node as Text);
+      if (!node.parentElement?.closest(".cm-gutters")) nodes.push(node as Text);
   }
   return nodes;
 }
@@ -88,7 +88,7 @@ export function useComparisonReadingPosition(
       Math.abs(window.scrollY - restoredScroll.current) < 1
     ) {
       pending.current = { ...reading.current, viewKey };
-      return;
+      return pending.current;
     }
     if (window.scrollY === 0) {
       reading.current = {
@@ -99,7 +99,7 @@ export function useComparisonReadingPosition(
         scrollY: 0,
       };
       pending.current = reading.current;
-      return;
+      return pending.current;
     }
     const headerBottom = headerRef.current?.getBoundingClientRect().bottom ?? 0;
     // Anchor the reading passage in the upper quarter of the usable viewport.
@@ -140,7 +140,7 @@ export function useComparisonReadingPosition(
         scrollY: window.scrollY,
       };
       reading.current = pending.current;
-      return;
+      return pending.current;
     }
     const unit = first.dataset.comparisonAnchor ?? "";
     // Binary search the first reading line rather than measuring every word.
@@ -180,6 +180,7 @@ export function useComparisonReadingPosition(
       scrollY: window.scrollY,
     };
     reading.current = pending.current;
+    return pending.current;
   };
 
   useLayoutEffect(() => {

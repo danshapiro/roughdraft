@@ -130,9 +130,44 @@
   line-height: 1.75;
 }
 
+.revision-markdown .revision-source-text .cm-editor {
+  font-size: 16px;
+}
+.revision-markdown .cm-gutters {
+  display: none;
+}
+
 .revision-more-actions .revision-tool-group {
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.revision-preview-label {
+  color: var(--muted-foreground);
+  font-size: 14px;
+  margin: 0 auto 16px;
+  max-width: 46.5rem;
+  padding-inline: 16px;
+}
+
+.revision-reviewed-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+.revision-reviewed-item {
+  border-top: 1px solid var(--border);
+  padding-block: 16px;
+}
+
+.revision-reviewed-item p {
+  margin-block: 8px;
+  white-space: pre-wrap;
+}
+
+.revision-reviewed-item button {
+  min-height: 44px;
 }
 
 .revision-more-actions .revision-tool-group + .revision-tool-group {
@@ -172,5 +207,44 @@
 
   .revision-source-text {
     font-size: 16px;
+  }
+
+  .revision-markdown {
+    padding: 20px 12px;
+  }
+}
+
+.revision-metadata-change {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  margin: 0 auto 24px;
+  max-width: 46.5rem;
+}
+.revision-metadata-change h2 {
+  font-size: 18px;
+  font-weight: 600;
+}
+.revision-metadata-change p {
+  margin-block: 8px;
+}
+.revision-metadata-versions {
+  display: grid;
+  gap: 16px;
+  margin-block: 16px;
+}
+.revision-metadata-versions pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 12rem;
+  overflow-y: auto;
+  font-size: 16px;
+}
+.revision-metadata-change button {
+  min-height: 44px;
+}
+@media (min-width: 640px) {
+  .revision-metadata-versions {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
 }

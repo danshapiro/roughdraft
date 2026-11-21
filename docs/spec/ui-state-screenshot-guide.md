@@ -234,7 +234,7 @@ Before/Diff/After comparison views. Use only disposable fixture documents.
 
 ## Single editor
 
-Capture the rendered editor with no reference, a comparison with an unreviewed change, and a pending suggestion overlapping a reference change. In each state, include the compact header at a scrolled position. Capture the Markdown icon view at that same passage, the Edit/Suggest dropdown, and file details with friendly version labels and full source paths. Capture an agent-selected destination, explicit-none review-only editing, the quiet saved icon and an external file conflict with unsaved text visible. Capture a stale-browser conflict and its Preserve this review action, followed by the detached saved-review confirmation. Chat reviews have no Send feedback action; capture that action separately for explicit button handoff and legacy waiting reviews.
+Capture the rendered editor with no reference, a comparison with an unreviewed change, and a pending suggestion overlapping a reference change. In each state, include the compact header at a scrolled position. Capture the Markdown icon view at that same passage, the Read/Edit/Suggest dropdown, and file details with friendly version labels and full source paths. Capture an agent-selected destination, explicit-none review-only editing, the quiet saved icon and an external file conflict with unsaved text visible. Capture a stale-browser conflict and its Preserve this review action, followed by the detached saved-review confirmation. Chat reviews have no Send feedback action; capture that action separately for explicit button handoff and legacy waiting reviews.
 
 
 ## Mobile and foldable layouts
@@ -247,7 +247,7 @@ full-width reading columns and no horizontal page scrolling.
 
 In the unified editor, capture the primary review toolbar and its More actions
 popover (copy/download and optional button handoff). Capture the Markdown icon,
-Edit/Suggest dropdown, long review title and file-details popover at 360px viewport
+Read/Edit/Suggest dropdown, long review title and file-details popover at 360px viewport
 height with full paths wrapping and actions reachable. Include comment drafts and replies. Check a pending suggestion
 and selected text survive folded-to-unfolded resize without saving unaccepted
 wording to the original. Android's keyboard should resize the content viewport;
@@ -257,3 +257,15 @@ Capture the mobile selection toolbar and URL editor docked above the keyboard
 area, selecting words/links at both screen edges. Check the full URL field,
 Open/Delete controls, formatting actions, and save/reload. Desktop retains the
 contextual toolbar beside its selection. Include a narrow landscape viewport.
+
+
+## Unified outcome and reviewed-change states
+
+Capture Changes, All rejected and All accepted with a mixture of earlier decisions and pending suggestions. Include the read-only preview label, disabled editing/decision controls, rendered and source previews, preserved YAML, and source-relative links/images from inputs in different folders. Verify Copy/Download match the visible outcome. Returning to Changes must restore the interaction mode and working source without adding preview text to Undo.
+
+Capture Reviewed changes after refresh, reopening an accepted and rejected passage, a related group of overlapping changes, and the disabled reopening explanation after that passage is edited. Include a long length-changing suggestion with later unrelated edits on both sides. Capture Read after clicking the document and typing: it must remain Read, keep focus in the document and leave the file unchanged.
+
+Capture editable full source with comments/suggestions, Read and Suggest source states, YAML/comment Undo and Redo, exact source-spelling edits, and restoration of a rich-text edit made before the source edit. Exercise 360px, 840px, desktop and short landscape viewports with reachable 44px controls and readable source text.
+
+
+Capture YAML-only comparisons with one metadata choice, full source outcomes using the corresponding YAML, and body-plus-YAML bulk Undo/Redo retaining unrelated Markdown spelling. Include source Undo after a later reply and after a later comment edit, preserving both feedback and file contents. Capture a CRLF document opened in source without a write, and a long document whose reading passage stays in the same column across source/rendered switching.

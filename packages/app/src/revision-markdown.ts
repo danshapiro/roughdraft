@@ -7,6 +7,7 @@ import {
 import { createEditorExtensions } from "./editor-extensions";
 import { type MarkdownOptions, splitYamlDocumentMetadata } from "./markdown";
 import { projectAcceptedDocument } from "./revision-projection";
+import { documentMetadata } from "./revision-metadata";
 
 const schema = getSchema(createEditorExtensions(""));
 
@@ -21,6 +22,31 @@ export function acceptedDocument(doc: JSONContent): JSONContent {
     ...doc,
     ...projectAcceptedDocument(schema.nodeFromJSON(doc)).doc.toJSON(),
   };
+}
+
+/** Generated dates may differ when anonymous review syntax is parsed again. */
+export function sameRevisionMarkup(left: string, right: string): boolean {
+  const signature = (markdown: string) => {
+    const parsed = criticMarkdownToEditorState(
+      markdown,
+      editableMarkdownOptions,
+    );
+    const comments = [...parsed.comments.values()]
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map((comment) => [
+        comment.id,
+        comment.content,
+        comment.authorType ?? null,
+        comment.authorId ?? null,
+        comment.parentCommentId ?? null,
+        comment.scope ?? null,
+      ]);
+    return JSON.stringify(
+      { doc: parsed.doc, comments, metadata: documentMetadata(markdown) },
+      (key, value) => (key === "createdAt" ? undefined : value),
+    );
+  };
+  return signature(left) === signature(right);
 }
 
 export function cleanRevisionMarkdown(markdown: string): string {

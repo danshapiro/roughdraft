@@ -5,8 +5,9 @@ import {
   undoDepth,
 } from "@tiptap/pm/history";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
-import { EditorState, Plugin, PluginKey } from "@tiptap/pm/state";
+import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { DecorationSet } from "@tiptap/pm/view";
+import { cleanRoughdraftMarkdown } from "@roughdraft/rfm";
 import type { Editor } from "@tiptap/react";
 import {
   ArrowDown,
@@ -23,6 +24,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiBackend } from "./api-backend";
+import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
 import { useComparisonReadingPosition } from "./comparison-reading-position";
 import type {
   ComparisonReviewComment,
@@ -75,9 +77,21 @@ import {
   reviewShortcut,
   reviewShortcutLabel,
 } from "./review-decisions";
+import { decideReviewChanges, suggestionDetail } from "./revision-bulk";
 import { equalRevisionDraft } from "./revision-draft";
 import {
+  recordReviewedChange,
+  reopenReviewedChange,
+  reviewedChanges,
+} from "./revision-history";
+import { outcomeDocument } from "./revision-outcomes";
+import {
+  useRevisionPreferences,
+  type RevisionView,
+} from "./revision-preferences";
+import {
   acceptedDocument,
+  sameRevisionMarkup,
   cleanRevisionMarkdown,
   copyRevisionMarkdown,
   createSourceSpellingPreserver,
@@ -97,6 +111,11 @@ import {
   type RevisionDraft,
   useRevisionSession,
 } from "./revision-session";
+import {
+  documentMetadata,
+  sameMetadata,
+  withDocumentMetadata,
+} from "./revision-metadata";
 import "./RevisionEditor.css";
 
 const referenceKey = new PluginKey<ReferenceChange[]>(
@@ -112,6 +131,21 @@ function kept(doc: ProseMirrorNode): string[] {
 function canonical(markdown: string) {
   const { doc } = criticMarkdownToEditorState(markdown);
   return editorStateToCriticMarkdown(acceptedDocument(doc), new Map());
+}
+
+function referenceDocument(schema: Editor["schema"], markdown: string) {
+  const parsed = criticMarkdownToEditorState(markdown, editableMarkdownOptions);
+  return schema.nodeFromJSON({
+    ...parsed.doc,
+    attrs: {
+      ...parsed.doc.attrs,
+      sourceMetadata: {
+        markdown,
+        frontmatter: parsed.frontmatter,
+        endmatter: parsed.endmatter,
+      },
+    },
+  });
 }
 
 function useReference(
@@ -164,7 +198,11 @@ function useReference(
           if (old === changes) return null;
           const ids = new Set(changes.map((change) => change.item.changeId));
           const currentKept = kept(current.doc);
-          const next = new Set(currentKept.filter((id) => ids.has(id)));
+          const next = new Set(
+            currentKept.filter(
+              (id) => ids.has(id) || id === "document-metadata",
+            ),
+          );
           const previousIds = new Set(
             old.map((change) => change.item.changeId),
           );
@@ -350,10 +388,22 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const preserveSource = useRef<ReturnType<
     typeof createSourceSpellingPreserver
   > | null>(null);
+  const exactReview = useRef(source.markdown);
+  const reviewSpelling = useRef<ReturnType<
+    typeof createSourceSpellingPreserver
+  > | null>(null);
   const [editor, setEditor] = useState<Editor | null>(null);
-  const [interaction, setInteraction] =
-    useState<DocumentInteractionMode>("editing");
-  const [formatted, setFormatted] = useState(true);
+  const [preferences, setPreferences] = useRevisionPreferences(initial.id);
+  const { interaction, formatted, view } = preferences;
+  const previewing = view !== "changes";
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [sourceReading, setSourceReading] = useState<{
+    quote: string[];
+    offset: number;
+  } | null>(null);
+  const sourceUpdateRef = useRef<
+    ((markdown: string, previous?: string) => void) | null
+  >(null);
   const [, bump] = useState(0);
   const [actionError, setActionError] = useState("");
   const [blocked, setBlocked] = useState(false);
@@ -383,7 +433,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const camera = useComparisonReadingPosition(
     documentRef,
     headerRef,
-    String(formatted),
+    `${formatted}-${view}`,
   );
   const captures = useRef(camera);
   captures.current = camera;
@@ -420,15 +470,51 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       }),
     [sourcePath],
   );
+  const previewPath =
+    view === "rejected"
+      ? (beforePath ?? sourcePath)
+      : (afterPath ?? sourcePath);
+  const previewBackend = useMemo(
+    () =>
+      new ApiBackend({
+        kind: "local-files",
+        label: "Local files",
+        detail: previewPath,
+        projectPath: documentProject(previewPath),
+      }),
+    [previewPath],
+  );
   const page = useMemo(
     () => ({ id: initial.id, title: initial.title, content: source.markdown }),
     [initial, source.markdown],
   );
   const ownEditor = useRef<Editor | null>(null);
-  const receiveEditor = useCallback((next: Editor | null) => {
-    ownEditor.current = next;
-    setEditor(next);
-  }, []);
+  const receiveEditor = useCallback(
+    (next: Editor | null) => {
+      ownEditor.current = next;
+      if (next && !reviewSpelling.current) {
+        const parsed = criticMarkdownToEditorState(
+          exactReview.current,
+          editableMarkdownOptions,
+        );
+        const comments = new Map(
+          readDraft().reviewComments.map((comment) => [comment.id, comment]),
+        );
+        const canonical = editorStateToCriticMarkdown(
+          next.getJSON(),
+          comments,
+          { frontmatter: parsed.frontmatter, endmatter: parsed.endmatter },
+        );
+        reviewSpelling.current = createSourceSpellingPreserver(
+          exactReview.current,
+          canonical,
+        );
+      }
+      setEditor(next);
+    },
+    [readDraft],
+  );
+
   useReference(editor, reference, baseSide, interaction);
 
   useEffect(() => {
@@ -442,110 +528,170 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   }, [editor]);
 
   const changeMarkdown = useCallback(
-    (markdown: string) => {
+    (markdown: string, origin?: "source") => {
       setMarkdownQueued(false);
       const current = ownEditor.current?.state.doc;
       if (!current) return;
-      const result = cleanRevisionMarkdown(markdown);
+      const sourceClean = cleanRoughdraftMarkdown(markdown);
+      const metadataChanged = !sameMetadata(
+        documentMetadata(sourceClean),
+        documentMetadata(exactClean.current),
+      );
+      const result =
+        origin === "source" ? sourceClean : cleanRevisionMarkdown(markdown);
       preserveSource.current ??= createSourceSpellingPreserver(
         exactClean.current,
         canonical(exactClean.current),
       );
       const requested = canonical(result);
       const preserved = preserveSource.current(requested);
-      const cleanMarkdown =
-        preserved !== null && canonical(preserved) === requested
-          ? preserved
-          : result;
+      let cleanMarkdown =
+        origin === "source"
+          ? result
+          : preserved !== null && canonical(preserved) === requested
+            ? preserved
+            : result;
+      if (metadataChanged && origin !== "source")
+        cleanMarkdown = withDocumentMetadata(
+          cleanMarkdown,
+          documentMetadata(sourceClean),
+        );
+      if (origin === "source" || metadataChanged) {
+        exactClean.current = cleanMarkdown;
+        preserveSource.current = null;
+      }
+      let reviewMarkdown = markdown;
+      if (origin !== "source") {
+        const preserved = reviewSpelling.current?.(markdown);
+        if (preserved != null && sameRevisionMarkup(preserved, markdown))
+          reviewMarkdown = preserved;
+      } else {
+        exactReview.current = markdown;
+        const parsed = criticMarkdownToEditorState(
+          markdown,
+          editableMarkdownOptions,
+        );
+        const comments = new Map(
+          readDraft().reviewComments.map((comment) => [comment.id, comment]),
+        );
+        const canonical = editorStateToCriticMarkdown(
+          current.toJSON(),
+          comments,
+          { frontmatter: parsed.frontmatter, endmatter: parsed.endmatter },
+        );
+        reviewSpelling.current = createSourceSpellingPreserver(
+          markdown,
+          canonical,
+        );
+      }
       updateDraft((previous) => ({
         ...previous,
-        markdown,
+        markdown: reviewMarkdown,
         cleanMarkdown,
         decisions: Object.fromEntries(kept(current).map((id) => [id, "kept"])),
+        reviewed: reviewedChanges(current),
       }));
       setBlocked(false);
     },
-    [updateDraft],
+    [updateDraft, readDraft],
   );
 
   const deciding = useCallback(
     (changeId: string, keep: boolean) => {
       const live = ownEditor.current;
       if (!live) return false;
-      const change = referenceKey
-        .getState(live.state)
-        ?.find((item) => item.item.changeId === changeId);
-      if (!change) return false;
-      const leaveAsIs = keep === (baseSide === "new");
-      const transaction = leaveAsIs
-        ? live.state.tr.setDocAttribute("kept", [
-            ...new Set([...kept(live.state.doc), changeId]),
-          ])
-        : revertReferenceChange(live.state, change);
-      if (transaction) {
+      if (changeId === "document-metadata" && reference !== null) {
+        const transaction = decideReviewChanges(
+          live.state,
+          referenceDocument(live.schema, reference),
+          baseSide,
+          keep ? "accept" : "reject",
+          true,
+          "metadata",
+        );
         live.view.dispatch(
           closeHistory(transaction)
             .setMeta(referenceDecision, true)
             .setMeta(explicitReviewEdit, true),
         );
         live.view.dispatch(closeHistory(live.state.tr));
+        return true;
+      }
+      const change = referenceKey
+        .getState(live.state)
+        ?.find((item) => item.item.changeId === changeId);
+      const detail = change
+        ? { ...change.item, from: change.from, to: change.to }
+        : suggestionDetail(live.state.doc, changeId);
+      if (!change && !suggestionPositions(live.state.doc).has(changeId))
+        return false;
+      const leaveAsIs = keep === (baseSide === "new");
+      const transaction = !change
+        ? live.state.tr
+        : leaveAsIs
+          ? live.state.tr.setDocAttribute("kept", [
+              ...new Set([...kept(live.state.doc), changeId]),
+            ])
+          : revertReferenceChange(live.state, change);
+      if (
+        transaction &&
+        !change &&
+        !applySuggestionDecisions(
+          transaction,
+          [changeId],
+          keep ? "accept" : "reject",
+        )
+      )
+        return true;
+      if (transaction) {
+        recordReviewedChange(
+          transaction,
+          {
+            decision: keep ? "accept" : "reject",
+            oldText: detail.oldText,
+            newText: detail.newText,
+            ...(change && leaveAsIs ? { keptId: changeId } : {}),
+          },
+          detail,
+        );
+        live.view.dispatch(
+          closeHistory(transaction)
+            .setMeta(referenceDecision, Boolean(change))
+            .setMeta(explicitReviewEdit, true),
+        );
+        live.view.dispatch(closeHistory(live.state.tr));
       }
       return true;
     },
-    [baseSide],
+    [baseSide, reference],
   );
 
   const decideAll = useCallback(
     (decision: ReviewDecision) => {
       const live = ownEditor.current;
       if (!live) return;
-      const existing = new Set(kept(live.state.doc));
-      const changes = (referenceKey.getState(live.state) ?? noChanges).filter(
-        (change) =>
-          !change.overlapsSuggestion && !existing.has(change.item.changeId),
-      );
-      const nativeIds = suggestionPositions(live.state.doc).keys();
-      const tr = live.state.tr;
-      if ((decision === "accept") === (baseSide === "new")) {
-        if (changes.length > 0) {
-          tr.setDocAttribute("kept", [
-            ...existing,
-            ...changes.map((change) => change.item.changeId),
-          ]);
-        }
-      } else if (changes.length > 0) {
-        // Working right to left keeps untouched positions valid. Verify every
-        // replacement before dispatching any of the choices.
-        changes.sort((a, b) => b.from - a.from || b.to - a.to);
-        let boundary = live.state.doc.content.size;
-        let scratch = EditorState.create({ doc: tr.doc });
-        for (const change of changes) {
-          const replacement =
-            change.to <= boundary && revertReferenceChange(scratch, change);
-          if (!replacement) {
-            setActionError(
-              "Some changes overlap or moved. Review them individually before choosing again.",
-            );
-            return;
-          }
-          for (const step of replacement.steps) tr.step(step);
-          scratch = scratch.apply(replacement);
-          boundary = change.from;
-        }
+      try {
+        const other =
+          reference === null ? null : referenceDocument(live.schema, reference);
+        const transaction = decideReviewChanges(
+          live.state,
+          other,
+          baseSide,
+          decision,
+          true,
+        );
+        if (!transaction.docChanged) return;
+        live.view.dispatch(
+          closeHistory(transaction).setMeta(explicitReviewEdit, true),
+        );
+        live.view.dispatch(closeHistory(live.state.tr));
+        setActiveChange(null);
+        setActionError("");
+      } catch (error) {
+        setActionError(error instanceof Error ? error.message : String(error));
       }
-      if (!applySuggestionDecisions(tr, nativeIds, decision)) {
-        setActionError("A suggestion moved. Review it before deciding.");
-        return;
-      }
-      if (!tr.docChanged) return;
-      // A resolved native edit can appear as a new difference from the frozen
-      // file. Mark the newly introduced comparison wording as already reviewed.
-      live.view.dispatch(closeHistory(tr).setMeta(explicitReviewEdit, true));
-      live.view.dispatch(closeHistory(live.state.tr));
-      setActiveChange(null);
-      setActionError("");
     },
-    [baseSide],
+    [baseSide, reference],
   );
 
   const renderedChanges = editor
@@ -564,6 +710,9 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       .map((change) => change.item);
   }, [renderedChanges, decisions]);
   const decisionsDisabled =
+    interaction === "viewing" ||
+    previewing ||
+    !formatted ||
     busy ||
     sendOpen ||
     Boolean(disk) ||
@@ -576,6 +725,8 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       disabled: decisionsDisabled,
       activeChangeId: activeChange,
       decisions,
+      reviewed: source.reviewed,
+      sourceUpdateRef,
       markdownFlushRef,
       onMarkdownQueued,
       comments: commentMap,
@@ -591,13 +742,61 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       decisions,
       decisionsDisabled,
       onMarkdownQueued,
+      source.reviewed,
       updateComments,
       visibleChanges,
     ],
   );
   const editorDoc = editor?.state.doc;
+  const workingSource =
+    editorDoc?.attrs.sourceMetadata?.markdown ?? draft.markdown;
+  const metadataPending =
+    reference !== null &&
+    !decisions.includes("document-metadata") &&
+    !sameMetadata(documentMetadata(workingSource), documentMetadata(reference));
+  const metadataOld = documentMetadata(
+    baseSide === "new" ? (reference ?? workingSource) : workingSource,
+  );
+  const metadataNew = documentMetadata(
+    baseSide === "new" ? workingSource : (reference ?? workingSource),
+  );
+  const reviewed = editorDoc
+    ? reviewedChanges(editorDoc)
+    : (source.reviewed ?? []);
+  const preview = useMemo(() => {
+    if (!editorDoc || view === "changes") return null;
+    try {
+      const other =
+        reference === null
+          ? null
+          : referenceDocument(editorDoc.type.schema, reference);
+      const doc = outcomeDocument(
+        editorDoc,
+        other,
+        baseSide,
+        view === "accepted" ? "accept" : "reject",
+      );
+      const metadata =
+        doc.attrs.sourceMetadata ?? criticMarkdownToEditorState(draft.markdown);
+      return {
+        doc: doc.toJSON(),
+        markdown: editorStateToCriticMarkdown(doc.toJSON(), new Map(), {
+          frontmatter: metadata.frontmatter,
+          endmatter: metadata.endmatter,
+        }),
+        error: "",
+      };
+    } catch (error) {
+      return {
+        doc: null,
+        markdown: "",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }, [editorDoc, reference, baseSide, view, draft.markdown]);
   const navigation = useMemo(() => {
     const positions = new Map<string, number>();
+    if (metadataPending) positions.set("document-metadata", -1);
     const ignored = new Set(decisions);
     for (const change of renderedChanges) {
       const id = change.item.changeId;
@@ -611,7 +810,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     return [...positions.entries()]
       .sort((a, b) => a[1] - b[1])
       .map(([id]) => id);
-  }, [decisions, editorDoc, renderedChanges]);
+  }, [decisions, editorDoc, renderedChanges, metadataPending]);
   const count = navigation.length;
   const markdown = draft.cleanMarkdown ?? draft.markdown;
   const cleanSaved = useMemo(
@@ -749,7 +948,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         <TipButton
           tip={
             formatted
-              ? "Show Markdown without pending suggestions or comments."
+              ? "Show full Markdown source, including suggestions and comments. Source editing requires Edit mode."
               : "Show the formatted document."
           }
           data-testid="revision-format"
@@ -759,23 +958,29 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           variant="ghost"
           onClick={() => {
             setMoreOpen(false);
-            captures.current();
+            setSourceReading(captures.current() ?? null);
             if (formatted) currentDraft();
-            setFormatted(!formatted);
+            setPreferences({ formatted: !formatted });
           }}
         >
           <FileCode2 aria-hidden="true" />
         </TipButton>
         <TipButton
-          tip="Copy Markdown without pending suggestions or comments."
+          tip={
+            previewing
+              ? "Copy the visible outcome preview as Markdown."
+              : "Copy Markdown without pending suggestions or comments."
+          }
           aria-label="Copy Markdown"
           data-testid="revision-copy"
           variant="ghost"
           size="icon"
           onClick={() => {
-            const draft = currentDraft();
+            const draft = previewing ? null : currentDraft();
             void copyRevisionMarkdown(
-              draft.cleanMarkdown ?? draft.markdown,
+              previewing
+                ? (preview?.markdown ?? "")
+                : (draft?.cleanMarkdown ?? draft?.markdown ?? ""),
             ).then(() => {
               setCopied(true);
               window.setTimeout(() => setCopied(false), 1400);
@@ -785,15 +990,21 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           {copied ? <Check /> : <Copy />}
         </TipButton>
         <TipButton
-          tip="Download Markdown without pending suggestions or comments."
+          tip={
+            previewing
+              ? "Download the visible outcome preview as Markdown."
+              : "Download Markdown without pending suggestions or comments."
+          }
           aria-label="Download Markdown"
           data-testid="revision-download"
           variant="ghost"
           size="icon"
           onClick={() => {
-            const draft = currentDraft();
+            const draft = previewing ? null : currentDraft();
             downloadRevisionMarkdown(
-              draft.cleanMarkdown ?? draft.markdown,
+              previewing
+                ? (preview?.markdown ?? "")
+                : (draft?.cleanMarkdown ?? draft?.markdown ?? ""),
               filename,
             );
           }}
@@ -801,6 +1012,19 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           <Download />
         </TipButton>
       </div>
+      <TipButton
+        tip="Inspect reviewed changes and reopen a decision."
+        aria-label="Reviewed changes"
+        data-testid="revision-reviewed"
+        variant="ghost"
+        disabled={!reviewed.length}
+        onClick={() => {
+          setMoreOpen(false);
+          setHistoryOpen(true);
+        }}
+      >
+        Reviewed changes{reviewed.length ? ` (${reviewed.length})` : ""}
+      </TipButton>
       {buttonHandoff && (
         <div
           className="revision-tool-group"
@@ -917,8 +1141,14 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
             <Select<DocumentInteractionMode>
               value={interaction}
               onValueChange={(mode) => {
-                if (mode !== "editing" && mode !== "suggesting") return;
-                setInteraction(mode);
+                if (
+                  mode !== "editing" &&
+                  mode !== "suggesting" &&
+                  mode !== "viewing"
+                )
+                  return;
+                currentDraft();
+                setPreferences({ interaction: mode });
                 setBlocked(false);
               }}
             >
@@ -926,17 +1156,30 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 data-testid="revision-mode"
                 aria-label="Editing mode"
                 className="revision-mode-select"
+                disabled={previewing}
                 title={
                   blocked
                     ? "Use Edit for formatting or structural changes."
-                    : "Edit directly or suggest changes for review."
+                    : "Read without editing, edit directly, or suggest changes for review."
                 }
               >
                 <SelectValue>
-                  {interaction === "suggesting" ? "Suggest" : "Edit"}
+                  {interaction === "suggesting"
+                    ? "Suggest"
+                    : interaction === "viewing"
+                      ? "Read"
+                      : "Edit"}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
+                <SelectItem
+                  value="viewing"
+                  label="Read"
+                  data-testid="revision-mode-read"
+                  className="min-h-11 text-sm"
+                >
+                  <SelectItemText>Read</SelectItemText>
+                </SelectItem>
                 <SelectItem
                   value="editing"
                   label="Edit"
@@ -955,6 +1198,62 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 </SelectItem>
               </SelectContent>
             </Select>
+            <Select<RevisionView>
+              value={view}
+              onValueChange={(next) => {
+                if (
+                  next !== "changes" &&
+                  next !== "accepted" &&
+                  next !== "rejected"
+                )
+                  return;
+                setSourceReading(captures.current() ?? null);
+                currentDraft();
+                setPreferences({ view: next });
+                setMoreOpen(false);
+              }}
+            >
+              <SelectTrigger
+                data-testid="revision-view"
+                aria-label="Document view"
+                className="revision-mode-select"
+                title="Preview outcomes without changing the review or file."
+              >
+                <SelectValue>
+                  {view === "accepted"
+                    ? "All accepted"
+                    : view === "rejected"
+                      ? "All rejected"
+                      : "Changes"}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem
+                  value="changes"
+                  data-testid="revision-view-changes"
+                  label="Changes"
+                  className="min-h-11 text-sm"
+                >
+                  <SelectItemText>Changes</SelectItemText>
+                </SelectItem>
+                <SelectItem
+                  value="rejected"
+                  data-testid="revision-view-rejected"
+                  label="All rejected"
+                  className="min-h-11 text-sm"
+                >
+                  <SelectItemText>All rejected</SelectItemText>
+                </SelectItem>
+                <SelectItem
+                  value="accepted"
+                  data-testid="revision-view-accepted"
+                  label="All accepted"
+                  className="min-h-11 text-sm"
+                >
+                  <SelectItemText>All accepted</SelectItemText>
+                </SelectItem>
+              </SelectContent>
+            </Select>
             <div
               className="revision-tool-group"
               aria-label="Document history"
@@ -966,7 +1265,14 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 data-testid="revision-undo"
                 variant="ghost"
                 size="icon"
-                disabled={!editor || undoDepth(editor.state) === 0}
+                disabled={
+                  !editor ||
+                  previewing ||
+                  interaction === "viewing" ||
+                  busy ||
+                  writePaused ||
+                  undoDepth(editor.state) === 0
+                }
                 onClick={() => editor?.commands.undo()}
               >
                 <Undo2 />
@@ -977,7 +1283,14 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 data-testid="revision-redo"
                 variant="ghost"
                 size="icon"
-                disabled={!editor || redoDepth(editor.state) === 0}
+                disabled={
+                  !editor ||
+                  previewing ||
+                  interaction === "viewing" ||
+                  busy ||
+                  writePaused ||
+                  redoDepth(editor.state) === 0
+                }
                 onClick={() => editor?.commands.redo()}
               >
                 <Redo2 />
@@ -1012,7 +1325,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 data-testid="revision-previous-change"
                 variant="ghost"
                 size="icon"
-                disabled={!formatted || !count}
+                disabled={!formatted || previewing || !count}
                 onClick={() => navigate(-1)}
               >
                 <ArrowUp />
@@ -1030,35 +1343,38 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 data-testid="revision-next-change"
                 variant="ghost"
                 size="icon"
-                disabled={!formatted || !count}
+                disabled={!formatted || previewing || !count}
                 onClick={() => navigate(1)}
               >
                 <ArrowDown />
               </TipButton>
-              {formatted && count > 0 && (
-                <>
-                  <TipButton
-                    tip={`Accept pending changes. Current change: ${reviewShortcutLabel("accept")}`}
-                    variant="outline"
-                    size="sm"
-                    disabled={decisionsDisabled}
-                    data-testid="revision-accept-all"
-                    onClick={() => decideAll("accept")}
-                  >
-                    Accept all
-                  </TipButton>
-                  <TipButton
-                    tip={`Reject pending changes. Current change: ${reviewShortcutLabel("reject")}`}
-                    variant="outline"
-                    size="sm"
-                    disabled={decisionsDisabled}
-                    data-testid="revision-reject-all"
-                    onClick={() => decideAll("reject")}
-                  >
-                    Reject all
-                  </TipButton>
-                </>
-              )}
+              {formatted &&
+                !previewing &&
+                interaction !== "viewing" &&
+                count > 0 && (
+                  <>
+                    <TipButton
+                      tip={`Accept pending changes. Current change: ${reviewShortcutLabel("accept")}`}
+                      variant="outline"
+                      size="sm"
+                      disabled={decisionsDisabled}
+                      data-testid="revision-accept-all"
+                      onClick={() => decideAll("accept")}
+                    >
+                      Accept all
+                    </TipButton>
+                    <TipButton
+                      tip={`Reject pending changes. Current change: ${reviewShortcutLabel("reject")}`}
+                      variant="outline"
+                      size="sm"
+                      disabled={decisionsDisabled}
+                      data-testid="revision-reject-all"
+                      onClick={() => decideAll("reject")}
+                    >
+                      Reject all
+                    </TipButton>
+                  </>
+                )}
             </div>
             {compactTools ? (
               <Popover open={moreOpen} onOpenChange={setMoreOpen}>
@@ -1136,7 +1452,52 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           </p>
         )}
         <div ref={documentRef}>
-          <div hidden={!formatted}>
+          <div hidden={!formatted || previewing}>
+            {metadataPending && (
+              <section
+                className="revision-metadata-change"
+                data-testid="revision-metadata"
+                data-review-rail-anchor="document-metadata"
+              >
+                <h2>Document metadata</h2>
+                <p>YAML fields changed between these versions.</p>
+                <div className="revision-metadata-versions">
+                  <div>
+                    <strong>Before</strong>
+                    <pre>
+                      {[metadataOld.frontmatter, metadataOld.endmatter]
+                        .filter(Boolean)
+                        .join("\n") || "No metadata"}
+                    </pre>
+                  </div>
+                  <div>
+                    <strong>After</strong>
+                    <pre>
+                      {[metadataNew.frontmatter, metadataNew.endmatter]
+                        .filter(Boolean)
+                        .join("\n") || "No metadata"}
+                    </pre>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    data-testid="revision-metadata-accept"
+                    disabled={decisionsDisabled}
+                    onClick={() => deciding("document-metadata", true)}
+                  >
+                    Keep
+                  </Button>
+                  <Button
+                    variant="outline"
+                    data-testid="revision-metadata-reject"
+                    disabled={decisionsDisabled}
+                    onClick={() => deciding("document-metadata", false)}
+                  >
+                    Revert
+                  </Button>
+                </div>
+              </section>
+            )}
             <RichTextEditorSurface
               page={page}
               activeDocumentPath={sourcePath ? pathLeaf(sourcePath) : null}
@@ -1145,7 +1506,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               focusRequestKey={null}
               sourceMarkdown={source.markdown}
               onMarkdownChange={changeMarkdown}
-              interactionMode={interaction}
+              interactionMode={previewing ? "viewing" : interaction}
               beforeNavigate={async () => {
                 try {
                   currentDraft();
@@ -1195,21 +1556,192 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               </div>
             )}
           </div>
-          {!formatted && (
-            <div className="review-layout-grid">
-              <div className="review-layout-main revision-markdown">
-                <pre
-                  data-comparison-anchor="unit-0"
-                  data-testid="revision-markdown"
-                  className="revision-source-text"
-                >
-                  {markdown}
-                </pre>
-              </div>
+          {previewing && (
+            <div data-testid="revision-preview">
+              <p className="revision-preview-label" role="status">
+                {view === "accepted" ? "All accepted" : "All rejected"} ·
+                Read-only preview
+              </p>
+              {preview?.error && <p role="alert">{preview.error}</p>}
+              {reviewed.some((change) => change.stale) && (
+                <p className="revision-preview-label">
+                  Some older decisions cannot be replayed because their passages
+                  changed.
+                </p>
+              )}
+              {formatted && preview?.doc && (
+                <RichTextEditorSurface
+                  page={{ ...page, id: `${page.id}-preview` }}
+                  activeDocumentPath={
+                    previewPath ? pathLeaf(previewPath) : null
+                  }
+                  selected
+                  layout="default"
+                  focusRequestKey={null}
+                  sourceMarkdown={preview.markdown}
+                  onMarkdownChange={() => {}}
+                  interactionMode="viewing"
+                  backend={previewBackend}
+                  controlledReview={{
+                    doc: preview.doc,
+                    suggestions: [],
+                    comments: new Map(),
+                    blockHighlights: [],
+                    canDecide: false,
+                    disabled: true,
+                    acceptLabel: "Keep",
+                    rejectLabel: "Revert",
+                    onAccept: () => {},
+                    onReject: () => {},
+                    onCreateComment: () => null,
+                    onUpdateComment: () => {},
+                    onDeleteComment: () => {},
+                  }}
+                />
+              )}
             </div>
+          )}
+          {!formatted && (
+            <>
+              <div hidden={previewing}>
+                <div className="review-layout-grid">
+                  <div
+                    className="review-layout-main revision-markdown"
+                    data-comparison-anchor="unit-0"
+                  >
+                    <MarkdownCodeEditor
+                      key="working-source"
+                      sourceHistory={{
+                        undo: () => {
+                          if (
+                            !previewing &&
+                            interaction !== "viewing" &&
+                            !busy &&
+                            !writePaused &&
+                            !disk &&
+                            !sendOpen
+                          )
+                            editor?.commands.undo();
+                        },
+                        redo: () => {
+                          if (
+                            !previewing &&
+                            interaction !== "viewing" &&
+                            !busy &&
+                            !writePaused &&
+                            !disk &&
+                            !sendOpen
+                          )
+                            editor?.commands.redo();
+                        },
+                      }}
+                      readingPosition={previewing ? null : sourceReading}
+                      testId="revision-markdown"
+                      className="revision-source-text"
+                      value={draft.markdown}
+                      readOnly={previewing || interaction !== "editing"}
+                      onChange={(next) => {
+                        if (!previewing && interaction === "editing")
+                          sourceUpdateRef.current?.(next, readDraft().markdown);
+                      }}
+                    />
+                    {interaction === "suggesting" && (
+                      <p className="text-sm text-muted-foreground">
+                        Switch to Edit to change Markdown source. Suggest in the
+                        formatted document.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+              {previewing && (
+                <div className="review-layout-grid">
+                  <div
+                    className="review-layout-main revision-markdown"
+                    data-comparison-anchor="unit-0"
+                  >
+                    <MarkdownCodeEditor
+                      key="outcome-source"
+                      readingPosition={sourceReading}
+                      testId="revision-preview-markdown"
+                      className="revision-source-text"
+                      value={preview?.markdown ?? ""}
+                      readOnly
+                      onChange={() => {}}
+                    />
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </div>
       </main>
+      <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
+        <DialogContent
+          className="max-w-2xl"
+          data-testid="revision-reviewed-dialog"
+        >
+          <DialogTitle>Reviewed changes</DialogTitle>
+          <DialogDescription>
+            Inspect previous decisions. Reopen a change to review it again;
+            unrelated edits stay in place.
+          </DialogDescription>
+          <div className="revision-reviewed-list">
+            {reviewed.map((change) => (
+              <section key={change.id} className="revision-reviewed-item">
+                <strong>
+                  {change.decision === "accept" ? "Accepted" : "Rejected"}
+                </strong>
+                {change.oldText && (
+                  <p>
+                    <span className="text-muted-foreground">Before: </span>
+                    {change.oldText}
+                  </p>
+                )}
+                {change.newText && (
+                  <p>
+                    <span className="text-muted-foreground">After: </span>
+                    {change.newText}
+                  </p>
+                )}
+                {change.stale && (
+                  <p className="text-sm text-muted-foreground">
+                    This passage was edited after the decision. Reopening would
+                    overwrite those edits.
+                  </p>
+                )}
+                <Button
+                  variant="outline"
+                  disabled={change.stale || decisionsDisabled}
+                  data-testid="revision-reopen-change"
+                  onClick={() => {
+                    if (!editor) return;
+                    const transaction = reopenReviewedChange(
+                      editor.state,
+                      change.id,
+                    );
+                    if (!transaction) {
+                      setActionError(
+                        "This passage changed. Your newer edits have been preserved.",
+                      );
+                      return;
+                    }
+                    editor.view.dispatch(
+                      closeHistory(transaction)
+                        .setMeta(referenceDecision, true)
+                        .setMeta(explicitReviewEdit, true),
+                    );
+                    editor.view.dispatch(closeHistory(editor.state.tr));
+                    setHistoryOpen(false);
+                  }}
+                >
+                  Reopen change
+                </Button>
+              </section>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
       <Dialog
         open={disk !== null}
         onOpenChange={(open) => {

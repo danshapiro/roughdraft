@@ -1,3 +1,4 @@
+import { EditorView } from "@codemirror/view";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -31,6 +32,19 @@ let container: HTMLDivElement;
 let root: ReturnType<typeof createRoot>;
 
 beforeEach(() => {
+  Object.defineProperty(Range.prototype, "getClientRects", {
+    configurable: true,
+    value: () => [],
+  });
+  Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+    configurable: true,
+    value: () => new DOMRect(),
+  });
+  const storage = new Map<string, string>();
+  vi.stubGlobal("localStorage", {
+    getItem: (key: string) => storage.get(key) ?? null,
+    setItem: (key: string, value: string) => storage.set(key, value),
+  });
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("matchMedia", () => ({
     matches: false,
@@ -54,6 +68,8 @@ afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
   vi.unstubAllGlobals();
+  Reflect.deleteProperty(Range.prototype, "getClientRects");
+  Reflect.deleteProperty(Range.prototype, "getBoundingClientRect");
 });
 
 function review(overrides: Record<string, unknown> = {}): ComparisonReviewData {
@@ -188,5 +204,11 @@ test("the Markdown icon exposes its action and active state", async () => {
   expect(byId("revision-format")?.getAttribute("aria-label")).toBe(
     "Show formatted document",
   );
-  expect(byId("revision-markdown")?.textContent).toBe("Revised text\n");
+  const host =
+    byId("revision-markdown")?.querySelector<HTMLElement>(".cm-editor");
+  expect(host).toBeTruthy();
+  if (!host) throw new Error("Markdown editor was not mounted");
+  const source = EditorView.findFromDOM(host);
+  expect(source?.state.doc.toString()).toBe("Revised text\n");
+  expect(source?.state.readOnly).toBe(false);
 });

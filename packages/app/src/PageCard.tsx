@@ -22,6 +22,7 @@ import { buildLocationForLinkedMarkdownDocument } from "./app-navigation";
 import { CommentEditorList } from "./CommentEditorList";
 import { Button } from "./components/ui/button";
 import type { ControlledDocumentReview } from "./controlled-review";
+import type { ReviewedChange } from "./comparison-types";
 import {
   type CriticChangeAttrs,
   type CriticComment,
@@ -62,11 +63,24 @@ import {
   type ReviewDecision,
   reviewShortcut,
 } from "./review-decisions";
-import { editableMarkdownOptions } from "./revision-markdown";
+import {
+  createSourceSpellingPreserver,
+  sameRevisionMarkup,
+  editableMarkdownOptions,
+} from "./revision-markdown";
+import { createReviewedChangesPlugin } from "./revision-history";
 import {
   projectAcceptedDocument,
   suggestionPositions,
 } from "./revision-projection";
+import {
+  replaceRevisionSource,
+  RevisionSource,
+  revisionSourceComments,
+  revisionSourceMetadata,
+  mergeSourceHistoryComments,
+  sameSourceContent,
+} from "./revision-source";
 import type { Page, StorageBackend } from "./storage";
 import { useCommentAnchorLayout } from "./useCommentAnchorLayout";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
@@ -132,7 +146,7 @@ interface RichTextEditorSurfaceProps {
   layout: "default" | "embedded-demo";
   focusRequestKey: string | null;
   sourceMarkdown: string;
-  onMarkdownChange: (markdown: string) => void;
+  onMarkdownChange: (markdown: string, origin?: "source") => void;
   interactionMode: DocumentInteractionMode;
   backend: StorageBackend;
   onEditorReady?: (editor: Editor | null) => void;
@@ -147,6 +161,7 @@ interface EditableReviewSurface {
   disabled?: boolean;
   activeChangeId?: string | null;
   decisions: string[];
+  reviewed?: ReviewedChange[];
   comments: ReadonlyMap<string, CriticComment>;
   onCommentsChange: (comments: Map<string, CriticComment>) => void;
   // Return true to handle or defer the action; false uses the native command.
@@ -154,14 +169,24 @@ interface EditableReviewSurface {
   onReject: (changeId: string, applyNative: () => void) => boolean;
   onBlockedSuggestionEdit: () => void;
   markdownFlushRef?: RefObject<(() => void) | null>;
+  sourceUpdateRef?: RefObject<
+    ((markdown: string, previous?: string) => void) | null
+  >;
   onMarkdownQueued?: () => void;
 }
 
 const ReviewDecisions = Extension.create({
   name: "reviewDecisions",
   addGlobalAttributes: () => [
-    { types: ["doc"], attributes: { kept: { default: [], rendered: false } } },
+    {
+      types: ["doc"],
+      attributes: {
+        kept: { default: [], rendered: false },
+        reviewed: { default: [], rendered: false },
+      },
+    },
   ],
+  addProseMirrorPlugins: () => [createReviewedChangesPlugin()],
 });
 
 interface CodeEditorSurfaceProps {
@@ -824,6 +849,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   }, [suppliedSuggestions, criticChanges, isEditableReview, comments]);
   const frontmatterRef = useRef<string | null>(parsedContent.frontmatter);
   const endmatterRef = useRef<string | null>(parsedContent.endmatter);
+  const sourceCommentsRef = useRef<Map<string, CriticComment> | null>(null);
 
   useEffect(() => {
     commentsRef.current = comments;
@@ -869,18 +895,45 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       const currentDoc = doc ?? currentEditor?.getJSON();
       if (!currentDoc) return;
 
+      const sourceMetadata = currentEditor
+        ? revisionSourceMetadata(currentEditor.state.doc)
+        : null;
       const nextMarkdown = editorStateToCriticMarkdown(
         currentDoc,
         nextComments ?? commentsRef.current,
         {
-          frontmatter: frontmatterRef.current,
-          endmatter: endmatterRef.current,
+          frontmatter: sourceMetadata
+            ? sourceMetadata.frontmatter
+            : frontmatterRef.current,
+          endmatter: sourceMetadata
+            ? sourceMetadata.endmatter
+            : endmatterRef.current,
         },
       );
       currentMarkdownRef.current = nextMarkdown;
+      if (
+        isEditableReview &&
+        currentEditor &&
+        sourceMetadata &&
+        sourceMetadata.markdown !== nextMarkdown
+      ) {
+        resolvingSuggestionRef.current = true;
+        try {
+          currentEditor.view.dispatch(
+            currentEditor.state.tr
+              .setDocAttribute("sourceMetadata", {
+                ...sourceMetadata,
+                markdown: nextMarkdown,
+              })
+              .setMeta("addToHistory", false),
+          );
+        } finally {
+          resolvingSuggestionRef.current = false;
+        }
+      }
       onMarkdownChange(nextMarkdown);
     },
-    [onMarkdownChange],
+    [onMarkdownChange, isEditableReview],
   );
 
   const flushPendingMarkdown = useCallback(() => {
@@ -918,6 +971,24 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     }
     commentsRef.current = next;
     setComments(next);
+    const sourceComments = sourceCommentsRef.current;
+    sourceCommentsRef.current = null;
+    if (
+      sourceComments &&
+      sourceComments.size === next.size &&
+      [...sourceComments].every(([id, comment]) => {
+        const saved = next.get(id);
+        return (
+          saved?.content === comment.content &&
+          saved?.createdAt === comment.createdAt &&
+          saved?.parentCommentId === comment.parentCommentId &&
+          saved?.authorType === comment.authorType &&
+          saved?.authorId === comment.authorId &&
+          saved?.scope === comment.scope
+        );
+      })
+    )
+      return;
     emitMarkdownChange(undefined, next);
   }, [editableReview?.comments, emitMarkdownChange]);
 
@@ -969,18 +1040,32 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     {
       extensions: [
         ...createEditorExtensions("Start writing..."),
-        ...(isEditableReview ? [ReviewDecisions] : []),
+        ...(isEditableReview ? [ReviewDecisions, RevisionSource] : []),
       ],
       content:
         controlledReview?.doc ??
         (editableReview
-          ? { ...parsedContent.doc, attrs: { kept: editableReview.decisions } }
+          ? {
+              ...parsedContent.doc,
+              attrs: {
+                kept: editableReview.decisions,
+                reviewed: editableReview.reviewed ?? [],
+                sourceMetadata: {
+                  markdown: sourceMarkdown,
+                  sourceSpelling: sourceMarkdown,
+                  sourceComments: [...editableReview.comments.values()],
+                  frontmatter: parsedContent.frontmatter,
+                  endmatter: parsedContent.endmatter,
+                },
+              },
+            }
           : parsedContent.doc),
       immediatelyRender: false,
       shouldRerenderOnTransaction: false,
       editorProps: {
         attributes: {
           class: "tiptap min-h-[70vh]",
+          tabindex: "0",
           ...(isEditableReview ? { "data-comparison-anchor": "unit-0" } : {}),
         },
         handleDrop: (_view, event) => {
@@ -1456,6 +1541,91 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
 
         const before = transaction.before;
         const after = currentEditor.state.doc;
+        const sourceMetadata = revisionSourceMetadata(after);
+        if (
+          isHistoryTransaction(transaction) &&
+          sourceMetadata &&
+          sourceMetadata.markdown !== undefined &&
+          before.attrs.sourceMetadata !== after.attrs.sourceMetadata
+        ) {
+          const nextComments = mergeSourceHistoryComments(
+            revisionSourceMetadata(before)?.sourceComments,
+            sourceMetadata.sourceComments,
+            commentsRef.current,
+          );
+          const options = {
+            frontmatter: sourceMetadata.frontmatter,
+            endmatter: sourceMetadata.endmatter,
+          };
+          const canonicalNext = editorStateToCriticMarkdown(
+            after.toJSON(),
+            nextComments,
+            options,
+          );
+          const raw = sourceMetadata.sourceSpelling;
+          const canRestoreRaw =
+            raw !== undefined &&
+            sameSourceContent(
+              replaceRevisionSource(currentEditor.state, raw).transaction.doc,
+              after,
+            );
+          let markdown = canonicalNext;
+          if (canRestoreRaw && raw !== undefined) {
+            const parsed = criticMarkdownToEditorState(
+              raw,
+              editableMarkdownOptions,
+            );
+            const beforeComments = new Map(
+              [...parsed.comments].map(([id, comment]) => [
+                id,
+                {
+                  ...comment,
+                  createdAt:
+                    nextComments.get(id)?.createdAt ?? comment.createdAt,
+                },
+              ]),
+            );
+            const canonicalBefore = editorStateToCriticMarkdown(
+              after.toJSON(),
+              beforeComments,
+              options,
+            );
+            const preserved = createSourceSpellingPreserver(
+              raw,
+              canonicalBefore,
+            )(canonicalNext);
+            if (
+              preserved !== null &&
+              sameRevisionMarkup(preserved, canonicalNext)
+            )
+              markdown = preserved;
+          }
+          frontmatterRef.current = sourceMetadata.frontmatter;
+          endmatterRef.current = sourceMetadata.endmatter;
+          commentsRef.current = nextComments;
+          setComments(nextComments);
+          sourceCommentsRef.current = nextComments;
+          editableReviewRef.current?.onCommentsChange(nextComments);
+          if (sourceMetadata.markdown !== markdown) {
+            resolvingSuggestionRef.current = true;
+            try {
+              currentEditor.view.dispatch(
+                currentEditor.state.tr
+                  .setDocAttribute("sourceMetadata", {
+                    ...sourceMetadata,
+                    markdown,
+                  })
+                  .setMeta("addToHistory", false),
+              );
+            } finally {
+              resolvingSuggestionRef.current = false;
+            }
+          }
+          currentMarkdownRef.current = markdown;
+          onMarkdownChange(markdown, canRestoreRaw ? "source" : undefined);
+          refreshCriticChanges();
+          return;
+        }
         const trailing = after.lastChild;
         // StarterKit adds an empty typing paragraph after an endnote, table or
         // other final block. This reading-only normalization must not serialize
@@ -1510,6 +1680,85 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   selectedChangeIdRef.current = selectedChangeId;
   hoveredChangeIdRef.current = hoveredChangeId;
   hoveredCommentIdRef.current = hoveredCommentId;
+
+  const sourceUpdateRef = editableReview?.sourceUpdateRef;
+  useLayoutEffect(() => {
+    if (!sourceUpdateRef || !editor) return;
+    sourceUpdateRef.current = (markdown, previous) => {
+      const review = editableReviewRef.current;
+      if (
+        !review ||
+        editor.isDestroyed ||
+        interactionModeRef.current !== "editing"
+      )
+        return;
+      flushPendingMarkdown();
+      const baseline = previous ?? currentMarkdownRef.current;
+      resolvingSuggestionRef.current = true;
+      try {
+        const snapshot = revisionSourceMetadata(editor.state.doc);
+        if (
+          snapshot?.markdown !== baseline ||
+          JSON.stringify(snapshot.sourceComments ?? []) !==
+            JSON.stringify([...commentsRef.current.values()])
+        ) {
+          const baselineMetadata = criticMarkdownToEditorState(
+            baseline,
+            editableMarkdownOptions,
+          );
+          editor.view.dispatch(
+            closeHistory(
+              editor.state.tr.setDocAttribute("sourceMetadata", {
+                markdown: baseline,
+                sourceSpelling: baseline,
+                frontmatter: baselineMetadata.frontmatter,
+                endmatter: baselineMetadata.endmatter,
+                sourceComments: [...commentsRef.current.values()],
+              }),
+            )
+              .setMeta("addToHistory", false)
+              .setMeta(explicitReviewEdit, true),
+          );
+        }
+        const parsed = replaceRevisionSource(editor.state, markdown);
+        const nextComments = revisionSourceComments(
+          markdown,
+          currentMarkdownRef.current,
+          parsed.comments,
+          commentsRef.current,
+        );
+        frontmatterRef.current = parsed.frontmatter;
+        endmatterRef.current = parsed.endmatter;
+        commentsRef.current = nextComments;
+        setComments(nextComments);
+        sourceCommentsRef.current = nextComments;
+        editor.view.dispatch(
+          parsed.transaction
+            .setDocAttribute("sourceMetadata", {
+              ...parsed.transaction.doc.attrs.sourceMetadata,
+              sourceSpelling: markdown,
+              sourceComments: [...nextComments.values()],
+            })
+            .setMeta(explicitReviewEdit, true),
+        );
+        review.onCommentsChange(nextComments);
+        currentMarkdownRef.current = markdown;
+        onMarkdownChange(markdown, "source");
+        refreshCriticChanges();
+      } finally {
+        resolvingSuggestionRef.current = false;
+      }
+    };
+    return () => {
+      sourceUpdateRef.current = null;
+    };
+  }, [
+    editor,
+    flushPendingMarkdown,
+    onMarkdownChange,
+    refreshCriticChanges,
+    sourceUpdateRef,
+  ]);
 
   useEffect(() => {
     editor?.setEditable(!isControlled && interactionMode !== "viewing", false);
