@@ -63,6 +63,14 @@ Use `roughdraft snapshot AGENTS.md --out AGENTS.before.md` before making changes
 Older comparison links still open their original review. `roughdraft open` and `roughdraft mcp` continue to support the original inline CriticMarkup workflow for tools that use it.
 
 ## Local development
+
+For a server reached from another machine, set `ROUGHDRAFT_BIND_HOST` and
+`ROUGHDRAFT_TOKEN`, then open files from their source machine with
+`roughdraft open ./draft.md --host https://your-roughdraft-server` using the same
+token. Keep that CLI running while you edit. Network-bound servers support
+remote document sessions; they do not browse, edit, or compare files on the
+server itself. Use a loopback-only server for those local-file workflows.
+
 ```bash
 ./scripts/setup.sh
 ./scripts/run.sh
