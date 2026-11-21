@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import type { Editor } from "@tiptap/react";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -505,6 +506,84 @@ describe("PageCard editor integration", () => {
       "doc-1",
       expect.stringContaining("Start now"),
     );
+    expect(rendered.onSaveStateChange.mock.calls.at(-1)?.[0]).toBe("saved");
+  });
+
+  it("waits for an active autosave before saving newer edits", async () => {
+    const rendered = await renderPageCard();
+    const pendingSaves: Array<() => void> = [];
+    let activeWrites = 0;
+    const logWrite = (event: string) => {
+      if (!process.env.THOUGHTFUL_SLOG_FILE) return;
+      appendFileSync(
+        process.env.THOUGHTFUL_SLOG_FILE,
+        `${JSON.stringify({
+          ts: new Date().toISOString(),
+          runId: process.env.THOUGHTFUL_SLOG_RUN_ID,
+          severity: "info",
+          source: "PageCard.autosave-regression",
+          event,
+          data: { activeWrites },
+        })}\n`,
+      );
+    };
+    rendered.onSave.mockImplementation(() => {
+      activeWrites += 1;
+      logWrite("save.started");
+      return new Promise<void>((resolve) => {
+        pendingSaves.push(() => {
+          activeWrites -= 1;
+          logWrite("save.completed");
+          resolve();
+        });
+      });
+    });
+    vi.useFakeTimers();
+
+    await insertTextAtEnd(rendered.getEditor(), " first");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+
+    await insertTextAtEnd(rendered.getEditor(), " second");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    const writesBeforeFirstSaveCompleted = rendered.onSave.mock.calls.length;
+    rendered.onSave.mockResolvedValue(undefined);
+    await act(async () => {
+      for (const resolve of pendingSaves) resolve();
+      await Promise.resolve();
+    });
+
+    expect(writesBeforeFirstSaveCompleted).toBe(1);
+    expect(rendered.onSave.mock.calls.at(-1)?.[1]).toContain(
+      "Start first second",
+    );
+  });
+
+  it("shares one write when manual save is requested twice", async () => {
+    const rendered = await renderPageCard();
+    const finishSaves: Array<() => void> = [];
+    rendered.onSave.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishSaves.push(resolve);
+        }),
+    );
+    vi.useFakeTimers();
+    await insertTextAtEnd(rendered.getEditor(), " changed");
+
+    let writesBeforeCompletion = 0;
+    await act(async () => {
+      const first = rendered.getSaveController().flushSave();
+      const second = rendered.getSaveController().flushSave();
+      writesBeforeCompletion = rendered.onSave.mock.calls.length;
+      for (const finish of finishSaves) finish();
+      await Promise.all([first, second]);
+    });
+    expect(writesBeforeCompletion).toBe(1);
     expect(rendered.onSaveStateChange.mock.calls.at(-1)?.[0]).toBe("saved");
   });
 

@@ -58,6 +58,76 @@ function createRawMarkdownBlock(markdown: string): string {
   )}"></div>\n`;
 }
 
+/** Keep literal blocks intact while applying document-level rewrites. */
+function transformOutsideCode(
+  markdown: string,
+  transform: (prose: string) => string,
+  options: { inline?: boolean; indented?: boolean } = {},
+): string {
+  // Marked normalizes CRLF and omits reference definitions from its token list.
+  // Use its code boundaries, but always transform slices of the original source.
+  const originalOffsets = [0];
+  for (let offset = 0; offset < markdown.length; offset += 1) {
+    if (markdown[offset] === "\r" && markdown[offset + 1] === "\n") offset += 1;
+    originalOffsets.push(offset + 1);
+  }
+  const normalized = markdown.replace(/\r\n?/g, "\n");
+  const ranges: Array<{ start: number; end: number }> = [];
+  let tokenOffset = 0;
+  for (const token of marked.lexer(normalized)) {
+    const start = normalized.indexOf(token.raw, tokenOffset);
+    if (start < 0) continue;
+    tokenOffset = start + token.raw.length;
+    let literalOffset = start;
+    marked.walkTokens([token], (nested) => {
+      if (nested.type !== "code" && nested.type !== "codespan") return;
+      if (nested.type === "codespan" && options.inline === false) return;
+      if (
+        nested.type === "code" &&
+        nested.codeBlockStyle === "indented" &&
+        options.indented === false
+      )
+        return;
+      let literalStart = normalized.indexOf(nested.raw, literalOffset);
+      let literalEnd = literalStart + nested.raw.length;
+      if (literalStart < 0 || literalEnd > tokenOffset) {
+        // Nested token sources omit list indentation and blockquote prefixes.
+        // Allow those prefixes between lines without excluding sibling HTML.
+        const pattern = nested.raw
+          .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+          .replace(/\n(?!$)/g, "\n[ \\t]*(?:>[ \\t]*)*");
+        const match = normalized
+          .slice(literalOffset, tokenOffset)
+          .match(new RegExp(pattern));
+        if (!match || match.index === undefined) return;
+        literalStart = literalOffset + match.index;
+        literalEnd = literalStart + match[0].length;
+      }
+      ranges.push({ start: literalStart, end: literalEnd });
+      literalOffset = literalEnd;
+    });
+  }
+  const transformSlice = (start: number, end: number) => {
+    if (start === end) return "";
+    // Regex anchors must see the original line context rather than treating
+    // the edge of an inline-code span as a new line or end of line.
+    const prefix = start > 0 && markdown[start - 1] !== "\n" ? "x" : "";
+    const suffix = end < markdown.length && markdown[end] !== "\n" ? "x" : "";
+    const result = transform(prefix + markdown.slice(start, end) + suffix);
+    return result.slice(prefix.length, suffix ? -1 : undefined);
+  };
+  let output = "";
+  let sourceOffset = 0;
+  for (const range of ranges) {
+    const originalStart = originalOffsets[range.start];
+    const originalEnd = originalOffsets[range.end];
+    output += transformSlice(sourceOffset, originalStart);
+    output += markdown.slice(originalStart, originalEnd);
+    sourceOffset = originalEnd;
+  }
+  return output + transformSlice(sourceOffset, markdown.length);
+}
+
 function protectRawHtmlBlocks(markdown: string): string {
   return markdown
     .replace(
@@ -116,14 +186,23 @@ function protectPipeSensitiveTables(markdown: string): string {
 }
 
 export function protectRichTextRoundTripMarkdown(markdown: string): string {
-  return protectPipeSensitiveTables(
-    protectIndentedCodeAfterLists(protectRawHtmlBlocks(markdown)),
-  );
+  // Whole-list and whole-table protection needs the complete container, even
+  // when one of its cells/items contains inline code. Literal fences remain
+  // excluded from every preprocessing stage.
+  const lists = transformOutsideCode(markdown, protectIndentedCodeAfterLists, {
+    inline: false,
+    indented: false,
+  });
+  const html = transformOutsideCode(lists, protectRawHtmlBlocks);
+  return transformOutsideCode(html, protectPipeSensitiveTables, {
+    inline: false,
+  });
 }
 
 function normalizeMarkdownPath(path: string): string {
-  if (path.startsWith("./") || path.startsWith("../")) return path;
-  return `./${path.replace(/^\/+/, "")}`;
+  if (path.startsWith("/") || path.startsWith("./") || path.startsWith("../"))
+    return path;
+  return `./${path}`;
 }
 
 /** Give equivalent relative destinations the same editor mark attributes. */
@@ -435,7 +514,7 @@ export function createTurndownService(): TurndownService {
       const trimmed = content
         .replace(/^\n+/, "")
         .replace(/\n+$/, "\n")
-        .replace(/\n/gm, "\n  ");
+        .replace(/\n(?!$)/g, "\n  ");
 
       let prefix = `${options.bulletListMarker} `;
       const parent = node.parentNode;
@@ -481,9 +560,6 @@ export function createTurndownService(): TurndownService {
       return `\n\n${caption}${lines.join("\n")}\n\n`;
     },
   });
-
-  // We own the markdown parser and want stable round-trips without doubled escapes.
-  service.escape = (value: string) => value;
 
   service.addRule("markdownAwareLinks", {
     filter: "a",
@@ -596,12 +672,12 @@ const turndown = createTurndownService();
  * gratuitous whitespace changes.
  */
 export function normalizeBlockSpacing(md: string): string {
-  let normalized = md.replace(/\n{3,}/g, "\n\n");
-  // Remove blank line immediately before a heading.
-  normalized = normalized.replace(/\n\n(#{1,6} )/g, "\n$1");
-  // Remove blank line immediately after a heading line.
-  normalized = normalized.replace(/(^#{1,6} [^\n]+)\n\n/gm, "$1\n");
-  return normalized;
+  return transformOutsideCode(md, (prose) =>
+    prose
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/\n\n(#{1,6} )/g, "\n$1")
+      .replace(/(^#{1,6} [^\n]+)\n\n/gm, "$1\n"),
+  );
 }
 
 export function toMarkdown(html: string): string {

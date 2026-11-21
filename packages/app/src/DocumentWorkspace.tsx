@@ -720,7 +720,10 @@ export function DocumentWorkspace({
       <RemoteSessionBanner backend={backend} />
       {documentPage ? (
         <div
-          className="fixed top-3 left-3 z-[60]"
+          className={cn(
+            "fixed left-3 z-[60]",
+            conflictNotice ? "bottom-3" : "top-3",
+          )}
           data-testid="document-save-status-corner"
         >
           <DocumentSaveStatusIndicator

@@ -252,7 +252,7 @@ test.describe("stale writes", () => {
       await appendInCodeEditor(page, `\nLocal body ${viewport.width}.\n`);
 
       const conflictNotice = fileConflictNotice(page);
-      const statusStack = page.getByTestId("document-status-stack");
+      const statusStack = page.getByTestId("document-save-status-corner");
       await expect(conflictNotice).toBeVisible();
       await expect(statusStack).toBeVisible();
 

@@ -1136,7 +1136,16 @@ function addCriticCodeBlockRule(service: TurndownService) {
         [...codeElement.classList]
           .find((className) => className.startsWith("language-"))
           ?.slice("language-".length) ?? "";
-      const content = service.turndown(codeElement.innerHTML).trimEnd();
+      const escapeText = service.escape;
+      let content: string;
+      try {
+        // CriticMarkup still serializes through its rules, while the surrounding
+        // code text must remain literal rather than becoming Markdown prose.
+        service.escape = (value: string) => value;
+        content = service.turndown(codeElement.innerHTML).trimEnd();
+      } finally {
+        service.escape = escapeText;
+      }
 
       return `\n\n\`\`\`${language}\n${content}\n\`\`\`\n\n`;
     },

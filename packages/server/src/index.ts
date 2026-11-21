@@ -21,6 +21,7 @@ import {
   resolveBindHosts,
 } from "./network.js";
 import { ReviewEventQueue } from "./review-events.js";
+import { logServerEvent } from "./diagnostics.js";
 import { atomicWrite, FileChangedError } from "./atomic-write.js";
 import { comparisonRouter } from "./comparisons.js";
 import { resolveUpdateStatus } from "./update-status.js";
@@ -77,6 +78,7 @@ interface CreateAppOptions {
   fetchImpl?: typeof fetch;
   packageName?: string;
   remoteDocumentToken?: string;
+  allowLocalFiles?: boolean;
   comparisonsDir?: string;
 }
 
@@ -440,6 +442,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const serverRoot = path.resolve(options.serverRoot ?? defaultServerRoot);
   const staticDirPath = options.staticDirPath ?? staticDir;
   const fetchImpl = options.fetchImpl ?? fetch;
+  const allowLocalFiles = options.allowLocalFiles !== false;
   const remoteDocumentToken =
     typeof options.remoteDocumentToken === "string" &&
     options.remoteDocumentToken.length > 0
@@ -492,6 +495,30 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     }
   }, REMOTE_SESSION_SWEEP_INTERVAL_MS);
   remoteSessionSweeper.unref?.();
+
+  app.use("/api", (req, res, next) => {
+    if (
+      allowLocalFiles ||
+      req.path === "/status" ||
+      req.path === "/update-status" ||
+      req.path === "/remote-document" ||
+      req.path.startsWith("/remote-document/")
+    ) {
+      next();
+      return;
+    }
+
+    logServerEvent(
+      "server",
+      "local-api.denied",
+      { method: req.method, path: req.path },
+      "warn",
+    );
+    res.status(403).json({
+      error:
+        "Local file APIs are disabled on network-bound servers. Open a remote document session or use a loopback-only server.",
+    });
+  });
 
   app.use(express.json({ limit: "50mb" }));
   app.use(
@@ -899,8 +926,8 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       serverRoot,
       stateless: true,
       capabilities: {
-        projectPathRequired: true,
-        fileSystemBrowsing: true,
+        projectPathRequired: allowLocalFiles,
+        fileSystemBrowsing: allowLocalFiles,
         remoteDocuments: true,
         remoteDocumentTokenRequired: remoteDocumentToken !== null,
       },
@@ -1383,6 +1410,9 @@ export async function createServer(
   const { app } = createApp({
     port,
     projectDir,
+    // Do not infer trust from socket addresses: reverse proxies also arrive
+    // through loopback. Network hosts expose remote sessions, never local files.
+    allowLocalFiles: !hasNonLoopbackHost(bindHosts),
     allowFileBindMountWrites:
       process.env.ROUGHDRAFT_ALLOW_FILE_BIND_MOUNT_WRITES === "1",
     remoteDocumentToken:

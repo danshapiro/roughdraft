@@ -516,7 +516,7 @@ test.describe("homepage workflow storyboard", () => {
             '[data-testid="homepage-workflow-sticky-visual"]',
           );
           const sceneCopy = element.querySelector(
-            ".homepage-workflow-scene-copy",
+            '[data-testid="homepage-workflow-scene-copy"]',
           );
           const documentTitle = document.querySelector(
             '[data-testid="homepage-workflow-document-title"]',

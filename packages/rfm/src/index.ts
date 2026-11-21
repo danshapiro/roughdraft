@@ -713,6 +713,19 @@ export function markRoughdraftResolved(
     metadata.attrs.set("resolved", options.summary);
   }
 
+  if (options.summary && /[\r\n]/.test(options.summary)) {
+    // Inline compatibility attributes cannot contain line breaks. Use the
+    // canonical endmatter representation without losing existing attributes.
+    const attrs = Object.fromEntries(metadata.attrs);
+    delete attrs.id;
+    const comments = new Map(endmatter.comments);
+    const suggestions = new Map(endmatter.suggestions);
+    const entries = target.kind === "suggestion" ? suggestions : comments;
+    entries.set(options.targetId, attrs);
+    const updated = `${markdown.slice(0, metadata.offset)}{#${options.targetId}}${markdown.slice(metadata.endOffset)}`;
+    return writeRoughdraftEndmatter(updated, { comments, suggestions });
+  }
+
   return `${markdown.slice(0, metadata.offset)}${serializeMetadataAttributes(
     Object.fromEntries(metadata.attrs),
   )}${markdown.slice(metadata.endOffset)}`;
@@ -792,7 +805,11 @@ function matchFence(
     };
   }
 
-  if (fence.marker !== marker || markerText.length < fence.length) {
+  if (
+    fence.marker !== marker ||
+    markerText.length < fence.length ||
+    line.slice(match[0].length).trim().length > 0
+  ) {
     return null;
   }
 

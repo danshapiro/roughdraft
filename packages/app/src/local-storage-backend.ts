@@ -121,9 +121,9 @@ export class LocalStorageBackend implements StorageBackend {
   }
 
   async saveAsset(file: File): Promise<StoredAsset> {
+    const dataUrl = await fileToDataUrl(file);
     const assets = readAssets();
     const markdownPath = nextAssetPath(assets, file.name);
-    const dataUrl = await fileToDataUrl(file);
 
     assets[markdownPath] = {
       path: markdownPath,

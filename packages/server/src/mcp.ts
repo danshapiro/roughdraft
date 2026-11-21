@@ -138,23 +138,12 @@ export function startMcpServer(options: McpOptions = {}): void {
 function takeMessage(
   buffer: Buffer<ArrayBufferLike>,
 ): { message: JsonRpcRequest; rest: Buffer<ArrayBufferLike> } | null {
-  const headerEnd = buffer.indexOf("\r\n\r\n");
-  if (headerEnd === -1) return null;
-
-  const header = buffer.subarray(0, headerEnd).toString("utf8");
-  const match = header.match(/content-length:\s*(\d+)/i);
-  if (!match) {
-    throw new Error("Missing Content-Length header.");
-  }
-
-  const length = Number.parseInt(match[1] ?? "0", 10);
-  const bodyStart = headerEnd + 4;
-  const bodyEnd = bodyStart + length;
-  if (buffer.length < bodyEnd) return null;
+  const lineEnd = buffer.indexOf("\n");
+  if (lineEnd === -1) return null;
 
   return {
-    message: JSON.parse(buffer.subarray(bodyStart, bodyEnd).toString("utf8")),
-    rest: buffer.subarray(bodyEnd),
+    message: JSON.parse(buffer.subarray(0, lineEnd).toString("utf8")),
+    rest: buffer.subarray(lineEnd + 1),
   };
 }
 
@@ -334,9 +323,7 @@ export async function callTool(
 }
 
 function writeMessage(output: NodeJS.WriteStream, value: unknown): void {
-  const body = Buffer.from(JSON.stringify(value), "utf8");
-  output.write(`Content-Length: ${body.byteLength}\r\n\r\n`);
-  output.write(body);
+  output.write(`${JSON.stringify(value)}\n`);
 }
 
 function objectArgs(value: unknown): Record<string, unknown> {

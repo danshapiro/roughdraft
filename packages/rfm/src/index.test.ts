@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parse as parseYaml } from "yaml";
 import {
   appendRoughdraftReply,
   appendRoughdraftDocumentComment,
@@ -160,6 +161,24 @@ describe("validateRoughdraftMarkdown", () => {
       comments: 0,
       suggestions: 0,
     });
+  });
+
+  it.each([
+    "```",
+    "~~~",
+  ])("keeps markers literal after a nonclosing %s fence", (fence) => {
+    const markdown = [
+      `${fence}text`,
+      `${fence}not-a-closing-fence`,
+      "{>>not feedback<<}",
+      fence,
+      '{>>Actual feedback<<}{id="c1" by="AI" at="2026-04-28T12:00:00.000Z"}',
+    ].join("\n");
+
+    expect(validateRoughdraftMarkdown(markdown).ok).toBe(true);
+    expect(
+      extractRoughdraftReviewIndex(markdown).items.map((item) => item.id),
+    ).toEqual(["c1"]);
   });
 
   it("does not treat ordinary final comments sections as review endmatter without compact references", () => {
@@ -475,6 +494,32 @@ describe("extractRoughdraftReviewIndex", () => {
 });
 
 describe("RFM mutation helpers", () => {
+  it.each([
+    "Fixed\nwith citations",
+    "Fixed\r\nwith citations",
+  ])("preserves a multiline resolution summary without invalidating metadata", (summary) => {
+    const markdown =
+      '{>>Feedback<<}{id="c1" by="AI" at="2026-04-28T12:00:00.000Z" custom="retain"}';
+    const output = markRoughdraftResolved(markdown, {
+      targetId: "c1",
+      summary,
+    });
+
+    expect(validateRoughdraftMarkdown(output).ok).toBe(true);
+    expect(extractRoughdraftReviewIndex(output).items).toEqual([
+      expect.objectContaining({ id: "c1", status: "resolved", author: "AI" }),
+    ]);
+    expect(parseYaml(output.split("\n---\n")[1]).comments.c1.resolved).toBe(
+      summary,
+    );
+    const again = markRoughdraftResolved(output, {
+      targetId: "c1",
+      summary: "Updated",
+    });
+    expect(validateRoughdraftMarkdown(again).ok).toBe(true);
+    expect(again).toContain("custom: retain");
+  });
+
   it("appends a reply without rewriting unrelated Markdown", () => {
     const markdown =
       '# Plan\n\nKeep {==this claim==}{>>Needs proof<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"} as written.\n';

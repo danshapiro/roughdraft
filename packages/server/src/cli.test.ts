@@ -171,7 +171,16 @@ describe("cli", () => {
           throw new Error("connect ECONNREFUSED");
         }
 
-        return fetch(input, init);
+        const response = await fetch(input, init);
+        if (url.pathname === "/api/status") {
+          // Test servers share this worker but model separate background PIDs.
+          const pid = Array.from(portByPid.entries()).find(
+            ([candidatePid, activePort]) =>
+              runningPids.has(candidatePid) && activePort === port,
+          )?.[0];
+          return Response.json({ ...(await response.json()), pid });
+        }
+        return response;
       },
       log: (message) => logs.push(message),
       error: (message) => errors.push(message),
