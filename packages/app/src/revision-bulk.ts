@@ -17,6 +17,7 @@ import { suggestionPositions } from "./revision-projection";
 import {
   type BaseSide,
   referenceChanges,
+  referenceChangeIds,
   revertReferenceChange,
 } from "./revision-reference";
 
@@ -73,11 +74,11 @@ export function decideReviewChanges(
       ...change,
       oldText: change.item.oldText,
       newText: change.item.newText,
-      keptId: change.item.changeId,
+      keptIds: referenceChangeIds(change),
     })),
     ...natives.map((id) => ({
       ...suggestionDetail(state.doc, id),
-      keptId: undefined,
+      keptIds: [] as string[],
     })),
   ].sort((a, b) => a.from - b.from || a.to - b.to);
   const append = (next: Transaction) => {
@@ -101,7 +102,10 @@ export function decideReviewChanges(
     if ((decision === "accept") === (base === "new")) {
       if (record)
         tr.setDocAttribute("kept", [
-          ...new Set([...(tr.doc.attrs.kept ?? []), change.item.changeId]),
+          ...new Set([
+            ...(tr.doc.attrs.kept ?? []),
+            ...referenceChangeIds(change),
+          ]),
         ]);
     } else {
       const next = revertReferenceChange(
@@ -187,7 +191,7 @@ export function decideReviewChanges(
         ? []
         : [new ReplaceStep(from, to, restore).toJSON()],
       guard: { from, to, slice: current.toJSON() },
-      keptIds: group.flatMap((item) => (item.keptId ? [item.keptId] : [])),
+      keptIds: group.flatMap((item) => item.keptIds),
     };
   });
   if (metadataPending)

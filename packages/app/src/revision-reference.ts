@@ -11,7 +11,9 @@ import type { CriticChangeRailItem } from "./DocumentReviewRail";
 import {
   createRenderedComparisonObserver,
   type RenderedSourceDifference,
+  summarizeComparisonContent,
 } from "./rendered-comparison-diff";
+import { shouldMergeDiffGap } from "./semantic-diff";
 import {
   hasPendingSuggestions,
   projectAcceptedDocument,
@@ -32,6 +34,125 @@ export interface ReferenceChange {
 }
 
 export type BaseSide = "old" | "new";
+
+/** Atomic IDs stay durable even when their presentation is grouped. */
+export function referenceChangeIds(change: ReferenceChange): string[] {
+  return change.item.sourceChangeIds ?? [change.item.changeId];
+}
+
+function groupReferenceChanges(
+  doc: ProseMirrorNode,
+  changes: ReferenceChange[],
+): ReferenceChange[] {
+  const groups: ReferenceChange[] = [];
+  const decided = new Set<string>(doc.attrs.kept ?? []);
+  const reviewed = doc.attrs.reviewed ?? [];
+  const canMerge = (left: ReferenceChange, right: ReferenceChange) => {
+    if (
+      left.structural ||
+      right.structural ||
+      left.overlapsSuggestion ||
+      right.overlapsSuggestion ||
+      left.to > right.from
+    )
+      return false;
+    if (
+      [...referenceChangeIds(left), ...referenceChangeIds(right)].some((id) =>
+        decided.has(id),
+      )
+    )
+      return false;
+    const parent = doc.resolve(left.from).parent;
+    if (
+      parent.type.name !== "paragraph" ||
+      doc.resolve(left.to).parent !== parent ||
+      doc.resolve(right.from).parent !== parent ||
+      doc.resolve(right.to).parent !== parent
+    )
+      return false;
+    if (
+      reviewed.some(
+        (entry: {
+          metadata?: unknown;
+          stale?: boolean;
+          guard: { from: number; to: number };
+        }) =>
+          !entry.metadata &&
+          !entry.stale &&
+          (entry.guard.from === entry.guard.to
+            ? left.from <= entry.guard.from && entry.guard.from <= right.to
+            : left.from < entry.guard.to && entry.guard.from < right.to),
+      )
+    )
+      return false;
+    let blocked = false;
+    const checkBoundary = (node: ProseMirrorNode) => {
+      if (
+        (node.isInline && !node.isText) ||
+        node.type.name === "criticChangeBlock" ||
+        node.type.name === "criticChangeBoundary" ||
+        node.marks.some((mark) =>
+          ["criticChange", "commentRef", "code"].includes(mark.type.name),
+        )
+      )
+        blocked = true;
+    };
+    doc.nodesBetween(left.from, right.to, checkBoundary);
+    left.restore.descendants(checkBoundary);
+    right.restore.descendants(checkBoundary);
+    if (blocked) return false;
+    const gap = doc.textBetween(left.to, right.from, "");
+    return shouldMergeDiffGap(
+      gap,
+      Math.max(left.restore.size, left.to - left.from),
+      Math.max(right.restore.size, right.to - right.from),
+    );
+  };
+  for (const change of changes) {
+    const previous = groups.at(-1);
+    if (!previous || !canMerge(previous, change)) {
+      groups.push(change);
+      continue;
+    }
+    const restore = previous.restore
+      .append(doc.slice(previous.to, change.from).content)
+      .append(change.restore);
+    const expected = doc.slice(previous.from, change.to).content;
+    const old = previous.baseSide === "new" ? restore : expected;
+    const next = previous.baseSide === "new" ? expected : restore;
+    const formatting =
+      old.textBetween(0, old.size, "") === next.textBetween(0, next.size, "");
+    const kind = !old.size
+      ? "addition"
+      : !next.size
+        ? "deletion"
+        : "substitution-old";
+    groups[groups.length - 1] = {
+      ...previous,
+      to: change.to,
+      restore,
+      expected,
+      item: {
+        ...previous.item,
+        kind,
+        change: { ...previous.item.change, kind },
+        oldText: summarizeComparisonContent(
+          old.content.map((node) => node.toJSON()),
+          formatting,
+        ),
+        newText: summarizeComparisonContent(
+          next.content.map((node) => node.toJSON()),
+          formatting,
+        ),
+        sourceChangeIds: [
+          ...referenceChangeIds(previous),
+          ...referenceChangeIds(change),
+        ],
+      },
+    };
+  }
+  return groups;
+}
 
 const referenceAuthor = {
   authorType: "ai",
@@ -178,7 +299,7 @@ export function createReferenceComparison(
       ? projection.mapping.invert()
       : null;
     const hasSuggestions = hasPendingSuggestions(current);
-    return projectedChanges.map((change) => {
+    const mapped = projectedChanges.map((change) => {
       const start = map?.map(change.from, 1) ?? change.from;
       const to = map?.map(change.to, -1) ?? change.to;
       const from = Math.min(start, to);
@@ -203,6 +324,7 @@ export function createReferenceComparison(
         overlapsSuggestion,
       };
     });
+    return groupReferenceChanges(current, mapped);
   };
 }
 

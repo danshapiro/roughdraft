@@ -71,7 +71,10 @@ export function mapReviewedChanges(
 
 export function recordReviewedChange(
   transaction: Transaction,
-  detail: Pick<ReviewedChange, "decision" | "oldText" | "newText" | "keptId">,
+  detail: Pick<
+    ReviewedChange,
+    "decision" | "oldText" | "newText" | "keptId" | "keptIds"
+  >,
   range: { from: number; to: number },
 ): Transaction {
   const before = transaction.before;

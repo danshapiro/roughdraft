@@ -42,17 +42,15 @@ async function chooseMode(page: Page, name: "Read" | "Edit" | "Suggest") {
   await expect(page.getByTestId("revision-mode")).toContainText(name);
 }
 
-async function chooseView(
-  page: Page,
-  name: "Changes" | "All rejected" | "All accepted",
-) {
+async function chooseView(page: Page, name: "Changes" | "Original" | "Final") {
   const ids = {
     Changes: "changes",
-    "All rejected": "rejected",
-    "All accepted": "accepted",
+    Original: "rejected",
+    Final: "accepted",
   };
   await page.getByTestId("revision-view").click();
   await page.getByTestId(`revision-view-${ids[name]}`).click();
+  await expect(page.getByTestId("revision-view")).toContainText(name);
 }
 
 async function openReviewedChanges(page: Page) {
@@ -179,13 +177,13 @@ test.describe("complete unified review workflows", () => {
         mutations.push(request.url());
     });
 
-    for (const view of ["All rejected", "All accepted"] as const) {
+    for (const view of ["Original", "Final"] as const) {
       await chooseView(page, view);
       const preview = page.getByTestId("revision-preview");
       const body = preview.locator(".ProseMirror");
       await expect(preview).toBeVisible();
       await expect(body).toHaveAttribute("contenteditable", "false");
-      const accepted = view === "All accepted";
+      const accepted = view === "Final";
       await expect(body).toContainText(
         accepted ? "Use blue markers." : "Use red markers.",
       );
@@ -343,15 +341,15 @@ test.describe("complete unified review workflows", () => {
     await expect(page.getByTestId("revision-pending")).toHaveText("2");
     await saved(page);
     const previews = new Map<string, string>();
-    for (const view of ["All rejected", "All accepted"] as const) {
+    for (const view of ["Original", "Final"] as const) {
       await chooseView(page, view);
       const body = page.getByTestId("revision-preview").locator(".ProseMirror");
       await expect(body).toBeVisible();
       await expect(body).toContainText(
-        view === "All rejected" ? "Use red markers." : "Use green markers.",
+        view === "Original" ? "Use red markers." : "Use green markers.",
       );
       await expect(body).toContainText(
-        view === "All rejected" ? "Keep the door open." : "Keep the door shut.",
+        view === "Original" ? "Keep the door open." : "Keep the door shut.",
       );
       previews.set(view, await body.innerText());
     }
@@ -364,7 +362,7 @@ test.describe("complete unified review workflows", () => {
       .toBe(beforeText);
     expect(fs.readFileSync(beforePath, "utf8")).toBe(beforeText);
     const afterBulk = await readReview(request, id);
-    for (const view of ["All rejected", "All accepted"] as const) {
+    for (const view of ["Original", "Final"] as const) {
       await chooseView(page, view);
       const body = page.getByTestId("revision-preview").locator(".ProseMirror");
       await expect(body).toHaveText(previews.get(view) ?? "", {

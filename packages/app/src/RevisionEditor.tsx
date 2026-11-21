@@ -102,6 +102,7 @@ import { suggestionPositions } from "./revision-projection";
 import {
   type BaseSide,
   createReferenceComparison,
+  referenceChangeIds,
   type ReferenceChange,
   referenceDecorations,
   revertReferenceChange,
@@ -181,7 +182,10 @@ function useReference(
           init: (_, state) => compare(state.doc),
           apply: (transaction, previous) =>
             transaction.docChanged &&
-            !transaction.before.content.eq(transaction.doc.content)
+            (!transaction.before.content.eq(transaction.doc.content) ||
+              transaction.before.attrs.kept !== transaction.doc.attrs.kept ||
+              transaction.before.attrs.reviewed !==
+                transaction.doc.attrs.reviewed)
               ? compare(transaction.doc)
               : previous,
         },
@@ -196,16 +200,14 @@ function useReference(
           const old = referenceKey.getState(previous) ?? noChanges;
           const changes = referenceKey.getState(current) ?? noChanges;
           if (old === changes) return null;
-          const ids = new Set(changes.map((change) => change.item.changeId));
+          const ids = new Set(changes.flatMap(referenceChangeIds));
           const currentKept = kept(current.doc);
           const next = new Set(
             currentKept.filter(
               (id) => ids.has(id) || id === "document-metadata",
             ),
           );
-          const previousIds = new Set(
-            old.map((change) => change.item.changeId),
-          );
+          const previousIds = new Set(old.flatMap(referenceChangeIds));
           if (
             !transactions.some((tr) => tr.getMeta(referenceDecision)) &&
             (modeRef.current === "editing" ||
@@ -630,7 +632,10 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         ? live.state.tr
         : leaveAsIs
           ? live.state.tr.setDocAttribute("kept", [
-              ...new Set([...kept(live.state.doc), changeId]),
+              ...new Set([
+                ...kept(live.state.doc),
+                ...referenceChangeIds(change),
+              ]),
             ])
           : revertReferenceChange(live.state, change);
       if (
@@ -650,7 +655,9 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
             decision: keep ? "accept" : "reject",
             oldText: detail.oldText,
             newText: detail.newText,
-            ...(change && leaveAsIs ? { keptId: changeId } : {}),
+            ...(change && leaveAsIs
+              ? { keptIds: referenceChangeIds(change) }
+              : {}),
           },
           detail,
         );
@@ -1217,13 +1224,13 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 data-testid="revision-view"
                 aria-label="Document view"
                 className="revision-mode-select"
-                title="Preview outcomes without changing the review or file."
+                title="Preview the original or final document without changing the review or file."
               >
                 <SelectValue>
                   {view === "accepted"
-                    ? "All accepted"
+                    ? "Final"
                     : view === "rejected"
-                      ? "All rejected"
+                      ? "Original"
                       : "Changes"}
                 </SelectValue>
               </SelectTrigger>
@@ -1239,18 +1246,18 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 <SelectItem
                   value="rejected"
                   data-testid="revision-view-rejected"
-                  label="All rejected"
+                  label="Original"
                   className="min-h-11 text-sm"
                 >
-                  <SelectItemText>All rejected</SelectItemText>
+                  <SelectItemText>Original</SelectItemText>
                 </SelectItem>
                 <SelectItem
                   value="accepted"
                   data-testid="revision-view-accepted"
-                  label="All accepted"
+                  label="Final"
                   className="min-h-11 text-sm"
                 >
-                  <SelectItemText>All accepted</SelectItemText>
+                  <SelectItemText>Final</SelectItemText>
                 </SelectItem>
               </SelectContent>
             </Select>
@@ -1559,8 +1566,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           {previewing && (
             <div data-testid="revision-preview">
               <p className="revision-preview-label" role="status">
-                {view === "accepted" ? "All accepted" : "All rejected"} ·
-                Read-only preview
+                {view === "accepted" ? "Final" : "Original"} · Read-only preview
               </p>
               {preview?.error && <p role="alert">{preview.error}</p>}
               {reviewed.some((change) => change.stale) && (

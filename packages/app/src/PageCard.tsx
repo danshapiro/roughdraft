@@ -597,7 +597,11 @@ function getDocumentCriticChangeRailItems(
   for (const change of changes.values()) {
     Object.assign(change, anchors.get(change.changeId));
     const rootCommentIds = [...comments.values()]
-      .filter((comment) => comment.parentCommentId === change.changeId)
+      .filter((comment) =>
+        [change.changeId, ...(change.sourceChangeIds ?? [])].includes(
+          comment.parentCommentId ?? "",
+        ),
+      )
       .map((comment) => comment.id);
     const descendantIds = rootCommentIds.flatMap((commentId) =>
       getCommentDescendantIds(commentId, comments),
@@ -815,7 +819,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     if (isEditableReview) {
       return criticChanges.map((suggestion) => {
         const rootIds = [...comments.values()]
-          .filter((comment) => comment.parentCommentId === suggestion.changeId)
+          .filter((comment) =>
+            [
+              suggestion.changeId,
+              ...(suggestion.sourceChangeIds ?? []),
+            ].includes(comment.parentCommentId ?? ""),
+          )
           .map((comment) => comment.id);
         return {
           ...suggestion,

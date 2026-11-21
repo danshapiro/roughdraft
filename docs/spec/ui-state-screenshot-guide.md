@@ -261,9 +261,11 @@ contextual toolbar beside its selection. Include a narrow landscape viewport.
 
 ## Unified outcome and reviewed-change states
 
-Capture Changes, All rejected and All accepted with a mixture of earlier decisions and pending suggestions. Include the read-only preview label, disabled editing/decision controls, rendered and source previews, preserved YAML, and source-relative links/images from inputs in different folders. Verify Copy/Download match the visible outcome. Returning to Changes must restore the interaction mode and working source without adding preview text to Undo.
+Capture Changes, Original and Final with a mixture of earlier decisions and pending suggestions. Include the read-only preview label, disabled editing/decision controls, rendered and source previews, preserved YAML, and source-relative links/images from inputs in different folders. Verify Copy/Download match the visible outcome. Returning to Changes must restore the interaction mode and working source without adding preview text to Undo.
 
 Capture Reviewed changes after refresh, reopening an accepted and rejected passage, a related group of overlapping changes, and the disabled reopening explanation after that passage is edited. Include a long length-changing suggestion with later unrelated edits on both sides. Capture Read after clicking the document and typing: it must remain Read, keep focus in the document and leave the file unchanged.
+
+Capture a heavily edited paragraph where short unchanged words between edits appear inside one replacement and one Keep/Revert card. Include clearly separate edits, inline code on either input, hard breaks, lists, tables, pending suggestions and inline comments as grouping boundaries. Capture grouped Keep, refresh, reopening, Revert and Undo, including a saved word-level decision and a comment on a later member. Resize from 390px to 840px while preserving the decision and undo state.
 
 Capture editable full source with comments/suggestions, Read and Suggest source states, YAML/comment Undo and Redo, exact source-spelling edits, and restoration of a rich-text edit made before the source edit. Exercise 360px, 840px, desktop and short landscape viewports with reachable 44px controls and readable source text.
 

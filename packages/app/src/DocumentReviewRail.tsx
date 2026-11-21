@@ -92,6 +92,7 @@ export interface CriticChangeRailItem {
   anchorTop: number;
   anchorBottom: number;
   sourceChangeCount?: number;
+  sourceChangeIds?: string[];
   reviewStatus?: string;
 }
 
