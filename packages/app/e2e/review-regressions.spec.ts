@@ -96,6 +96,7 @@ test("saves the latest draft after a delayed save response @smoke", async ({
     releaseFirstResponse = resolve;
   });
   let writes = 0;
+  let completedWrites = 0;
   try {
     const filePath = writeProjectFile(
       projectDir,
@@ -106,10 +107,11 @@ test("saves the latest draft after a delayed save response @smoke", async ({
     await page.route("**/api/markdown-file/events**", (route) => route.abort());
     await page.route("**/api/markdown-file?**", async (route) => {
       if (route.request().method() !== "PUT") return route.continue();
-      writes += 1;
+      const requestNumber = ++writes;
       const response = await route.fetch();
-      if (writes === 1) await responseGate;
+      if (requestNumber === 1) await responseGate;
       await route.fulfill({ response });
+      completedWrites += 1;
     });
     await openMarkdownFile(page, filePath, "code");
     await expect(codeEditor(page)).toContainText("Original.");
@@ -141,8 +143,14 @@ test("saves the latest draft after a delayed save response @smoke", async ({
     await expect
       .poll(() => readProjectFile(projectDir, "draft.md"))
       .toContain("First edit.\nSecond edit.\nAfter mode change.");
+    await expect.poll(() => completedWrites).toBe(3);
+    await expect(documentSaveStatus(page)).toHaveAttribute(
+      "aria-label",
+      "Saved",
+    );
   } finally {
     releaseFirstResponse();
+    await page.unrouteAll({ behavior: "wait" });
     removeMarkdownProject(projectDir);
   }
 });
