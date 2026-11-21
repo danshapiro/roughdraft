@@ -113,6 +113,8 @@ When changing UI behavior, routes, dialogs, popovers, banners, editor modes, rev
 
 Keep generated screenshot runs in `.context/ui-state-screenshots/` unless the user explicitly asks to commit visual artifacts.
 
+After every change, give Dan a working Roughdraft link to a real, complex Markdown document running on the updated app. Set a clear title and an explicit autosave destination or `none`. Verify the link, keep the review preview available until accepted, and preserve its runtime and documents outside disposable worktrees.
+
 ## Worktree-Specific CLI
 
 This repo installs a worktree-specific Roughdraft CLI wrapper during setup.
