@@ -129,8 +129,8 @@ suggestions:
 | Document | Review handoff sent | Successful handoff | `review-handoff-status`, `review-handoff-robots-toy`, `review-handoff-close-window`, `review-handoff-copy-message` | Capture the random completion title, robot toy, primary close button, and fallback copy hint below it. |
 | Document | Review handoff undelivered | Watcher disconnects before handoff | `review-handoff-status` | Popover title: `No agent is watching now`. |
 | Document | Review handoff error | Force handoff API error | `review-handoff-status` | Popover title: `Could not notify agent`. |
-| Remote | Connected banner | Open with `?session=<id>&token=<token>` and remote capability enabled | `role=status`, `aria-label="Remote session connected"` | The session URL needs no local path parameter; capture the loaded document workspace. |
-| Remote | Disconnected banner | Close the source CLI while leaving the viewer open | `role=alert`, `aria-label="Remote session disconnected"` | The custom disconnect event must show the warning even while the viewer's event stream stays open. |
+| Remote | Connected banner | Open with `?session=<id>&token=<token>` and remote capability enabled | `remote-session-connected` | The session URL needs no local path parameter; capture the loaded document workspace. |
+| Remote | Disconnected banner | Close the source CLI while leaving the viewer open | `remote-session-disconnected` | The custom disconnect event must show the warning even while the viewer's event stream stays open. |
 | Editor | Selection menu | Select text in rich editor | `selection-menu` | Capture formatting buttons and comment/suggestion actions. |
 | Editor | Selection menu on suggestion | Select existing suggestion text | `selection-menu-action-accept-suggestion`, `selection-menu-action-reject-suggestion` | Requires review fixture. |
 | Editor | Link popover | Click a link or choose Link from selection menu | `link-popover`, `link-url-input`, `link-action-open`, `link-action-delete` | Use the plain fixture link. |

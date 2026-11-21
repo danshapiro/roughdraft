@@ -74,17 +74,13 @@ test("remote session opens, saves through the CLI, and reports disconnection @sm
     url.searchParams.set("editor", "code");
     await page.goto(url.toString());
     await expect(codeEditor(page)).toContainText("Original.");
-    await expect(
-      page.getByRole("status", { name: "Remote session connected" }),
-    ).toBeVisible();
+    await expect(page.getByTestId("remote-session-connected")).toBeVisible();
     await appendInCodeEditor(page, "\nSaved through the remote CLI.");
     await expect
       .poll(() => readProjectFile(projectDir, "remote.md"))
       .toContain("Saved through the remote CLI.");
     await stopCli();
-    await expect(
-      page.getByRole("alert", { name: "Remote session disconnected" }),
-    ).toBeVisible();
+    await expect(page.getByTestId("remote-session-disconnected")).toBeVisible();
   } finally {
     await stopCli();
     removeMarkdownProject(projectDir);
