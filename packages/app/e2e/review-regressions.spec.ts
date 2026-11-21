@@ -1,3 +1,6 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
 import {
   appendInCodeEditor,
@@ -10,6 +13,83 @@ import {
   richTextEditor,
   writeProjectFile,
 } from "./helpers";
+
+test("remote session opens, saves through the CLI, and reports disconnection @smoke", async ({
+  page,
+}) => {
+  const projectDir = createMarkdownProject("remote-browser");
+  const filePath = writeProjectFile(
+    projectDir,
+    "remote.md",
+    "# Remote document\n\nOriginal.\n",
+  );
+  const cli = spawn(
+    process.execPath,
+    [
+      fileURLToPath(
+        new URL("../../server/bin/roughdraft.mjs", import.meta.url),
+      ),
+      "open",
+      filePath,
+      "--no-open",
+      "--json",
+    ],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        ROUGHDRAFT_HOST: `http://127.0.0.1:${process.env.API_PORT ?? 4317}`,
+      },
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  let viewerUrl = "";
+  cli.stdout.on("data", (chunk) => {
+    stdout += String(chunk);
+    try {
+      viewerUrl = (JSON.parse(stdout) as { url: string }).url;
+    } catch {
+      // CLI stdout may arrive in separate chunks.
+    }
+  });
+  cli.stderr.on("data", (chunk) => {
+    stderr += String(chunk);
+  });
+  const stopCli = async () => {
+    if (cli.exitCode !== null || cli.signalCode !== null) return;
+    const exited = once(cli, "exit");
+    cli.kill("SIGTERM");
+    await exited;
+  };
+  try {
+    await expect
+      .poll(() => {
+        if (cli.exitCode !== null)
+          throw new Error(`Remote CLI exited: ${stderr}`);
+        return viewerUrl;
+      })
+      .not.toBe("");
+    const url = new URL(viewerUrl);
+    url.searchParams.set("editor", "code");
+    await page.goto(url.toString());
+    await expect(codeEditor(page)).toContainText("Original.");
+    await expect(
+      page.getByRole("status", { name: "Remote session connected" }),
+    ).toBeVisible();
+    await appendInCodeEditor(page, "\nSaved through the remote CLI.");
+    await expect
+      .poll(() => readProjectFile(projectDir, "remote.md"))
+      .toContain("Saved through the remote CLI.");
+    await stopCli();
+    await expect(
+      page.getByRole("alert", { name: "Remote session disconnected" }),
+    ).toBeVisible();
+  } finally {
+    await stopCli();
+    removeMarkdownProject(projectDir);
+  }
+});
 
 test("saves the latest draft after a delayed save response @smoke", async ({
   page,

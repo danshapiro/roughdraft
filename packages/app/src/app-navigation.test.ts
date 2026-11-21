@@ -101,6 +101,8 @@ describe("app navigation", () => {
     ["other%25file.md", "/home/dan/docs/other%file.md"],
     ["100%Accuracy.md", "/home/dan/docs/100%Accuracy.md"],
     ["caf%C3%A9.md", "/home/dan/docs/café.md"],
+    ["other%20%Accuracy.md", "/home/dan/docs/other %Accuracy.md"],
+    ["caf%C3%A9%Accuracy.md", "/home/dan/docs/café%Accuracy.md"],
   ])("resolves the encoded Markdown link %s", (href, expectedPath) => {
     const location = buildLocationForLinkedMarkdownDocument({
       projectPath: "/home/dan/docs",

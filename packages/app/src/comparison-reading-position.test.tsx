@@ -74,6 +74,7 @@ describe("comparison reading position", () => {
           <header ref={headerRef}>
             <button
               type="button"
+              data-testid="reading-position-switch"
               onClick={() => {
                 capture();
                 source = true;
@@ -98,7 +99,11 @@ describe("comparison reading position", () => {
     const root = createRoot(container);
     try {
       await act(async () => root.render(<Reader />));
-      await act(async () => container.querySelector("button")?.click());
+      await act(async () =>
+        container
+          .querySelector<HTMLElement>('[data-testid="reading-position-switch"]')
+          ?.click(),
+      );
       // The literal URL adds a line to the previous paragraph. Its trailing
       // line-box space must not make it the anchor for the next passage.
       expect(paragraphRect("unit-1", true).top).toBe(240);

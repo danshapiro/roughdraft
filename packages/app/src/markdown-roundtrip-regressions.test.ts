@@ -3,6 +3,7 @@ import {
   criticMarkdownToEditorState,
   editorStateToCriticMarkdown,
 } from "./critic-markup";
+import { toHtml } from "./markdown";
 
 function roundTrip(input: string) {
   const state = criticMarkdownToEditorState(input);
@@ -105,6 +106,35 @@ describe("rich text Markdown preservation", () => {
     expect(criticMarkdownToEditorState(saved).doc).toEqual(
       criticMarkdownToEditorState(input).doc,
     );
+  });
+
+  it("keeps an inline HTML comment after inline code inside its original paragraph", () => {
+    const input = "Start `x`<!-- hidden -->\nend.\n";
+    const rendered = document.createElement("div");
+    rendered.innerHTML = toHtml(input);
+    expect(Array.from(rendered.children, (element) => element.tagName)).toEqual(
+      ["P"],
+    );
+
+    const original = criticMarkdownToEditorState(input);
+    const withoutComment = criticMarkdownToEditorState("Start `x`\nend.\n");
+    expect(original.doc).toEqual(withoutComment.doc);
+    expect(criticMarkdownToEditorState(roundTrip(input)).doc).toEqual(
+      original.doc,
+    );
+  });
+
+  it("preserves a whole escaped-pipe table containing inline code", () => {
+    const input = "| A | B |\n| --- | --- |\n| a\\|b | `x` |\n";
+
+    expect(roundTrip(input)).toBe(input);
+  });
+
+  it("preserves indented source after a list item containing inline code", () => {
+    const input =
+      "- Use `example`\n\n    code block\n    second line\n\nAfter\n";
+
+    expect(roundTrip(input)).toBe(input);
   });
 
   it.each([

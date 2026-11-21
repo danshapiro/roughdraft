@@ -142,6 +142,35 @@ function fileUrlForAbsolutePath(absolutePath: string) {
   return url;
 }
 
+function decodeFileUrlPath(pathname: string) {
+  return pathname.replace(/(?:%[0-9a-f]{2})+/gi, (encoded) => {
+    let result = "";
+    for (let offset = 0; offset < encoded.length; ) {
+      let consumed = 0;
+      // A UTF-8 character uses at most four bytes. Decode valid fragments
+      // independently so a literal %Ac cannot hide an adjacent space or é.
+      for (
+        let bytes = Math.min(4, (encoded.length - offset) / 3);
+        bytes > 0;
+        bytes -= 1
+      ) {
+        try {
+          result += decodeURIComponent(
+            encoded.slice(offset, offset + bytes * 3),
+          );
+          consumed = bytes * 3;
+          break;
+        } catch {
+          // Try the shorter prefix; preserve an undecodable byte literally.
+        }
+      }
+      result += consumed ? "" : encoded.slice(offset, offset + 3);
+      offset += consumed || 3;
+    }
+    return result;
+  });
+}
+
 export function buildLocationForLinkedMarkdownDocument({
   projectPath,
   currentDocumentPath,
@@ -163,17 +192,7 @@ export function buildLocationForLinkedMarkdownDocument({
     linkedPath.documentPath.replace(/%(?![\da-f]{2})/gi, "%25"),
     fileUrlForAbsolutePath(currentAbsolutePath),
   );
-  const targetPath = targetUrl.pathname.replace(
-    /(?:%[0-9a-f]{2})+/gi,
-    (encoded) => {
-      try {
-        return decodeURIComponent(encoded);
-      } catch {
-        // A literal percent followed by hex digits need not be valid UTF-8.
-        return encoded;
-      }
-    },
-  );
+  const targetPath = decodeFileUrlPath(targetUrl.pathname);
   const url = new URL(window.location.href);
 
   url.pathname = browserPath("/");
