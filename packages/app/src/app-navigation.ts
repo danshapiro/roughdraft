@@ -136,7 +136,10 @@ function linkedMarkdownPathParts(href: string) {
 
 function fileUrlForAbsolutePath(absolutePath: string) {
   const normalizedPath = normalizePathSeparators(absolutePath);
-  return new URL(`file://${encodeURI(normalizedPath)}`);
+  const url = new URL("file:///");
+  // Filesystem names contain literal URL delimiters and percent characters.
+  url.pathname = normalizedPath.split("/").map(encodeURIComponent).join("/");
+  return url;
 }
 
 export function buildLocationForLinkedMarkdownDocument({
@@ -157,10 +160,20 @@ export function buildLocationForLinkedMarkdownDocument({
 
   const currentAbsolutePath = joinPath(projectPath, currentDocumentPath);
   const targetUrl = new URL(
-    encodeURI(linkedPath.documentPath),
+    linkedPath.documentPath.replace(/%(?![\da-f]{2})/gi, "%25"),
     fileUrlForAbsolutePath(currentAbsolutePath),
   );
-  const targetPath = decodeURI(targetUrl.pathname);
+  const targetPath = targetUrl.pathname.replace(
+    /(?:%[0-9a-f]{2})+/gi,
+    (encoded) => {
+      try {
+        return decodeURIComponent(encoded);
+      } catch {
+        // A literal percent followed by hex digits need not be valid UTF-8.
+        return encoded;
+      }
+    },
+  );
   const url = new URL(window.location.href);
 
   url.pathname = browserPath("/");

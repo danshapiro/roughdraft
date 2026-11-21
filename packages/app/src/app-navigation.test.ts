@@ -92,4 +92,46 @@ describe("app navigation", () => {
       }),
     ).toBeNull();
   });
+
+  it.each([
+    ["other%20file.md", "/home/dan/docs/other file.md"],
+    ["other file.md", "/home/dan/docs/other file.md"],
+    ["other%23file.md", "/home/dan/docs/other#file.md"],
+    ["other%3Ffile.md", "/home/dan/docs/other?file.md"],
+    ["other%25file.md", "/home/dan/docs/other%file.md"],
+    ["100%Accuracy.md", "/home/dan/docs/100%Accuracy.md"],
+    ["caf%C3%A9.md", "/home/dan/docs/café.md"],
+  ])("resolves the encoded Markdown link %s", (href, expectedPath) => {
+    const location = buildLocationForLinkedMarkdownDocument({
+      projectPath: "/home/dan/docs",
+      currentDocumentPath: "source.md",
+      href,
+    });
+    if (!location) throw new Error("Expected a Markdown document location");
+
+    expect(
+      new URL(location, window.location.origin).searchParams.get("path"),
+    ).toBe(expectedPath);
+  });
+
+  it.each([
+    "my#notes",
+    "my?notes",
+    "my%20notes",
+  ])("preserves literal filename characters in directory %s", (directory) => {
+    const location = buildLocationForLinkedMarkdownDocument({
+      projectPath: `/home/dan/${directory}`,
+      currentDocumentPath: "source.md",
+      href: "target.md#section",
+      unified: true,
+    });
+    if (!location) throw new Error("Expected a Markdown document location");
+
+    const url = new URL(location, window.location.origin);
+    expect(url.searchParams.get("path")).toBe(
+      `/home/dan/${directory}/target.md`,
+    );
+    expect(url.searchParams.get("editor")).toBe("unified");
+    expect(url.hash).toBe("#section");
+  });
 });

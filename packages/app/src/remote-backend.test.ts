@@ -267,4 +267,39 @@ describe("RemoteBackend", () => {
     stopWatching();
     expect(statuses).toEqual(["disconnected", "connected", "disconnected"]);
   });
+
+  it("reports writer disconnection while the viewer event stream stays open", () => {
+    let source: EventTarget | undefined;
+    class FakeEventSource extends EventTarget {
+      static CLOSED = 2;
+      readyState = 1;
+      constructor(_url: string) {
+        super();
+        source = this;
+      }
+      close() {
+        this.readyState = FakeEventSource.CLOSED;
+      }
+    }
+    global.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const backend = bootstrap();
+    const statuses: string[] = [];
+    backend.onSessionStatusChange((status) => statuses.push(status));
+    const stop = backend.watchMarkdownFile("draft.md", () => {});
+    try {
+      if (!source) throw new Error("Expected a viewer event stream");
+      source.dispatchEvent(new Event("connected"));
+      source.dispatchEvent(new Event("disconnected"));
+      expect(backend.sessionStatus).toBe("disconnected");
+      source.dispatchEvent(new Event("connected"));
+      expect(statuses).toEqual([
+        "disconnected",
+        "connected",
+        "disconnected",
+        "connected",
+      ]);
+    } finally {
+      stop();
+    }
+  });
 });

@@ -187,6 +187,10 @@ export class RemoteBackend implements StorageBackend {
       this.setSessionStatus("connected");
     });
 
+    source.addEventListener("disconnected", () => {
+      this.setSessionStatus("disconnected");
+    });
+
     source.addEventListener("save", (event) => {
       try {
         const payload = JSON.parse((event as MessageEvent<string>).data) as {

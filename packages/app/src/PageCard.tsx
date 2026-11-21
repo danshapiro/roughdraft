@@ -2927,7 +2927,14 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
         );
         return { status: "saved" };
       } catch (error) {
-        console.error("Failed to save page:", error);
+        console.error(
+          JSON.stringify({
+            severity: "error",
+            event: "document.save.failed",
+            documentId: page.id,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
         onSaveStateChange("error");
         return { status: "error", error };
       }
@@ -2941,6 +2948,36 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       saveBlocked,
     ],
   );
+
+  const performSaveRef = useRef(performSave);
+  performSaveRef.current = performSave;
+
+  const flushSave = useCallback((): Promise<ManualSaveResult> => {
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+
+    if (inFlightSaveRef.current) return inFlightSaveRef.current;
+
+    const savePending = async (): Promise<ManualSaveResult> => {
+      while (pendingMarkdownRef.current !== lastAcceptedMarkdownRef.current) {
+        const result = await performSaveRef.current(pendingMarkdownRef.current);
+        if (result.status !== "saved") return result;
+      }
+      onSaveStateChange("saved");
+      return { status: "saved" };
+    };
+
+    const operation = savePending();
+    inFlightSaveRef.current = operation;
+    void operation.finally(() => {
+      if (inFlightSaveRef.current === operation) {
+        inFlightSaveRef.current = null;
+      }
+    });
+    return operation;
+  }, [onSaveStateChange]);
 
   const scheduleSave = useCallback(
     (nextMarkdown: string) => {
@@ -2961,41 +2998,11 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       onSaveStateChange("saving");
       saveTimer.current = setTimeout(() => {
         saveTimer.current = null;
-        inFlightSaveRef.current = performSave(nextMarkdown).finally(() => {
-          inFlightSaveRef.current = null;
-        });
-        void inFlightSaveRef.current;
+        void flushSave();
       }, 500);
     },
-    [onSaveStateChange, performSave, saveBlocked],
+    [flushSave, onSaveStateChange, saveBlocked],
   );
-
-  const flushSave = useCallback(async (): Promise<ManualSaveResult> => {
-    if (saveTimer.current) {
-      clearTimeout(saveTimer.current);
-      saveTimer.current = null;
-    }
-
-    const currentMarkdown = pendingMarkdownRef.current;
-
-    if (
-      currentMarkdown === lastAcceptedMarkdownRef.current &&
-      !inFlightSaveRef.current
-    ) {
-      onSaveStateChange("saved");
-      return { status: "saved" };
-    }
-
-    if (inFlightSaveRef.current) {
-      await inFlightSaveRef.current;
-      if (pendingMarkdownRef.current === lastAcceptedMarkdownRef.current) {
-        onSaveStateChange("saved");
-        return { status: "saved" };
-      }
-    }
-
-    return await performSave(pendingMarkdownRef.current);
-  }, [onSaveStateChange, performSave]);
 
   useEffect(() => {
     onSaveControllerChange?.({ flushSave });
