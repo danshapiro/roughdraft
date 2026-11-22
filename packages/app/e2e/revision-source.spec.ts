@@ -245,6 +245,73 @@ test("source-only Markdown spelling edits save exactly and survive undo and redo
   }
 });
 
+test("source Redo saves after an earlier Undo write is acknowledged late @smoke", async ({
+  page,
+  request,
+}) => {
+  const project = createMarkdownProject("revision-source-delayed-ack");
+  const filename = writeProjectFile(project, "notes.md", "Original\n");
+  let releaseAcknowledgement = () => {};
+  try {
+    const created = await request.post(`${api}/document`, {
+      data: { targetPath: filename, autosave: filename },
+    });
+    await expect(created).toBeOK();
+    const { id } = (await created.json()) as ComparisonReviewData;
+    await page.goto(`/?comparison=${id}`);
+    await selectRichText(page, "Original");
+    await page.keyboard.type("Edited");
+    await expect.poll(() => fs.readFileSync(filename, "utf8")).toBe("Edited\n");
+    await page.getByTestId("revision-format").click();
+    const source = page.getByTestId("revision-markdown").locator(".cm-content");
+    await source.focus();
+    await page.keyboard.press("Control+A");
+    await page.keyboard.insertText("Edited.\n");
+    await expect
+      .poll(() => fs.readFileSync(filename, "utf8"))
+      .toBe("Edited.\n");
+    await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
+      "aria-label",
+      "Saved to file",
+    );
+    await page.getByTestId("revision-format").click();
+
+    const acknowledgement = new Promise<void>((resolve) => {
+      releaseAcknowledgement = resolve;
+    });
+    let holdNextSave = true;
+    await page.route(`**/api/comparisons/${id}/save`, async (route) => {
+      if (!holdNextSave) {
+        await route.continue();
+        return;
+      }
+      holdNextSave = false;
+      const response = await route.fetch();
+      await acknowledgement;
+      await route.fulfill({ response });
+    });
+
+    await page.getByTestId("revision-undo").click();
+    await expect(richTextEditor(page)).toHaveText("Edited");
+    await expect.poll(() => fs.readFileSync(filename, "utf8")).toBe("Edited\n");
+    await page.getByTestId("revision-redo").click();
+    await expect(richTextEditor(page)).toHaveText("Edited.");
+    releaseAcknowledgement();
+
+    await expect
+      .poll(() => fs.readFileSync(filename, "utf8"))
+      .toBe("Edited.\n");
+    await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
+      "aria-label",
+      "Saved to file",
+    );
+    logE2eEvent("revision.source-delayed-ack-redo-saved", { id });
+  } finally {
+    releaseAcknowledgement();
+    removeMarkdownProject(project);
+  }
+});
+
 test("source Undo after an outcome preview retains suggestions and feedback @smoke", async ({
   page,
   request,

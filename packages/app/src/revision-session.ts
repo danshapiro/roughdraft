@@ -60,6 +60,19 @@ function storedDraft(review: ComparisonReviewData): RevisionDraft | null {
     : null;
 }
 
+function needsFileSave(
+  review: ComparisonReviewData,
+  draft: RevisionDraft,
+  paused: boolean,
+) {
+  return (
+    !paused &&
+    Boolean(review.destinationPath) &&
+    (draft.cleanMarkdown ?? draft.markdown) !==
+      cleanRevisionMarkdown(review.savedText ?? "")
+  );
+}
+
 interface BrowserRecovery {
   revision: number;
   draft: RevisionDraft;
@@ -232,11 +245,7 @@ export function useRevisionSession(
         const current = server.current;
         const path = `/${encodeURIComponent(current.id)}`;
         const saveFile =
-          action === "sync" &&
-          !paused.current &&
-          current.destinationPath &&
-          (snapshot.cleanMarkdown ?? snapshot.markdown) !==
-            cleanRevisionMarkdown(current.savedText ?? "");
+          action === "sync" && needsFileSave(current, snapshot, paused.current);
         const endpoint =
           action === "sync"
             ? saveFile
@@ -344,7 +353,13 @@ export function useRevisionSession(
   );
 
   useEffect(() => {
-    if (equalDraft(draft, storedDraft(server.current) ?? seed)) {
+    // A save can be acknowledged after the user has already undone/redone it.
+    // Recheck newer work against every acknowledgement, even if it matched the
+    // previously saved draft while that request was still in flight.
+    if (
+      equalDraft(draft, storedDraft(session) ?? seed) &&
+      !needsFileSave(session, draft, paused.current)
+    ) {
       setRecoveryPending(false);
       return;
     }
@@ -363,7 +378,7 @@ export function useRevisionSession(
       active = false;
       window.clearTimeout(timer);
     };
-  }, [draft, run, seed]);
+  }, [draft, run, seed, session]);
 
   const readDraft = useCallback(() => latest.current, []);
 
