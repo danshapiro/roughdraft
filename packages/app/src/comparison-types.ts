@@ -18,6 +18,23 @@ export interface EditorDraft {
   markdown: string;
   cleanMarkdown?: string;
   decisions: Record<string, "kept">;
+  reviewed?: ReviewedChange[];
+}
+export interface DocumentMetadata {
+  frontmatter: string | null;
+  endmatter: string | null;
+}
+export interface ReviewedChange {
+  id: string;
+  decision: "accept" | "reject";
+  oldText: string;
+  newText: string;
+  inverse: Record<string, unknown>[];
+  guard: { from: number; to: number; slice: unknown };
+  keptId?: string;
+  keptIds?: string[];
+  stale?: boolean;
+  metadata?: { before: DocumentMetadata; after: DocumentMetadata };
 }
 export interface EditorFeedback {
   draft: EditorDraft;
@@ -33,6 +50,11 @@ export interface ComparisonReviewData {
   title: string;
   beforeLabel: string;
   afterLabel: string;
+  beforePath?: string | null;
+  afterPath?: string | null;
+  autosave?: string;
+  handoff?: "chat" | "button";
+  recoveredReviews?: ComparisonReviewData[];
   targetPath: string | null;
   beforeText: string;
   afterText: string;

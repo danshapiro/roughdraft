@@ -34,3 +34,11 @@ The mitigation is a shared bearer token, `ROUGHDRAFT_TOKEN`:
 - The viewerUrl printed by the CLI includes `?token=...` so the browser tab can authenticate. The frontend forwards the token as a header on fetches and as `?token=` on the EventSource.
 
 Loopback-only deployments stay back-compatible: no token required, no behavior change. The token is the contract that lets non-loopback deployments be safe; the secure-by-default startup guard is the contract that lets us ship the feature without expecting users to read documentation before exposing the endpoints.
+
+## Exact-server connection amendment
+
+Unified review commands accept an explicit `--server URL`. This selects an existing capable server exactly and performs no local discovery, automatic startup, port fallback, or process ownership change. Implicit local startup retains checkout isolation. `--port` remains a startup preference and reports the effective connection when fallback occurs.
+
+The status response identifies each running app instance, advertises file-comparison capability, and optionally supplies a trusted canonical public address. A public frontend may proxy another local API address, but a successful review handoff must verify the saved review and its server through the final public address. A display-only public-address override cannot establish that relationship.
+
+The repository's `pnpm preview` owns preparation and retention of development review runtimes through `devservers`. Runtimes and review documents are preserved outside disposable worktrees. Connecting to or keeping such a preview does not authorize production installation or service changes.

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "./index";
 
 describe("createApp", () => {
@@ -20,8 +20,68 @@ describe("createApp", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     fs.rmSync(projectDir, { recursive: true, force: true });
     fs.rmSync(homeDir, { recursive: true, force: true });
+  });
+
+  it("identifies the exact running app independently of its checkout and process", async () => {
+    const first = createApp({ homeDir, serverRoot });
+    const second = createApp({ homeDir, serverRoot });
+    const firstStatus = (await request(first.app).get("/api/status")).body;
+    const repeated = (await request(first.app).get("/api/status")).body;
+    const secondStatus = (await request(second.app).get("/api/status")).body;
+    expect(firstStatus.instanceId).toEqual(expect.any(String));
+    expect(firstStatus.instanceId).toBe(repeated.instanceId);
+    expect(firstStatus.instanceId).not.toBe(secondStatus.instanceId);
+    expect(firstStatus.capabilities.fileComparisons).toBe(true);
+    const restricted = createApp({ homeDir, allowLocalFiles: false });
+    const restrictedStatus = (await request(restricted.app).get("/api/status"))
+      .body;
+    expect(restrictedStatus.capabilities.fileComparisons).toBe(false);
+    expect(
+      (await request(restricted.app).get("/api/comparisons/missing")).status,
+    ).toBe(403);
+  });
+
+  it("advertises the configured public route while retaining mounted prefixes", async () => {
+    vi.stubEnv(
+      "DEVSERVERS_PUBLIC_URL",
+      "https://managed.example/editors/alice",
+    );
+    vi.stubEnv("ROUGHDRAFT_PUBLIC_URL", "");
+    const managed = createApp({ homeDir });
+    expect((await request(managed.app).get("/api/status")).body.publicUrl).toBe(
+      "https://managed.example/editors/alice/",
+    );
+    vi.stubEnv("ROUGHDRAFT_PUBLIC_URL", "https://override.example/review/");
+    const overridden = createApp({ homeDir });
+    expect(
+      (await request(overridden.app).get("/api/status")).body.publicUrl,
+    ).toBe("https://override.example/review/");
+    const explicit = createApp({
+      homeDir,
+      publicUrl: "https://explicit.example/path",
+    });
+    expect(
+      (await request(explicit.app).get("/api/status")).body.publicUrl,
+    ).toBe("https://explicit.example/path/");
+    const disabled = createApp({ homeDir, publicUrl: null });
+    expect(
+      (await request(disabled.app).get("/api/status")).body.publicUrl,
+    ).toBeNull();
+  });
+
+  it("rejects invalid public addresses before advertising a misleading review route", () => {
+    for (const publicUrl of [
+      "relative/path",
+      "file:///tmp/review",
+      "https://user:password@example.com/",
+      "https://example.com/?comparison=old",
+      "https://example.com/#old",
+    ]) {
+      expect(() => createApp({ homeDir, publicUrl })).toThrow(/public.*URL/i);
+    }
   });
 
   it("creates a markdown page on disk", async () => {
@@ -44,6 +104,49 @@ describe("createApp", () => {
 
     const filePath = path.join(projectDir, "untitled-1.md");
     expect(fs.readFileSync(filePath, "utf-8")).toBe("# Draft\n");
+  });
+
+  it("resolves rendered module and API requests beneath the configured public prefix", async () => {
+    const { default: express } = await import("express");
+    const publicUrl = "https://example.com/editors/alice/";
+    fs.writeFileSync(
+      path.join(projectDir, "index.html"),
+      '<!doctype html><html><head></head><body><script type="module" src="./assets/app.js"></script></body></html>',
+    );
+    fs.mkdirSync(path.join(projectDir, "assets"));
+    fs.writeFileSync(
+      path.join(projectDir, "assets/app.js"),
+      "window.loaded = true;",
+    );
+    const { app } = createApp({
+      homeDir,
+      staticDirPath: projectDir,
+      publicUrl,
+    });
+    // Model the prefix-stripping reverse proxy that owns the public route.
+    const proxy = express().use("/editors/alice", app);
+    const shell = await request(proxy).get(
+      "/editors/alice/?comparison=saved-review",
+    );
+    expect(shell.status).toBe(200);
+    const baseHref = shell.text.match(/<base href="([^"]+)"/)?.[1];
+    const moduleSrc = shell.text.match(/<script[^>]*src="([^"]+)"/)?.[1];
+    if (!baseHref || !moduleSrc)
+      throw new Error("Expected a browser base and module entry");
+    const documentBase = new URL(baseHref, publicUrl);
+    const moduleUrl = new URL(moduleSrc, documentBase);
+    const apiUrl = new URL("api/status", documentBase);
+    expect({
+      modulePath: moduleUrl.pathname,
+      apiPath: apiUrl.pathname,
+    }).toEqual({
+      modulePath: "/editors/alice/assets/app.js",
+      apiPath: "/editors/alice/api/status",
+    });
+    expect((await request(proxy).get(moduleUrl.pathname)).status).toBe(200);
+    const status = await request(proxy).get(apiUrl.pathname);
+    expect(status.status).toBe(200);
+    expect(status.body.publicUrl).toBe(publicUrl);
   });
 
   it("serves built HTML with a per-request browser base for reverse proxies", async () => {
@@ -558,6 +661,7 @@ describe("createApp", () => {
       homeDir,
       staticDirPath: projectDir,
       port: 4312,
+      publicUrl: null,
     });
 
     const response = await request(app).get("/api/status");
@@ -565,6 +669,8 @@ describe("createApp", () => {
     expect(response.status).toBe(200);
     expect(response.body).toEqual({
       backend: "local-files",
+      instanceId: expect.any(String),
+      publicUrl: null,
       pid: process.pid,
       port: 4312,
       serverRoot,
@@ -572,6 +678,7 @@ describe("createApp", () => {
       capabilities: {
         projectPathRequired: true,
         fileSystemBrowsing: true,
+        fileComparisons: true,
         remoteDocuments: true,
         remoteDocumentTokenRequired: false,
       },

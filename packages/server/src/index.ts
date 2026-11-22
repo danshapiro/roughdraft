@@ -10,10 +10,13 @@ import {
 } from "@roughdraft/rfm";
 import express, {
   type Express,
+  type NextFunction,
   type Request,
   type Response,
-  type NextFunction,
 } from "express";
+import { atomicWrite, FileChangedError } from "./atomic-write.js";
+import { comparisonRouter } from "./comparisons.js";
+import { logServerEvent } from "./diagnostics.js";
 import {
   hasNonLoopbackHost,
   ROUGHDRAFT_DEFAULT_PORT,
@@ -21,9 +24,6 @@ import {
   resolveBindHosts,
 } from "./network.js";
 import { ReviewEventQueue } from "./review-events.js";
-import { logServerEvent } from "./diagnostics.js";
-import { atomicWrite, FileChangedError } from "./atomic-write.js";
-import { comparisonRouter } from "./comparisons.js";
 import { resolveUpdateStatus } from "./update-status.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -80,6 +80,7 @@ interface CreateAppOptions {
   remoteDocumentToken?: string;
   allowLocalFiles?: boolean;
   comparisonsDir?: string;
+  publicUrl?: string | null;
 }
 
 interface CreateAppResult {
@@ -436,6 +437,27 @@ function listProjectTree(projectDir: string): ProjectTreeListing {
   return { paths };
 }
 
+function configuredPublicUrl(value: string | null | undefined): string | null {
+  if (!value?.trim()) return null;
+  try {
+    const url = new URL(value.trim());
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    )
+      throw new Error("Invalid public address");
+    if (!url.pathname.endsWith("/")) url.pathname += "/";
+    return url.toString();
+  } catch {
+    throw new Error(
+      "The public URL must be an absolute HTTP(S) address without credentials, query parameters, or a fragment.",
+    );
+  }
+}
+
 export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const port = options.port ?? ROUGHDRAFT_DEFAULT_PORT;
   const homeDir = options.homeDir ?? os.homedir();
@@ -443,6 +465,19 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const staticDirPath = options.staticDirPath ?? staticDir;
   const fetchImpl = options.fetchImpl ?? fetch;
   const allowLocalFiles = options.allowLocalFiles !== false;
+  const instanceId = crypto.randomUUID();
+  const publicUrl = configuredPublicUrl(
+    options.publicUrl !== undefined
+      ? options.publicUrl
+      : process.env.ROUGHDRAFT_PUBLIC_URL?.trim() ||
+          process.env.DEVSERVERS_PUBLIC_URL,
+  );
+  logServerEvent("server", "instance.ready", {
+    instanceId,
+    serverRoot,
+    publicUrl,
+    fileComparisons: allowLocalFiles,
+  });
   const remoteDocumentToken =
     typeof options.remoteDocumentToken === "string" &&
     options.remoteDocumentToken.length > 0
@@ -918,6 +953,8 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   app.get("/api/status", (_req, res) => {
     res.json({
       backend: "local-files",
+      instanceId,
+      publicUrl,
       pid: process.pid,
       port,
       projectDir: options.projectDir
@@ -928,6 +965,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       capabilities: {
         projectPathRequired: allowLocalFiles,
         fileSystemBrowsing: allowLocalFiles,
+        fileComparisons: allowLocalFiles,
         remoteDocuments: true,
         remoteDocumentTokenRequired: remoteDocumentToken !== null,
       },
@@ -1355,7 +1393,8 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const configured =
       typeof options.browserBasePath === "function"
         ? options.browserBasePath(req)
-        : (options.browserBasePath ?? "/");
+        : (options.browserBasePath ??
+          (publicUrl ? new URL(publicUrl).pathname : "/"));
     if (
       !configured.startsWith("/") ||
       configured.startsWith("//") ||

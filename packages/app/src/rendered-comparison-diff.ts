@@ -4,6 +4,7 @@ import type { ControlledReviewBlockHighlight } from "./controlled-review";
 import type { CriticChangeAttrs, CriticChangeKind } from "./critic-markup";
 import { noteKey } from "./endnotes";
 import { stableMarkdownDestination } from "./markdown";
+import { shouldMergeDiffGap } from "./semantic-diff";
 
 export interface RenderedComparisonDifference {
   content: JSONContent[];
@@ -192,7 +193,10 @@ function joinText(content: JSONContent[]) {
   return result;
 }
 
-function summary(content: JSONContent[], formatting: boolean): string {
+export function summarizeComparisonContent(
+  content: JSONContent[],
+  formatting: boolean,
+): string {
   const text = content.map(visibleText).join("").trim();
   const descriptors = new Set<string>();
   const visit = (node: JSONContent) => {
@@ -435,6 +439,101 @@ type SubtreeCache = WeakMap<
 >;
 
 type AlignmentPart = ReturnType<typeof alignment>[number];
+
+function proseBarrier(node: JSONContent) {
+  return (
+    node.type !== "text" ||
+    node.marks?.some((mark) =>
+      ["criticChange", "commentRef", "code"].includes(mark.type),
+    )
+  );
+}
+
+/** The observer retains atomic runs for saved IDs; rendered prose is cleaned. */
+function cleanProseAlignment(
+  parts: AlignmentPart[],
+  before: JSONContent[],
+  after: JSONContent[],
+): AlignmentPart[] {
+  const result: AlignmentPart[] = [];
+  let oldIndex = 0,
+    newIndex = 0,
+    leftOld = 0,
+    leftNew = 0,
+    leftBlocked = false;
+  const width = (nodes: JSONContent[]) =>
+    nodes.reduce((sum, node) => sum + visibleText(node).length, 0);
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index];
+    if (part.added || part.removed) {
+      const nodes = part.removed
+        ? before.slice(oldIndex, oldIndex + part.count)
+        : after.slice(newIndex, newIndex + part.count);
+      if (part.removed) {
+        oldIndex += part.count;
+        leftOld += width(nodes);
+      } else {
+        newIndex += part.count;
+        leftNew += width(nodes);
+      }
+      leftBlocked ||= nodes.some(proseBarrier);
+      result.push(part);
+      continue;
+    }
+    const oldGap = before.slice(oldIndex, oldIndex + part.count),
+      newGap = after.slice(newIndex, newIndex + part.count);
+    oldIndex += part.count;
+    newIndex += part.count;
+    let nextOld = oldIndex,
+      nextNew = newIndex,
+      rightOld = 0,
+      rightNew = 0,
+      rightBlocked = false;
+    for (
+      let next = index + 1;
+      next < parts.length && (parts[next].added || parts[next].removed);
+      next++
+    ) {
+      const chunk = parts[next];
+      const nodes = chunk.removed
+        ? before.slice(nextOld, nextOld + chunk.count)
+        : after.slice(nextNew, nextNew + chunk.count);
+      if (chunk.removed) {
+        nextOld += chunk.count;
+        rightOld += width(nodes);
+      } else {
+        nextNew += chunk.count;
+        rightNew += width(nodes);
+      }
+      rightBlocked ||= nodes.some(proseBarrier);
+    }
+    const gap = newGap.map(visibleText).join("");
+    if (
+      !leftBlocked &&
+      !rightBlocked &&
+      !oldGap.some(proseBarrier) &&
+      !newGap.some(proseBarrier) &&
+      shouldMergeDiffGap(
+        gap,
+        Math.max(leftOld, leftNew),
+        Math.max(rightOld, rightNew),
+      )
+    ) {
+      result.push(
+        { ...part, added: false, removed: true },
+        { ...part, added: true, removed: false },
+      );
+      leftOld += gap.length;
+      leftNew += gap.length;
+    } else {
+      result.push(part);
+      leftOld = 0;
+      leftNew = 0;
+      leftBlocked = false;
+    }
+  }
+  return result;
+}
 interface CachedRun {
   oldNodes: JSONContent[];
   newNodes: JSONContent[];
@@ -504,8 +603,10 @@ function compareRendered(
       previous.length > 0 &&
       next.length > 0 &&
       previous.map(visibleText).join("") === next.map(visibleText).join("");
-    if (previous.length) oldSummary.push(summary(previous, formatting));
-    if (next.length) newSummary.push(summary(next, formatting));
+    if (previous.length)
+      oldSummary.push(summarizeComparisonContent(previous, formatting));
+    if (next.length)
+      newSummary.push(summarizeComparisonContent(next, formatting));
   };
   const replace = (
     previous: JSONContent[],
@@ -602,8 +703,10 @@ function compareRendered(
       newFrom,
       newTo: offsets(next, newFrom)[next.length],
       structural,
-      oldText: previous.length ? summary(previous, formatting) : "",
-      newText: next.length ? summary(next, formatting) : "",
+      oldText: previous.length
+        ? summarizeComparisonContent(previous, formatting)
+        : "",
+      newText: next.length ? summarizeComparisonContent(next, formatting) : "",
     });
   };
   const mergeNode = (
@@ -672,10 +775,14 @@ function compareRendered(
     newFrom: number,
     observe?: DifferenceObserver,
   ): JSONContent[] => {
-    const parts =
+    const aligned =
       parent === "doc" && alignRoot
         ? alignRoot(previous, next)
         : alignment(previous, next, semanticKey);
+    const parts =
+      change && parent === "paragraph"
+        ? cleanProseAlignment(aligned, previous, next)
+        : aligned;
     let oldIndex = 0;
     let newIndex = 0;
     const result: JSONContent[] = [];

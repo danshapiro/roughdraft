@@ -142,7 +142,7 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     fs.writeFileSync(target, "# Rules\r\nOriginal");
     fs.writeFileSync(candidate, "# Rules\r\nNew rule");
     const result = await command(
-      ["propose", target, "--after", candidate, "--timeout", "5"],
+      ["propose", target, "--after", candidate, "--watch", "--timeout", "5"],
       async (event) => {
         expect(fs.readFileSync(target, "utf8")).toBe("# Rules\r\nOriginal");
         const review = event.comparison;
@@ -190,6 +190,7 @@ describe("comparison CLI actual subprocess and filesystem", () => {
       target,
       "--before",
       before,
+      "--watch",
       "--timeout",
       "0",
     ]);
@@ -200,7 +201,13 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     });
     expect(fs.readFileSync(target, "utf8")).toBe("Already changed\n");
     const result = await command(
-      ["comparison", timedOut.events[0].comparisonId, "--timeout", "5"],
+      [
+        "comparison",
+        timedOut.events[0].comparisonId,
+        "--watch",
+        "--timeout",
+        "5",
+      ],
       async (event) => {
         const review = event.comparison;
         const draft = { markdown: review.beforeText, decisions: {} };
@@ -264,7 +271,7 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     });
     await api(`/${review.id}/send`, { revision: saved.revision, ...draft });
     const resumed = await command(
-      ["comparison", review.id, "--timeout", "5"],
+      ["comparison", review.id, "--watch", "--timeout", "5"],
       async (event) => {
         await api(`/${review.id}/send`, {
           revision: event.comparison.revision,
@@ -293,7 +300,7 @@ describe("comparison CLI actual subprocess and filesystem", () => {
     fs.writeFileSync(before, "Before");
     fs.writeFileSync(after, "After");
     const result = await command(
-      ["compare", before, after, "--timeout", "5"],
+      ["compare", before, after, "--watch", "--timeout", "5"],
       async (event) => {
         expect(event.comparison.targetPath).toBe(null);
         await api(`/${event.comparison.id}/send`, {
@@ -324,7 +331,7 @@ describe("comparison CLI actual subprocess and filesystem", () => {
       comment: "Previous feedback",
     });
     const result = await command(
-      ["comparison", review.id, "--timeout", "5"],
+      ["comparison", review.id, "--watch", "--timeout", "5"],
       async (event) => {
         expect(event.comparison.feedback).toEqual(earlier.feedback);
         const copied = await api(`/${review.id}/fork`, {
@@ -361,7 +368,7 @@ describe("comparison CLI actual subprocess and filesystem", () => {
       decisions: {},
     });
     const received = await command(
-      ["edit", target, "--timeout", "5"],
+      ["edit", target, "--watch", "--timeout", "5"],
       async (event) => {
         expect(event.comparisonId).toBe(review.id);
         expect(event.comparison.feedback).toEqual(first.feedback);
@@ -378,5 +385,66 @@ describe("comparison CLI actual subprocess and filesystem", () => {
       saved: false,
     });
     expect(fs.readFileSync(target, "utf8")).toBe("live file");
+  }, 15000);
+
+  it("opens a nonblocking chat review and reads persisted edits and comments without sending feedback", async () => {
+    const before = path.join(directory, "guide.before.md");
+    const after = path.join(directory, "guide.md");
+    fs.writeFileSync(before, "Previous guide");
+    fs.writeFileSync(after, "Updated guide");
+    const opened = await command([
+      "compare",
+      before,
+      after,
+      "--title",
+      "Review the customer welcome guide",
+      "--before-label",
+      "Previous guide",
+      "--after-label",
+      "Updated guide",
+      "--autosave",
+      "none",
+      "--timeout",
+      "0",
+    ]);
+    expect(opened.code, opened.errors).toBe(0);
+    expect(opened.events).toHaveLength(1);
+    const review = opened.events[0].comparison;
+    expect(review).toMatchObject({
+      title: "Review the customer welcome guide",
+      beforeLabel: "Previous guide",
+      afterLabel: "Updated guide",
+      autosave: "none",
+      handoff: "chat",
+    });
+    const draft = {
+      markdown: "Edited guide with a {++pending suggestion++}",
+      cleanMarkdown: "Edited guide with a ",
+      decisions: { wording: "kept" },
+      reviewComments: [
+        {
+          id: "latest-comment",
+          changeId: "document",
+          content: "Please shorten the introduction",
+          createdAt: "2026-11-21T12:00:00.000Z",
+          scope: "document",
+        },
+      ],
+    };
+    await api(`/${review.id}/draft`, { revision: review.revision, ...draft });
+    const read = await command(["comparison", review.id, "--read"]);
+    expect(read.code, read.errors).toBe(0);
+    expect(read.events).toHaveLength(1);
+    expect(read.events[0]).toMatchObject({
+      event: "comparison.read",
+      comparisonId: review.id,
+      comparison: {
+        draft: { markdown: draft.markdown, decisions: draft.decisions },
+        reviewComments: draft.reviewComments,
+        feedback: null,
+      },
+    });
+    expect(fs.readFileSync(before, "utf8")).toBe("Previous guide");
+    expect(fs.readFileSync(after, "utf8")).toBe("Updated guide");
   }, 15000);
 });

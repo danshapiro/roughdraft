@@ -35,6 +35,7 @@ interface CommentEditorListProps {
   allowDeleteThread?: boolean;
   onDeleteComment: (commentId: string) => void;
   onUpdateComment: (commentId: string, nextContent: string) => void;
+  autosave?: boolean;
   onSelectComment?: (commentId: string) => void;
   onHoverComment?: (commentId: string | null) => void;
   onFocusComment?: (commentId: string) => void;
@@ -105,6 +106,7 @@ export function CommentEditorList({
   allowDeleteThread = true,
   onDeleteComment,
   onUpdateComment,
+  autosave = false,
   onSelectComment,
   onHoverComment,
   onFocusComment,
@@ -118,6 +120,7 @@ export function CommentEditorList({
   const interactive = interactiveProp && !readOnly;
   const textareaRefs = useRef(new Map<string, HTMLTextAreaElement>());
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const originalContent = useRef(new Map<string, string>());
   const [editingCommentIds, setEditingCommentIds] = useState<string[]>([]);
   const threads = useMemo(() => buildCommentThreads(comments), [comments]);
   const commentMap = useMemo(
@@ -167,6 +170,11 @@ export function CommentEditorList({
 
     const pendingComment = commentMap.get(pendingFocusCommentId);
     if (!pendingComment) return;
+    if (!originalContent.current.has(pendingFocusCommentId))
+      originalContent.current.set(
+        pendingFocusCommentId,
+        pendingComment.content,
+      );
 
     setDrafts((current) => ({
       ...current,
@@ -204,6 +212,7 @@ export function CommentEditorList({
   const startEditingComment = (commentId: string) => {
     const comment = commentMap.get(commentId);
     if (!comment) return;
+    originalContent.current.set(commentId, comment.content);
 
     setDrafts((current) => ({
       ...current,
@@ -226,6 +235,7 @@ export function CommentEditorList({
     if (!comment) return;
 
     const nextContent = (drafts[commentId] ?? comment.content).trim();
+    originalContent.current.delete(commentId);
 
     if (nextContent.length === 0) {
       onDeleteComment(commentId);
@@ -247,6 +257,8 @@ export function CommentEditorList({
   const cancelEditingComment = (commentId: string) => {
     const comment = commentMap.get(commentId);
     if (!comment) return;
+    const original = originalContent.current.get(commentId) ?? comment.content;
+    originalContent.current.delete(commentId);
 
     setDrafts((current) => {
       const nextDrafts = { ...current };
@@ -254,10 +266,13 @@ export function CommentEditorList({
       return nextDrafts;
     });
 
-    if (comment.content.trim().length === 0) {
+    if (original.trim().length === 0) {
       onDeleteComment(commentId);
       return;
     }
+
+    if (autosave && original !== comment.content)
+      onUpdateComment(commentId, original);
 
     stopEditingComment(commentId);
   };
@@ -314,6 +329,7 @@ export function CommentEditorList({
               ...current,
               [commentId]: nextContent,
             }));
+            if (autosave) onUpdateComment(commentId, nextContent);
           }}
         />
       ))}

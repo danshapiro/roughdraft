@@ -1,4 +1,3 @@
-import { reviewShortcutKeys, reviewShortcutLabel } from "./review-decisions";
 import type { Editor } from "@tiptap/react";
 import { Check, Reply, X } from "lucide-react";
 import {
@@ -12,10 +11,10 @@ import {
   useState,
 } from "react";
 import {
-  CommentEditorList,
   type CommentActionDefinition,
   type CommentActionsRenderContext,
   type CommentContentRenderContext,
+  CommentEditorList,
 } from "./CommentEditorList";
 import type {
   CriticChangeAttrs,
@@ -34,6 +33,7 @@ import {
 import { SUGGESTED_PARAGRAPH_SENTINEL } from "./editor-extensions";
 import { cn } from "./lib/utils";
 import type { DraftSuggestionState } from "./PageCard";
+import { reviewShortcutKeys, reviewShortcutLabel } from "./review-decisions";
 
 const SUGGESTION_QUOTE_PREVIEW_LIMIT = 140;
 const WINDOWED_RAIL_THRESHOLD = 60;
@@ -92,6 +92,7 @@ export interface CriticChangeRailItem {
   anchorTop: number;
   anchorBottom: number;
   sourceChangeCount?: number;
+  sourceChangeIds?: string[];
   reviewStatus?: string;
 }
 
@@ -109,6 +110,7 @@ interface DocumentReviewRailProps {
   testId?: string;
   onDeleteComment: (commentId: string) => void;
   onUpdateComment: (commentId: string, nextContent: string) => void;
+  autosaveComments?: boolean;
   onReplyComment: (commentId: string) => void;
   onSelectComment: (commentId: string) => void;
   onFocusComment: (commentId: string) => void;
@@ -277,6 +279,7 @@ export function DocumentReviewRail({
   testId,
   onDeleteComment,
   onUpdateComment,
+  autosaveComments = false,
   onReplyComment,
   onSelectComment,
   onFocusComment,
@@ -585,6 +588,7 @@ export function DocumentReviewRail({
                 }}
               >
                 <CommentEditorList
+                  autosave={autosaveComments}
                   comments={layout.thread.visibleComments}
                   variant="rail"
                   className={cn(!isExpanded && "pointer-events-none")}
@@ -827,6 +831,7 @@ export function DocumentReviewRail({
                 </div>
               ) : null}
               <CommentEditorList
+                autosave={autosaveComments}
                 readOnly={reviewControls?.disabled}
                 allowDeleteThread={
                   reviewControls?.allowDeleteThread ?? !reviewControls

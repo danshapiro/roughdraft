@@ -23,6 +23,7 @@ async function openReview(
   page: Page,
   request: APIRequestContext,
   files: { targetPath: string } | { beforePath: string; afterPath: string },
+  options: { autosave?: string } = {},
 ) {
   const response = await request.post(
     "targetPath" in files ? `${api}/document` : api,
@@ -30,8 +31,24 @@ async function openReview(
       headers: { Connection: "close" },
       data:
         "targetPath" in files
-          ? files
-          : { ...files, editor: "unified", mode: "compare" },
+          ? {
+              ...files,
+              title: "Review document wording",
+              autosave: files.targetPath,
+              handoff: "chat",
+              ...options,
+            }
+          : {
+              ...files,
+              editor: "unified",
+              mode: "compare",
+              title: "Review document wording",
+              beforeLabel: "Original",
+              afterLabel: "Revised",
+              autosave: "none",
+              handoff: "chat",
+              ...options,
+            },
     },
   );
   await expect(response).toBeOK();
@@ -116,7 +133,7 @@ test.describe("mobile and foldable review", () => {
   test("a folded cover screen leaves room to read and comfortably tap review controls @smoke", async ({
     page,
     request,
-  }) => {
+  }, testInfo) => {
     await openReview(page, request, {
       beforePath: writeProjectFile(project, "before.md", before),
       afterPath: writeProjectFile(project, "after.md", after),
@@ -138,6 +155,12 @@ test.describe("mobile and foldable review", () => {
       .soft(editor?.width, "Phone margins should leave a useful text column")
       .toBeGreaterThanOrEqual(296);
     await noPageOverflow(page);
+    const screenshot = testInfo.outputPath("folded-cover-header.png");
+    await page.screenshot({ path: screenshot });
+    await testInfo.attach("folded-cover-header", {
+      path: screenshot,
+      contentType: "image/png",
+    });
     await page.getByTestId("revision-more").tap();
     const actions = page.getByTestId("revision-more-actions");
     await expect(actions).toBeVisible();
@@ -160,7 +183,8 @@ test.describe("mobile and foldable review", () => {
   }) => {
     const targetPath = writeProjectFile(project, "notes.md", before);
     const id = await openReview(page, request, { targetPath });
-    await page.getByTestId("revision-suggest").tap();
+    await page.getByTestId("revision-mode").tap();
+    await page.getByTestId("revision-mode-suggest").tap();
     await selectRichText(page, "original");
     await page.keyboard.insertText("updated");
     await expect(page.getByTestId("revision-pending")).toHaveText("1");
@@ -222,27 +246,40 @@ test.describe("mobile and foldable review", () => {
     expect(fs.readFileSync(targetPath, "utf8")).toBe(before);
   });
 
-  test("More actions opens Save As and saves a separate copy on a phone @smoke", async ({
+  test("the agent's preset save location writes a separate copy on a phone @smoke", async ({
     page,
     request,
   }) => {
     const targetPath = writeProjectFile(project, "original.md", before);
-    await openReview(page, request, { targetPath });
-    await page.getByTestId("revision-more").tap();
-    await page.getByTestId("revision-save-as").tap();
     const destination = `${project}/saved-copy.md`;
-    await page.getByTestId("revision-output").fill(destination);
-    await page.getByTestId("revision-save-confirm").tap();
-    await expect(page.getByTestId("revision-path")).toHaveText(destination);
-    await expect(page.getByTestId("revision-file-status")).toHaveText("Saved");
-    expect(fs.readFileSync(destination, "utf8")).toBe(before);
+    await openReview(page, request, { targetPath }, { autosave: destination });
+    await expect(page.getByTestId("revision-path")).toHaveText(
+      "Review document wording",
+    );
+    await selectRichText(page, "original");
+    await page.keyboard.insertText("edited");
+    await expect
+      .poll(
+        () =>
+          fs.existsSync(destination) && fs.readFileSync(destination, "utf8"),
+      )
+      .toBe(before.replace("original", "edited"));
+    await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
+      "aria-label",
+      "Saved to file",
+    );
+    await page.getByTestId("revision-details").tap();
+    await expect(page.getByTestId("revision-details-autosave")).toHaveText(
+      destination,
+    );
     expect(fs.readFileSync(targetPath, "utf8")).toBe(before);
+    await noPageOverflow(page);
   });
 
-  test("a short phone viewport keeps file-choice inputs and save actions reachable @smoke", async ({
+  test("a short phone viewport keeps long file details readable while preserving edits @smoke", async ({
     page,
     request,
-  }) => {
+  }, testInfo) => {
     const folder = "a-long-descriptive-directory-name-for-a-shared-review";
     const beforePath = writeProjectFile(
       project,
@@ -254,40 +291,69 @@ test.describe("mobile and foldable review", () => {
       `${folder}/after-a-long-descriptive-document-name.md`,
       after,
     );
-    await openReview(page, request, { beforePath, afterPath });
-    await page.getByTestId("revision-edit").tap();
-    await expect(page.getByTestId("revision-base-dialog")).toBeVisible();
-    await page.getByTestId("revision-base-copy").tap();
-    await page.getByTestId("revision-copy-seed-new").tap();
-    const destination = `${project}/mobile-copy.md`;
-    const input = page.getByTestId("revision-base-path");
-    await input.fill(destination);
+    const id = await openReview(page, request, { beforePath, afterPath });
+    await selectRichText(page, "updated");
+    await page.keyboard.insertText("edited");
     await page.setViewportSize({ width: 360, height: 360 });
-    const dialog = page.getByTestId("revision-base-dialog");
-    const bounds = await dialog.boundingBox();
+    await expect(page.getByTestId("revision-path")).toHaveText(
+      "Review document wording",
+    );
+    await expect(page.getByTestId("revision-identity")).not.toContainText(
+      afterPath,
+    );
+    await expect(page.getByTestId("revision-after-label")).toHaveAttribute(
+      "title",
+      afterPath,
+    );
+    await page.getByTestId("revision-details").tap();
+    const details = page.getByTestId("revision-details-content");
+    await expect(details).toBeVisible();
+    await details.evaluate(async (element) => {
+      await Promise.all(
+        element.getAnimations().map((animation) => animation.finished),
+      );
+    });
+    const screenshot = testInfo.outputPath("short-screen-file-details.png");
+    await page.screenshot({ path: screenshot });
+    await testInfo.attach("short-screen-file-details", {
+      path: screenshot,
+      contentType: "image/png",
+    });
+    const bounds = await details.boundingBox();
     expect
-      .soft(bounds?.y, "The modal top should stay inside the visible screen")
+      .soft(bounds?.y, "The details top should stay inside the visible screen")
       .toBeGreaterThanOrEqual(8);
     expect
       .soft(
         (bounds?.y ?? 0) + (bounds?.height ?? 0),
-        "The modal bottom should stay inside the visible screen",
+        "The details bottom should stay inside the visible screen",
       )
       .toBeLessThanOrEqual(352);
-    await readableText(input);
-    await touchControls(dialog);
-    const confirm = page.getByTestId("revision-base-confirm");
-    await confirm.scrollIntoViewIfNeeded();
-    await expect(confirm).toBeInViewport();
-    await confirm.tap();
-    await expect(page.getByTestId("revision-file-status")).toHaveText("Saved");
+    await expect(page.getByTestId("revision-details-before")).toHaveText(
+      beforePath,
+    );
+    await expect(page.getByTestId("revision-details-after")).toHaveText(
+      afterPath,
+    );
+    await expect(page.getByTestId("revision-details-autosave")).toContainText(
+      "No Markdown file writes",
+    );
+    await page.keyboard.press("Escape");
+    await expect(richTextEditor(page)).toContainText("edited wording");
     await expect
-      .poll(
-        () =>
-          fs.existsSync(destination) && fs.readFileSync(destination, "utf8"),
-      )
-      .toBe(after);
+      .poll(async () => {
+        const response = await request.get(`${api}/${id}`, {
+          headers: { Connection: "close" },
+        });
+        return (await response.json()).draft?.cleanMarkdown;
+      })
+      .toContain("edited wording");
+    await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
+      "aria-label",
+      "Review saved",
+    );
     expect(fs.readFileSync(beforePath, "utf8")).toBe(before);
     expect(fs.readFileSync(afterPath, "utf8")).toBe(after);
+    await noPageOverflow(page);
   });
 });

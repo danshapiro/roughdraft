@@ -2377,7 +2377,18 @@ async function runCliInternal(
             };
           }
           const result = await ensureServerRunning(effectiveDeps);
-          return { apiUrl: result.server.url, frontendUrl: result.server.url };
+          const preferredPort = getPreferredPort(effectiveDeps.env);
+          const portChanged = result.server.port !== preferredPort;
+          if (portChanged)
+            effectiveDeps.error(
+              `Preferred port ${preferredPort} is busy or unavailable for this checkout, using ${result.server.port}. Use --server URL to require an exact existing server.`,
+            );
+          return {
+            apiUrl: result.server.url,
+            frontendUrl: result.server.url,
+            preferredPort,
+            portChanged,
+          };
         },
       );
     }
