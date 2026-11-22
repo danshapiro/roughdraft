@@ -94,6 +94,8 @@ interface IdReference {
   id: string;
   kind: "comment" | "suggestion";
   offset: number;
+  endmatterBacked?: boolean;
+  content?: string;
 }
 
 interface ReplyReference {
@@ -105,6 +107,8 @@ interface ReplyReference {
 interface FenceState {
   marker: "`" | "~";
   length: number;
+  containerIndent?: number;
+  quoteDepth?: number;
 }
 
 interface ParsedComment {
@@ -193,6 +197,7 @@ export function validateRoughdraftMarkdown(
     metadata: Metadata | null,
     kind: "comment" | "suggestion",
     markerOffset: number,
+    content?: string,
   ) => {
     if (!metadata) {
       for (const attribute of requiredMetadataAttributes) {
@@ -224,19 +229,32 @@ export function validateRoughdraftMarkdown(
       }
 
       const existing = ids.get(id);
-      if (existing) {
+      const body =
+        content === "" && typeof entry.body === "string" ? entry.body : content;
+      const repeatedComment =
+        kind === "comment" &&
+        existing?.kind === "comment" &&
+        existing.endmatterBacked &&
+        existing.content === body;
+      if (existing && !repeatedComment) {
         addDiagnostic(
           "error",
           "duplicate-id",
           `Duplicate review id \`${id}\`.`,
           metadata.offset,
         );
-      } else {
-        ids.set(id, { id, kind, offset: metadata.offset });
+      } else if (!existing) {
+        ids.set(id, {
+          id,
+          kind,
+          offset: metadata.offset,
+          endmatterBacked: true,
+          content: body,
+        });
       }
 
       validateEndmatterEntry(id, entry, metadata.offset, addDiagnostic, false);
-      return;
+      return repeatedComment;
     }
 
     if (metadata.kind === "legacy") {
@@ -310,6 +328,11 @@ export function validateRoughdraftMarkdown(
       continue;
     }
 
+    if (markdown[offset] === "\\") {
+      offset += 2;
+      continue;
+    }
+
     const codeSpanEnd = matchInlineCodeSpan(markdown, offset);
     if (codeSpanEnd !== null) {
       offset = codeSpanEnd;
@@ -334,9 +357,16 @@ export function validateRoughdraftMarkdown(
       while (markdown.startsWith("{>>", nextOffset)) {
         const parsed = parseComment(markdown, nextOffset, addDiagnostic);
         if (!parsed) break;
-        summary.comments += 1;
         anchoredComments += 1;
-        validateMetadata(parsed.metadata, "comment", nextOffset);
+        if (
+          !validateMetadata(
+            parsed.metadata,
+            "comment",
+            nextOffset,
+            parsed.content,
+          )
+        )
+          summary.comments += 1;
         nextOffset = parsed.endOffset;
       }
 
@@ -347,8 +377,10 @@ export function validateRoughdraftMarkdown(
     if (markdown.startsWith("{>>", offset)) {
       const parsed = parseComment(markdown, offset, addDiagnostic);
       if (parsed) {
-        summary.comments += 1;
-        validateMetadata(parsed.metadata, "comment", offset);
+        if (
+          !validateMetadata(parsed.metadata, "comment", offset, parsed.content)
+        )
+          summary.comments += 1;
         offset = parsed.endOffset;
         continue;
       }
@@ -370,6 +402,9 @@ export function validateRoughdraftMarkdown(
 
     const existing = ids.get(id);
     if (existing) {
+      // A compact inline reference and its body metadata describe one item.
+      // Repeated inline IDs are still diagnosed while scanning the document.
+      if (existing.kind === "comment" && existing.endmatterBacked) continue;
       addDiagnostic(
         "error",
         "duplicate-id",
@@ -453,26 +488,44 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
   const validation = validateRoughdraftMarkdown(markdown);
   const endmatter = parseRoughdraftEndmatter(markdown);
   const items: RfmReviewItem[] = [];
+  const referencedComments = new Map<string, RfmReviewItem>();
   const noopDiagnostic = () => {};
 
   const addComment = (parsed: ParsedComment, anchorText?: string) => {
     const attrs = hydrateMetadataAttrs(parsed.metadata, endmatter, "comment");
     const id = attrs.get("id") ?? `comment-${parsed.offset.toString()}`;
     const parentId = attrs.get("re") ?? null;
+    const text =
+      parsed.content === "" && parsed.metadata?.kind === "reference"
+        ? (attrs.get("body") ?? "")
+        : parsed.content;
+    const existing =
+      parsed.metadata?.kind === "reference"
+        ? referencedComments.get(id)
+        : undefined;
+    if (existing?.text === text) {
+      if (anchorText !== undefined)
+        existing.anchorText = (existing.anchorText ?? "") + anchorText;
+      existing.endOffset = parsed.endOffset;
+      return;
+    }
 
-    items.push({
+    const item: RfmReviewItem = {
       id,
       kind: parentId ? "reply" : "comment",
       parentId,
       author: attrs.get("by") ?? null,
       createdAt: attrs.get("at") ?? null,
       status: attrs.get("status") ?? null,
-      text: parsed.content,
+      text,
       anchorText,
       offset: parsed.offset,
       endOffset: parsed.endOffset,
       ...locationForOffset(lineStarts, parsed.offset),
-    });
+    };
+    items.push(item);
+    if (parsed.metadata?.kind === "reference" && !existing)
+      referencedComments.set(id, item);
   };
 
   const addSuggestion = (parsed: ParsedSuggestion) => {
@@ -516,6 +569,11 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
 
     if (fence) {
       offset = nextLineOffset(markdown, offset);
+      continue;
+    }
+
+    if (markdown[offset] === "\\") {
+      offset += 2;
       continue;
     }
 
@@ -567,7 +625,7 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
   }
 
   for (const [id, entry] of endmatter.comments) {
-    if (!entry.body) continue;
+    if (!entry.body || items.some((item) => item.id === id)) continue;
 
     items.push({
       id,
@@ -628,6 +686,11 @@ export function cleanRoughdraftMarkdown(markdown: string): string {
         offset = next;
         continue;
       }
+    }
+    if (markdown[offset] === "\\") {
+      result += markdown.slice(offset, Math.min(offset + 2, end));
+      offset += 2;
+      continue;
     }
     const codeEnd = matchInlineCodeSpan(markdown, offset);
     if (codeEnd !== null) {
@@ -871,18 +934,40 @@ function matchFence(
   fence: FenceState | null,
 ): { fence: FenceState } | null {
   const lineEnd = nextLineOffset(markdown, offset);
-  const line = markdown.slice(offset, lineEnd).replace(/\r?\n$/, "");
-  const match = line.match(/^[ \t]{0,3}(`{3,}|~{3,})/);
+  let line = markdown.slice(offset, lineEnd).replace(/\r?\n$/, "");
+  let containerIndent = 0;
+  let quoteDepth = 0;
+  while (true) {
+    const quoteIndent = 3 + (fence?.containerIndent ?? 0);
+    const quote =
+      !fence || quoteDepth < (fence.quoteDepth ?? 0)
+        ? line.match(new RegExp(`^[ \\t]{0,${quoteIndent}}>[ \\t]?`))
+        : null;
+    const list =
+      quote || fence ? null : line.match(/^[ \t]{0,3}(?:[-+*]|\d+[.)])[ \t]+/);
+    const prefix = quote ?? list;
+    if (!prefix) break;
+    if (list) containerIndent += prefix[0].length;
+    if (quote) quoteDepth++;
+    line = line.slice(prefix[0].length);
+  }
+  if (fence && quoteDepth !== (fence.quoteDepth ?? 0)) return null;
+  const indent = 3 + (fence?.containerIndent ?? 0);
+  const match = line.match(new RegExp(`^[ \\t]{0,${indent}}(\`{3,}|~{3,})`));
   if (!match) return null;
 
   const markerText = match[1] ?? "";
   const marker = markerText[0] as "`" | "~";
 
   if (!fence) {
+    if (marker === "`" && line.slice(match[0].length).includes("`"))
+      return null;
     return {
       fence: {
         marker,
         length: markerText.length,
+        containerIndent,
+        quoteDepth,
       },
     };
   }
@@ -906,8 +991,63 @@ function matchInlineCodeSpan(markdown: string, offset: number): number | null {
     length += 1;
   }
 
-  const closing = markdown.indexOf("`".repeat(length), offset + length);
-  return closing === -1 ? null : closing + length;
+  let cursor = offset + length;
+  while (cursor < markdown.length) {
+    const closing = markdown.indexOf("`", cursor);
+    if (closing === -1) return null;
+    let run = 1;
+    while (markdown[closing + run] === "`") run++;
+    if (run === length) return closing + run;
+    cursor = closing + run;
+  }
+  return null;
+}
+
+/** Find review syntax outside literal inline/fenced code in a Markdown payload. */
+export function findRoughdraftDelimiter(
+  markdown: string,
+  delimiter: string,
+  start = 0,
+): number {
+  let offset = start;
+  let fence: FenceState | null = null;
+  while (offset < markdown.length) {
+    if (offset === start || isLineStart(markdown, offset)) {
+      if (fence) {
+        // Compatibility payloads can put the review delimiter directly after
+        // their closing fence. It is outside the Markdown payload, not info text.
+        const terminal = markdown.indexOf(delimiter, offset);
+        if (
+          terminal >= offset &&
+          terminal < nextLineOffset(markdown, offset) &&
+          matchFence(markdown.slice(offset, terminal), 0, fence)
+        )
+          return terminal;
+      }
+      const marker = matchFence(markdown, offset, fence);
+      if (marker) {
+        fence = fence ? null : marker.fence;
+        offset = nextLineOffset(markdown, offset);
+        continue;
+      }
+    }
+    if (fence) {
+      offset = nextLineOffset(markdown, offset);
+      continue;
+    }
+    if (markdown[offset] === "\\") {
+      offset += 2;
+      continue;
+    }
+    const codeEnd = matchInlineCodeSpan(markdown, offset);
+    if (codeEnd !== null) {
+      offset = codeEnd;
+      continue;
+    }
+    if (markdown.startsWith(delimiter, offset)) return offset;
+    offset++;
+  }
+  return -1;
 }
 
 function parseComment(
@@ -1009,9 +1149,11 @@ function parseSuggestion(
   }
 
   if (markdown.startsWith("{~~", offset)) {
-    const separator = markdown.indexOf("~>", offset + 3);
+    const separator = findRoughdraftDelimiter(markdown, "~>", offset + 3);
     const close =
-      separator === -1 ? -1 : markdown.indexOf("~~}", separator + 2);
+      separator === -1
+        ? -1
+        : findRoughdraftDelimiter(markdown, "~~}", separator + 2);
 
     if (separator === -1 || close === -1) {
       addDiagnostic(
@@ -1048,7 +1190,11 @@ function parseWrappedMarker(
 ): { endOffset: number } | null {
   if (!markdown.startsWith(open, offset)) return null;
 
-  const closeOffset = markdown.indexOf(close, offset + open.length);
+  const closeOffset = findRoughdraftDelimiter(
+    markdown,
+    close,
+    offset + open.length,
+  );
   return closeOffset === -1 ? null : { endOffset: closeOffset + close.length };
 }
 
@@ -1459,4 +1605,5 @@ function findCanonicalMetadataStart(
 function isValidDateTime(value: string): boolean {
   return dateTimePattern.test(value) && !Number.isNaN(Date.parse(value));
 }
+
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";

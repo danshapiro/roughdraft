@@ -1,9 +1,9 @@
-import { browserAnchorPath } from "./browser-base-path";
 import { tables, taskListItems } from "@joplin/turndown-plugin-gfm";
-import { marked, Marked } from "marked";
-import { endnoteExtension } from "./endnotes";
+import { Marked, marked } from "marked";
 import TurndownService from "turndown";
 import { parse as parseYaml } from "yaml";
+import { browserAnchorPath } from "./browser-base-path";
+import { endnoteExtension } from "./endnotes";
 
 export const rawMarkdownBlockAttribute = "data-markdown-raw-block";
 
@@ -491,6 +491,7 @@ export function createTurndownService(): TurndownService {
   const service = new TurndownService({
     headingStyle: "atx",
     codeBlockStyle: "fenced",
+    emDelimiter: "*",
     bulletListMarker: "-",
     blankReplacement(_content, node) {
       if (node.hasAttribute(rawMarkdownBlockAttribute)) {

@@ -122,6 +122,9 @@ export function CommentEditorList({
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const originalContent = useRef(new Map<string, string>());
   const [editingCommentIds, setEditingCommentIds] = useState<string[]>([]);
+  const [editingFocusCommentId, setEditingFocusCommentId] = useState<
+    string | null
+  >(null);
   const threads = useMemo(() => buildCommentThreads(comments), [comments]);
   const commentMap = useMemo(
     () => new Map(comments.map((comment) => [comment.id, comment])),
@@ -190,18 +193,20 @@ export function CommentEditorList({
 
   useEffect(() => {
     if (!interactive) return;
-    if (!pendingFocusCommentId) return;
-    if (!editingCommentIds.includes(pendingFocusCommentId)) return;
+    const commentId = pendingFocusCommentId ?? editingFocusCommentId;
+    if (!commentId || !editingCommentIds.includes(commentId)) return;
 
-    const target = textareaRefs.current.get(pendingFocusCommentId);
+    const target = textareaRefs.current.get(commentId);
     if (!target || target.offsetParent === null) return;
 
     target.focus();
     const cursorPosition = target.value.length;
     target.setSelectionRange(cursorPosition, cursorPosition);
-    onAutoFocusComment?.(pendingFocusCommentId);
+    setEditingFocusCommentId(null);
+    if (pendingFocusCommentId === commentId) onAutoFocusComment?.(commentId);
   }, [
     editingCommentIds,
+    editingFocusCommentId,
     interactive,
     onAutoFocusComment,
     pendingFocusCommentId,
@@ -221,6 +226,7 @@ export function CommentEditorList({
     setEditingCommentIds((current) =>
       current.includes(commentId) ? current : [...current, commentId],
     );
+    setEditingFocusCommentId(commentId);
     onSelectComment?.(commentId);
   };
 

@@ -244,3 +244,40 @@ describe("source-preserving suggestion decisions", () => {
     expect(resolveSuggestionSource(input, "s24", "reject")).toBeNull();
   });
 });
+
+it.each([
+  "Alpha\n\nbeta gamma.",
+  "Alpha  \nbeta gamma.",
+])("resolving a framed native block proposal removes framing but preserves actual breaks: %s", (replacement) => {
+  const source = `{~~\nAlpha beta gamma.\n~>\n${replacement}\n~~}${metadata("s24")}\n`;
+  expect(resolveSuggestionSource(source, "s24", "reject")).toBe(
+    "Alpha beta gamma.\n",
+  );
+  expect(resolveSuggestionSource(source, "s24", "accept")).toBe(
+    `${replacement}\n`,
+  );
+});
+
+it.each([
+  "accept",
+  "reject",
+] as const)("%s of a framed code proposal preserves code newlines, literal markers and unrelated source bytes", (decision) => {
+  const oldCode = "```md\n\n  {~~old~>new~~}\n\n```";
+  const newCode = "```md\n\n\t{++added++}\n\n```";
+  const prefix = "* Preserve this source marker\n\n\n";
+  const suffix = "\n\n\nUnrelated tail.\n";
+  const source = `${prefix}{~~\n${oldCode}\n~>\n${newCode}\n~~}${metadata("s24")}${suffix}`;
+  expect(resolveSuggestionSource(source, "s24", decision)).toBe(
+    `${prefix}${decision === "accept" ? newCode : oldCode}${suffix}`,
+  );
+});
+
+it("source decision framing handles CRLF without changing real line endings", () => {
+  const before = "First\r\n\r\nSecond";
+  const after = "Revised\r\n\r\nSecond";
+  const source = `{~~\r\n${before}\r\n~>\r\n${after}\r\n~~}${metadata("s24")}\r\n`;
+  expect(resolveSuggestionSource(source, "s24", "reject")).toBe(
+    `${before}\r\n`,
+  );
+  expect(resolveSuggestionSource(source, "s24", "accept")).toBe(`${after}\r\n`);
+});

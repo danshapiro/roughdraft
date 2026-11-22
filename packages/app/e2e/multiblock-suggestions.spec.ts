@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { extractRoughdraftReviewIndex } from "@roughdraft/rfm";
 import {
   createMarkdownProject,
   documentSaveStatus,
@@ -190,7 +191,15 @@ test("editing and replying before resolving a block suggestion preserves both ed
     expect(saved).toContain("Keep this edited final paragraph.");
     expect(saved).toContain("The proposed setup supports the LONGER laser.");
     expect(saved).toContain("another suggestion");
-    expect(saved).toContain('id="s25"');
+    expect(
+      extractRoughdraftReviewIndex(saved).items.find(
+        (item) => item.id === "s25",
+      ),
+    ).toMatchObject({
+      kind: "suggestion",
+      suggestionKind: "addition",
+      text: "another suggestion",
+    });
     expect(saved).not.toContain(
       "This keeps all the setup instructions together.",
     );

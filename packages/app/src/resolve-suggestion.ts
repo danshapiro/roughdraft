@@ -2,6 +2,16 @@ import { extractRoughdraftReviewIndex } from "@roughdraft/rfm";
 import { isMap, parseDocument } from "yaml";
 import { splitYamlDocumentMetadata } from "./markdown";
 
+function withoutBlockFraming(text: string): string {
+  // Explicit block proposals wrap each side in one newline. Only those two
+  // framing boundaries are syntax; indentation and internal/code breaks stay.
+  const leading = text.startsWith("\r\n") ? 2 : text.startsWith("\n") ? 1 : 0;
+  const trailing = text.endsWith("\r\n") ? 2 : text.endsWith("\n") ? 1 : 0;
+  return leading && trailing && text.length >= leading + trailing
+    ? text.slice(leading, text.length - trailing)
+    : text;
+}
+
 /** Resolve a source-backed suggestion without reformatting unrelated Markdown. */
 export function resolveSuggestionSource(
   markdown: string,
@@ -51,7 +61,7 @@ export function resolveSuggestionsSource(
     ...matches.map((suggestion) => ({
       from: suggestion.offset,
       to: suggestion.endOffset,
-      text:
+      text: withoutBlockFraming(
         decision === "accept"
           ? suggestion.suggestionKind === "deletion"
             ? ""
@@ -59,6 +69,7 @@ export function resolveSuggestionsSource(
           : suggestion.suggestionKind === "addition"
             ? ""
             : (suggestion.originalText ?? ""),
+      ),
     })),
     ...replies
       .filter((item) => item.endOffset > item.offset)

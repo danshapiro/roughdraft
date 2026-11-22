@@ -1,5 +1,6 @@
 import { appendFileSync } from "node:fs";
 import type { Editor } from "@tiptap/react";
+import { EditorState } from "@tiptap/pm/state";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +11,15 @@ import {
   shouldDismissCommentThread,
 } from "../src/PageCard";
 import type { Page, StorageBackend } from "../src/storage";
+import { criticMarkdownToEditorState } from "../src/critic-markup";
+import {
+  acceptCriticChangeTransaction,
+  rejectCriticChangeTransaction,
+} from "../src/editor-extensions";
+import {
+  projectAcceptedDocument,
+  suggestionPositions,
+} from "../src/revision-projection";
 
 function createDomRect({
   left = 0,
@@ -1198,12 +1208,20 @@ describe("PageCard editor integration", () => {
       await Promise.resolve();
     });
 
-    expect(rendered.onSave).toHaveBeenCalledWith(
-      "doc-suggesting-enter-paragraph-1",
-      expect.stringMatching(
-        /^Start\n\n\{\+\+\u2060\+\+\}\{id="s1" by="user" at="[^"]+"\}\n$/,
-      ),
+    const saved = rendered.onSave.mock.calls.at(-1);
+    expect(saved?.[0]).toBe("doc-suggesting-enter-paragraph-1");
+    const restored = editor.schema.nodeFromJSON(
+      criticMarkdownToEditorState(saved?.[1] ?? "").doc,
     );
+    expect(suggestionPositions(restored).size).toBe(1);
+    expect(projectAcceptedDocument(restored).doc.childCount).toBe(1);
+    expect(projectAcceptedDocument(restored).doc.textContent).toBe("Start");
+    const accepted = acceptCriticChangeTransaction(
+      EditorState.create({ doc: restored }),
+      "s1",
+    );
+    expect(accepted?.doc.childCount).toBe(2);
+    expect(accepted?.doc.lastChild?.textContent).toBe("");
   });
 
   it("accepts and rejects inserted paragraph suggestions without leaving marker text", async () => {
@@ -1252,7 +1270,7 @@ describe("PageCard editor integration", () => {
     expect(rejectEditor.getText()).toBe("Start");
   });
 
-  it("suggesting mode consumes Ctrl+Backspace at a paragraph start without joining paragraphs", async () => {
+  it("suggesting mode tracks Ctrl+Backspace joining paragraphs without changing the accepted document", async () => {
     const rendered = await renderPageCard({
       page: {
         id: "doc-suggesting-boundary-backspace-1",
@@ -1263,6 +1281,7 @@ describe("PageCard editor integration", () => {
       selected: true,
     });
     const editor = rendered.getEditor();
+    const original = editor.state.doc;
 
     await act(async () => {
       const range = findTextRange(editor, "Second paragraph");
@@ -1272,11 +1291,20 @@ describe("PageCard editor integration", () => {
     });
     await pressEditorKey(editor, "Backspace", { ctrlKey: true });
 
-    expect(editor.state.doc.childCount).toBe(2);
-    expect(editor.getText()).toBe("First paragraph\n\nSecond paragraph");
+    expect(suggestionPositions(editor.state.doc).size).toBe(1);
+    expect(projectAcceptedDocument(editor.state.doc).doc.eq(original)).toBe(
+      true,
+    );
+    const reverted = rejectCriticChangeTransaction(editor.state, "s1");
+    expect(reverted?.doc.eq(original)).toBe(true);
+    await act(async () => {
+      editor.commands.acceptCriticChange("s1");
+    });
+    expect(editor.state.doc.childCount).toBe(1);
+    expect(editor.getText()).toBe("First paragraphSecond paragraph");
   });
 
-  it("suggesting mode consumes Ctrl+Delete at a paragraph end without joining paragraphs", async () => {
+  it("suggesting mode tracks Ctrl+Delete joining paragraphs without changing the accepted document", async () => {
     const rendered = await renderPageCard({
       page: {
         id: "doc-suggesting-boundary-delete-1",
@@ -1287,6 +1315,7 @@ describe("PageCard editor integration", () => {
       selected: true,
     });
     const editor = rendered.getEditor();
+    const original = editor.state.doc;
 
     await act(async () => {
       const range = findTextRange(editor, "First paragraph");
@@ -1296,8 +1325,17 @@ describe("PageCard editor integration", () => {
     });
     await pressEditorKey(editor, "Delete", { ctrlKey: true });
 
-    expect(editor.state.doc.childCount).toBe(2);
-    expect(editor.getText()).toBe("First paragraph\n\nSecond paragraph");
+    expect(suggestionPositions(editor.state.doc).size).toBe(1);
+    expect(projectAcceptedDocument(editor.state.doc).doc.eq(original)).toBe(
+      true,
+    );
+    const reverted = rejectCriticChangeTransaction(editor.state, "s1");
+    expect(reverted?.doc.eq(original)).toBe(true);
+    await act(async () => {
+      editor.commands.acceptCriticChange("s1");
+    });
+    expect(editor.state.doc.childCount).toBe(1);
+    expect(editor.getText()).toBe("First paragraphSecond paragraph");
   });
 
   it("document code mode shows raw markdown and hides rich text chrome", async () => {
