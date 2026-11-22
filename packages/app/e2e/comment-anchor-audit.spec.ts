@@ -6,6 +6,8 @@ import {
 } from "@playwright/test";
 import {
   createMarkdownProject,
+  logE2eEvent,
+  openMarkdownFile,
   removeMarkdownProject,
   richTextEditor,
   writeProjectFile,
@@ -110,6 +112,61 @@ test.describe("comment anchors through document editing", () => {
     await page.goto(`/?comparison=${review.id}`);
     await expect(richTextEditor(page)).toBeVisible();
     return review.id as string;
+  }
+
+  for (const width of [1440, 390]) {
+    test.describe(`comment pointer at ${width}px`, () => {
+      test.use({ viewport: { width, height: 900 }, hasTouch: width === 390 });
+      for (const mode of ["document", "native-file"] as const) {
+        test(`first click on an inactive bold comment places the editing caret at ${width}px in ${mode} @smoke`, async ({
+          page,
+          request,
+        }) => {
+          const markdown =
+            "# Notes\n\n" +
+            Array.from(
+              { length: 24 },
+              (_, index) => `Unchanged context paragraph ${index + 1}.\n\n`,
+            ).join("") +
+            'Alpha {==**bravo charlie**==}{>>First comment<<}{id="c1" by="user" at="2026-11-21T12:00:00.000Z"} delta.\n\nFooter stays unchanged.\n';
+          if (mode === "document") await open(page, request, markdown);
+          else {
+            const filename = writeProjectFile(project, "native.md", markdown);
+            await openMarkdownFile(page, filename);
+            await page.getByTestId("document-mode-trigger").click();
+            await page.getByTestId("document-mode-editing").click();
+          }
+          const footer = richTextEditor(page).getByText(
+            "Footer stays unchanged.",
+            { exact: true },
+          );
+          await footer.click();
+          await page.keyboard.press("End");
+          await page.mouse.move(0, 0);
+          const anchor = richTextEditor(page).getByText("bravo charlie", {
+            exact: true,
+          });
+          if (width === 390) await anchor.tap({ position: { x: 25, y: 8 } });
+          else await anchor.click({ position: { x: 25, y: 8 } });
+          const selection = await page.evaluate(() => ({
+            text: window.getSelection()?.anchorNode?.textContent,
+            offset: window.getSelection()?.anchorOffset,
+            focused: document.activeElement?.getAttribute("contenteditable"),
+          }));
+          logE2eEvent("comment.first-click-selection", {
+            width,
+            mode,
+            ...selection,
+          });
+          await page.keyboard.type("CLICK ");
+          await expect(footer).toHaveText("Footer stays unchanged.");
+          expect(await anchorText(page, "c1")).toContain("CLICK ");
+          await expect(page.getByTestId("comment-thread-c1")).toContainText(
+            "First comment",
+          );
+        });
+      }
+    });
   }
 
   test("adding an overlapping comment keeps the original anchor's exact range @smoke", async ({

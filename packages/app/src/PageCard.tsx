@@ -231,6 +231,38 @@ function areCommentIdListsEqual(
   return current.every((commentId, index) => commentId === next[index]);
 }
 
+function highlightTransaction(editor: Editor) {
+  const { view } = editor;
+  const transaction = editor.state.tr;
+  const selection = view.dom.ownerDocument.getSelection();
+  if (
+    view.composing ||
+    !view.hasFocus() ||
+    !selection?.anchorNode ||
+    !selection.focusNode ||
+    !view.dom.contains(selection.anchorNode) ||
+    !view.dom.contains(selection.focusNode) ||
+    (selection.anchorNode.nodeType !== Node.TEXT_NODE &&
+      selection.focusNode.nodeType !== Node.TEXT_NODE)
+  )
+    return transaction;
+
+  // A click can update the browser caret before ProseMirror receives its
+  // selectionchange event. Redrawing highlights must retain that newer text
+  // selection, rather than restore the previous editor-state selection.
+  const nativeSelection = TextSelection.between(
+    transaction.doc.resolve(
+      view.posAtDOM(selection.anchorNode, selection.anchorOffset),
+    ),
+    transaction.doc.resolve(
+      view.posAtDOM(selection.focusNode, selection.focusOffset),
+    ),
+  );
+  if (!nativeSelection.eq(transaction.selection))
+    transaction.setSelection(nativeSelection);
+  return transaction;
+}
+
 function getSelectionCommentIds(editor: Editor | null): string[] {
   if (!editor) return [];
 
@@ -2094,7 +2126,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   useEffect(() => {
     if (!editor || !isControlled) return;
     editor.view.dispatch(
-      editor.state.tr.setMeta(controlledReviewHighlightKey, {
+      highlightTransaction(editor).setMeta(controlledReviewHighlightKey, {
         blockHighlights: controlledReview?.blockHighlights,
         suggestions: controlledReview?.suggestions,
         comments: controlledReview?.comments,
@@ -2278,7 +2310,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       : null;
 
     editor.view.dispatch(
-      editor.state.tr.setMeta(commentHighlightPluginKey, {
+      highlightTransaction(editor).setMeta(commentHighlightPluginKey, {
         selectedCommentId,
         hoveredCommentId: effectiveHoveredCommentId,
       }),
@@ -2291,7 +2323,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     const effectiveHoveredChangeId = selectedChangeId ? hoveredChangeId : null;
 
     editor.view.dispatch(
-      editor.state.tr.setMeta(criticChangeHighlightPluginKey, {
+      highlightTransaction(editor).setMeta(criticChangeHighlightPluginKey, {
         selectedChangeId,
         hoveredChangeId: effectiveHoveredChangeId,
       }),
