@@ -6,6 +6,7 @@
   margin-inline: auto;
   max-width: 1120px;
   padding: 6px 16px;
+  position: relative;
 }
 .revision-identity {
   align-items: center;
@@ -89,6 +90,24 @@
 }
 .revision-tools {
   gap: 3px 6px;
+}
+.revision-tools > .revision-tool-group {
+  flex-shrink: 0;
+  flex-wrap: nowrap;
+}
+.revision-toolbar-measure {
+  height: 0;
+  inset-inline: 0;
+  overflow: hidden;
+  pointer-events: none;
+  position: absolute;
+  top: 0;
+  visibility: hidden;
+}
+.revision-tools.revision-measured-tools {
+  flex-wrap: nowrap;
+  max-width: none;
+  width: max-content;
 }
 .revision-tool-group + .revision-tool-group {
   border-inline-start: 1px solid var(--border);
@@ -177,7 +196,7 @@
   padding: 12px 0 0;
 }
 
-@media (max-width: 1023px), (pointer: coarse) {
+@media (max-width: 1023px) {
   .revision-header-inner {
     gap: 8px;
     padding: 8px 12px;
@@ -199,6 +218,11 @@
   .revision-navigation {
     flex-wrap: nowrap;
     order: 1;
+  }
+
+  .revision-header-inner[data-visible-tools]:not([data-visible-tools="0"])
+    .revision-navigation {
+    order: 0;
   }
 
   .revision-navigation span {
