@@ -88,6 +88,16 @@ const CriticChangeBlock = Node.create({
   group: "block",
   content: "block+",
   defining: true,
+  addGlobalAttributes() {
+    return [
+      {
+        types: ["doc"],
+        attributes: {
+          suggestionCommentParents: { default: null, rendered: false },
+        },
+      },
+    ];
+  },
   addAttributes() {
     return {
       commentIds: {
@@ -270,8 +280,29 @@ const CommentRef = Mark.create({
     return {
       setCommentRef:
         (attributes) =>
-        ({ commands }) =>
-          commands.setMark(this.name, attributes),
+        ({ tr, dispatch }) => {
+          const { from, to } = tr.selection;
+          if (from === to) return false;
+          if (dispatch) {
+            const markType = tr.doc.type.schema.marks[this.name];
+            tr.doc.nodesBetween(from, to, (node, pos) => {
+              if (!node.isInline) return;
+              const existing = markType.isInSet(node.marks);
+              const commentIds = [
+                ...new Set([
+                  ...(existing?.attrs.commentIds ?? []),
+                  ...attributes.commentIds,
+                ]),
+              ];
+              tr.addMark(
+                Math.max(from, pos),
+                Math.min(to, pos + node.nodeSize),
+                markType.create({ commentIds }),
+              );
+            });
+          }
+          return true;
+        },
       removeCommentId:
         (commentId) =>
         ({ tr, state, dispatch }) => {
@@ -522,9 +553,18 @@ export function acceptCriticChangeTransaction(
       if (range.kind === "deletion" || range.kind === "substitution-old") {
         tr.delete(range.from, range.to);
       } else {
-        tr.removeMark(range.from, range.to, range.mark);
+        const sentinelPositions = findSuggestedParagraphSentinels(
+          tr.doc,
+          range.from,
+          range.to,
+        );
+        const mappingStart = tr.mapping.maps.length;
+        for (const position of sentinelPositions.reverse())
+          tr.delete(position, position + SUGGESTED_PARAGRAPH_SENTINEL.length);
+        const mappedTo = tr.mapping.slice(mappingStart).map(range.to, -1);
+        tr.removeMark(range.from, mappedTo, range.mark);
         const block = tr.doc.nodeAt(range.from);
-        if (block) tr.replaceWith(range.from, range.to, block.content);
+        if (block) tr.replaceWith(range.from, mappedTo, block.content);
       }
       continue;
     }
@@ -1228,6 +1268,8 @@ export function markdownPreviewUrlsPlugin(options: MarkdownOptions) {
 export function createEditorExtensions(placeholder: string) {
   return [
     StarterKit.configure({
+      // Review blocks contain their own editable paragraphs and lists.
+      trailingNode: { notAfter: ["criticChangeBlock"] },
       heading: {
         levels: [1, 2, 3, 4, 5, 6],
       },

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
+import { describe, expect, it } from "vitest";
 import {
   createCriticChange,
   createNextChangeId,
@@ -476,7 +476,14 @@ describe("CriticMarkup comments", () => {
         expect.objectContaining({ type: "code" }),
       ]),
     });
-    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+    const output = editorStateToCriticMarkdown(doc, comments);
+    expect(output).toBe(
+      "Check {==`roughdraft open`==}{>><<}{#cmt-code} before sharing.\n\n---\ncomments:\n  cmt-code:\n    by: user\n    at: 2024-01-15T10:31:00.000Z\n    codeAnchorEncoding: backslash\n    body: Make sure this command is visible\n",
+    );
+    expect(criticMarkdownToEditorState(output).doc.content).toEqual(
+      doc.content,
+    );
+    expect(criticMarkdownToEditorState(output).comments).toEqual(comments);
   });
 
   it("creates one comment anchor when a selection spans inline code", () => {
@@ -500,22 +507,24 @@ describe("CriticMarkup comments", () => {
       editor.commands.setTextSelection({ from: start + 1, to: end + 1 });
       editor.commands.setCommentRef({ commentIds: ["c1"] });
 
-      expect(
-        editorStateToCriticMarkdown(
-          editor.getJSON(),
-          new Map([
-            [
-              "c1",
-              {
-                id: "c1",
-                content: "test",
-                createdAt: "2026-04-25T21:54:47.475Z",
-              },
-            ],
-          ]),
-        ),
-      ).toBe(
-        'Each dev wrapper keeps {==its own server state under `~/.roughdraft/dev/<wrapper-name>` by default==}{>>test<<}{id="c1" by="user" at="2026-04-25T21:54:47.475Z"}, so opening works.\n',
+      const output = editorStateToCriticMarkdown(
+        editor.getJSON(),
+        new Map([
+          [
+            "c1",
+            {
+              id: "c1",
+              content: "test",
+              createdAt: "2026-04-25T21:54:47.475Z",
+            },
+          ],
+        ]),
+      );
+      expect(output).toBe(
+        "Each dev wrapper keeps {==its own server state under `~/.roughdraft/dev/<wrapper-name>` by default==}{>><<}{#c1}, so opening works.\n\n---\ncomments:\n  c1:\n    by: user\n    at: 2026-04-25T21:54:47.475Z\n    codeAnchorEncoding: backslash\n    body: test\n",
+      );
+      expect(criticMarkdownToEditorState(output).doc.content).toEqual(
+        editor.getJSON().content,
       );
     } finally {
       editor.destroy();
@@ -634,24 +643,35 @@ const command = "roughdraft open";
           },
         ],
       });
-      expect(
-        editorStateToCriticMarkdown(
-          editor.getJSON(),
-          new Map([
-            [
-              "c1",
-              {
-                id: "c1",
-                content: "test",
-                createdAt: "2026-04-25T22:14:08.827Z",
-              },
-            ],
-          ]),
-        ),
-      ).toBe(`\`\`\`ts
-const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-25T22:14:08.827Z"}";
+      const output = editorStateToCriticMarkdown(
+        editor.getJSON(),
+        new Map([
+          [
+            "c1",
+            {
+              id: "c1",
+              content: "test",
+              createdAt: "2026-04-25T22:14:08.827Z",
+            },
+          ],
+        ]),
+      );
+      expect(output).toBe(`\`\`\`ts
+const command = "{==roughdraft open==}{>><<}{#c1}";
 \`\`\`
+
+---
+comments:
+  c1:
+    by: user
+    at: 2026-04-25T22:14:08.827Z
+    codeAnchorEncoding: backslash
+    body: test
 `);
+      expect(criticMarkdownToEditorState(output).doc.content?.[0]).toEqual(
+        editor.getJSON().content?.[0],
+      );
+      expect(criticMarkdownToEditorState(output).doc.content).toHaveLength(1);
     } finally {
       editor.destroy();
     }
@@ -663,7 +683,10 @@ const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-2
 \`\`\`
 `;
 
-    const { doc, comments } = criticMarkdownToEditorState(input);
+    const { doc, comments } = criticMarkdownToEditorState(input, {
+      legacyCodeComments: true,
+    });
+    expect(criticMarkdownToEditorState(input).comments.size).toBe(0);
 
     expect(doc.content?.[0]).toMatchObject({
       type: "codeBlock",
@@ -693,7 +716,13 @@ const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-2
       id: "c1",
       content: "test",
     });
-    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+    const output = editorStateToCriticMarkdown(doc, comments);
+    expect(output).toContain("codeAnchorEncoding: backslash");
+    expect(output).toContain("body: test");
+    expect(criticMarkdownToEditorState(output).doc.content).toEqual(
+      doc.content,
+    );
+    expect(criticMarkdownToEditorState(output).comments).toEqual(comments);
   });
 
   it("round-trips an anchored reply thread", () => {

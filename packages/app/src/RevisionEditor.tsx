@@ -7,7 +7,6 @@ import {
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { DecorationSet } from "@tiptap/pm/view";
-import { cleanRoughdraftMarkdown } from "@roughdraft/rfm";
 import type { Editor } from "@tiptap/react";
 import {
   ArrowDown,
@@ -24,7 +23,6 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiBackend } from "./api-backend";
-import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
 import { useComparisonReadingPosition } from "./comparison-reading-position";
 import type {
   ComparisonReviewComment,
@@ -67,6 +65,7 @@ import {
   criticChangeHighlightPluginKey,
   explicitReviewEdit,
 } from "./editor-extensions";
+import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
 import {
   type DocumentInteractionMode,
   RichTextEditorSurface,
@@ -84,26 +83,33 @@ import {
   reopenReviewedChange,
   reviewedChanges,
 } from "./revision-history";
-import { outcomeDocument } from "./revision-outcomes";
-import {
-  useRevisionPreferences,
-  type RevisionView,
-} from "./revision-preferences";
 import {
   acceptedDocument,
-  sameRevisionMarkup,
+  cleanRevisionDocument,
   cleanRevisionMarkdown,
+  cleanRevisionSourceMarkdown,
   copyRevisionMarkdown,
   createSourceSpellingPreserver,
   downloadRevisionMarkdown,
   editableMarkdownOptions,
+  sameRevisionMarkup,
 } from "./revision-markdown";
+import {
+  documentMetadata,
+  sameMetadata,
+  withDocumentMetadata,
+} from "./revision-metadata";
+import { outcomeDocument } from "./revision-outcomes";
+import {
+  type RevisionView,
+  useRevisionPreferences,
+} from "./revision-preferences";
 import { suggestionPositions } from "./revision-projection";
 import {
   type BaseSide,
   createReferenceComparison,
-  referenceChangeIds,
   type ReferenceChange,
+  referenceChangeIds,
   referenceDecorations,
   revertReferenceChange,
 } from "./revision-reference";
@@ -112,11 +118,6 @@ import {
   type RevisionDraft,
   useRevisionSession,
 } from "./revision-session";
-import {
-  documentMetadata,
-  sameMetadata,
-  withDocumentMetadata,
-} from "./revision-metadata";
 import "./RevisionEditor.css";
 
 const referenceKey = new PluginKey<ReferenceChange[]>(
@@ -127,6 +128,48 @@ const noChanges: ReferenceChange[] = [];
 
 function kept(doc: ProseMirrorNode): string[] {
   return doc.attrs.kept ?? [];
+}
+
+function rebaseCommentSnapshots(
+  snapshots: ComparisonReviewComment[][],
+  previous: ComparisonReviewComment[],
+  current: ComparisonReviewComment[],
+) {
+  const before = new Map(previous.map((comment) => [comment.id, comment]));
+  const moves = new Map(
+    current.flatMap((comment) => {
+      const old = before.get(comment.id);
+      return old &&
+        (old.parentCommentId ?? null) !== (comment.parentCommentId ?? null)
+        ? [
+            [
+              comment.id,
+              { from: old.parentCommentId, to: comment.parentCommentId },
+            ] as const,
+          ]
+        : [];
+    }),
+  );
+  if (!moves.size) return snapshots;
+  return snapshots.map((snapshot) => {
+    let changed = false;
+    const moved = snapshot.map((comment) => {
+      const move = moves.get(comment.id);
+      if (!move || (comment.parentCommentId ?? null) !== (move.from ?? null))
+        return comment;
+      changed = true;
+      return { ...comment, parentCommentId: move.to };
+    });
+    if (!changed) return snapshot;
+    const byId = new Map(moved.map((comment) => [comment.id, comment]));
+    return moved.map((comment) => ({
+      ...comment,
+      changeId:
+        byId.get(comment.parentCommentId ?? "")?.parentCommentId ??
+        comment.parentCommentId ??
+        "document",
+    }));
+  });
 }
 
 function canonical(markdown: string) {
@@ -352,7 +395,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     [reviewComments],
   );
   const updateComments = useCallback(
-    (next: Map<string, CriticComment>) => {
+    (next: Map<string, CriticComment>, origin?: "document") => {
       updateDraft((current) => {
         const previous = current.reviewComments ?? [];
         const comments = [...next.values()]
@@ -366,8 +409,23 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           }));
         if (JSON.stringify(comments) === JSON.stringify(previous))
           return current;
-        commentHistory.current.past.push(previous);
-        commentHistory.current.future = [];
+        if (origin === "document") {
+          // Parent moves belong to document history. Rebase both comment stacks
+          // so older text edits keep their attachment through document Undo.
+          commentHistory.current.past = rebaseCommentSnapshots(
+            commentHistory.current.past,
+            previous,
+            comments,
+          );
+          commentHistory.current.future = rebaseCommentSnapshots(
+            commentHistory.current.future,
+            previous,
+            comments,
+          );
+        } else {
+          commentHistory.current.past.push(previous);
+          commentHistory.current.future = [];
+        }
         return { ...current, reviewComments: comments };
       });
     },
@@ -538,13 +596,15 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       setMarkdownQueued(false);
       const current = ownEditor.current?.state.doc;
       if (!current) return;
-      const sourceClean = cleanRoughdraftMarkdown(markdown);
+      const sourceClean = cleanRevisionSourceMarkdown(markdown);
       const metadataChanged = !sameMetadata(
         documentMetadata(sourceClean),
         documentMetadata(exactClean.current),
       );
       const result =
-        origin === "source" ? sourceClean : cleanRevisionMarkdown(markdown);
+        origin === "source"
+          ? sourceClean
+          : cleanRevisionDocument(current.toJSON(), readDraft());
       preserveSource.current ??= createSourceSpellingPreserver(
         exactClean.current,
         canonical(exactClean.current),
@@ -1189,7 +1249,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 disabled={previewing}
                 title={
                   blocked
-                    ? "Use Edit for formatting or structural changes."
+                    ? "This edit could not be recorded as a suggestion. Try again, or use Edit."
                     : "Read without editing, edit directly, or suggest changes for review."
                 }
               >

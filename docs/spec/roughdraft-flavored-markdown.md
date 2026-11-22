@@ -26,7 +26,7 @@ Roughdraft uses these CriticMarkup-compatible markers:
 
 An implementation MUST treat the opening and closing marker pairs as review delimiters outside inline code and fenced code blocks.
 
-Implementations MUST treat review markers inside inline code spans and fenced code blocks as literal example text. They MUST NOT create comments, suggestions, or highlights from those code contexts.
+Implementations MUST treat review markers inside inline code spans and fenced code blocks as literal example text by default. Code annotations require the explicit metadata extension described below.
 
 ## Comments
 
@@ -74,6 +74,12 @@ comments:
 The highlighted text is the visible anchor. Implementations SHOULD attach all immediately following comment blocks to the same anchor until another token interrupts the sequence.
 
 A standalone highlight is valid CriticMarkup. Roughdraft 0.1 reserves it as review syntax, but standalone highlights are not required to produce a review-thread item unless an implementation explicitly supports highlight-only annotations.
+
+### Code annotations
+
+To annotate code without confusing its literal contents with review delimiters, the editor writes an empty inline comment, `{>><<}{#id}`, and a corresponding YAML comment entry with `codeAnchorEncoding: backslash`. The comment's body lives only in that YAML entry. Within that comment's code anchor, each backslash and brace is escaped with a backslash. Readers supporting this extension decode only those declared code anchors; they MUST NOT apply that decoding to ordinary code or unflagged historical input.
+
+The YAML entry also contains the comment's `body`, so readers that treat all code as literal can still return the feedback. An implementation MAY offer an explicit compatibility mode for historical unflagged code annotations. New writers MUST use the declaration rather than infer annotations from code examples.
 
 ## Suggestions
 
@@ -164,7 +170,7 @@ comments:
     at: "2026-04-28T12:00:00.000Z"
 ```
 
-Root comment bodies and suggestion text stay inline so their anchors remain portable. Replies live entirely in endmatter because their `re` field already points at a parent id:
+Root comment bodies and suggestion text normally stay inline so their anchors remain portable. A multiline comment or a body containing `<<}` uses an empty inline comment, `{>><<}{#c1}`, with its text in the YAML `body` field. Readers hydrate that empty comment from the referenced body. Replies live entirely in endmatter because their `re` field already points at a parent id:
 
 ```markdown
 Please revisit {==this sentence==}{>>Needs a source.<<}{#c1}.
@@ -213,6 +219,7 @@ Known metadata attributes:
 | `re` | Comments | No | Parent comment or suggestion id for threaded replies. |
 | `status` | Comments and suggestions | No | Review state. Roughdraft currently writes `resolved` when an item has been addressed. |
 | `resolved` | Comments and suggestions | No | Optional short resolution summary for an item whose `status` is `resolved`. |
+| `codeAnchorEncoding` | YAML comment entries | For generated code annotations | `backslash` explicitly identifies encoded code anchors; their feedback also appears in `body`. |
 
 Example:
 
@@ -227,6 +234,8 @@ comments:
 ```
 
 Implementations SHOULD generate simple document-local ids. Roughdraft uses `c1`, `c2`, and so on for comments and `s1`, `s2`, and so on for suggestions. Implementations MUST preserve unknown valid attributes or YAML keys when possible, but they MUST NOT require unknown metadata for correct review rendering.
+
+Multiple compact references MAY identify separate fragments of one logical comment, such as overlapping or differently formatted text. Readers SHOULD index that comment once while retaining all its anchor fragments. Repeated inline declarations or conflicting bodies for the same id remain errors.
 
 For compatibility, readers MAY accept legacy comment metadata of the form `{@id:c1; by:AI; at:2026-04-28T12:00:00.000Z@}`. Writers SHOULD emit compact references plus YAML endmatter for new review data.
 

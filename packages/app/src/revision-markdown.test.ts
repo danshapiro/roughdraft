@@ -5,6 +5,7 @@ import {
   editorStateToCriticMarkdown,
 } from "./critic-markup";
 import {
+  cleanRevisionDocument,
   cleanRevisionMarkdown,
   createSourceSpellingPreserver,
 } from "./revision-markdown";
@@ -72,4 +73,129 @@ describe("preserving original Markdown when saving comparison choices", () => {
     );
     expect(preserve("Keep wording\n")).toBeNull();
   });
+});
+
+it("formatted clean projection uses the live accepted document without turning split review formatting into a file edit", () => {
+  const comment = { type: "commentRef", attrs: { commentIds: ["c1"] } };
+  const bold = { type: "bold" };
+  const sourceMetadata = {
+    frontmatter: "---\ntitle: Preserve this YAML\n---\n\n",
+    endmatter:
+      '---\nother: true\ncomments:\n  c1:\n    by: user\n    at: "2026-01-01T00:00:00.000Z"\n    body: Keep this note.\n',
+  };
+  const original = {
+    type: "doc",
+    attrs: { sourceMetadata },
+    content: [
+      {
+        type: "paragraph",
+        content: [{ type: "text", text: "Alpha beta", marks: [comment, bold] }],
+      },
+    ],
+  };
+  const change = {
+    type: "criticChange",
+    attrs: {
+      kind: "addition",
+      changeId: "s1",
+      authorType: "user",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    },
+  };
+  const proposed = {
+    ...original,
+    content: [
+      {
+        type: "paragraph",
+        content: [
+          { type: "text", text: "Alpha ", marks: [comment, bold] },
+          { type: "text", text: "New ", marks: [comment, bold, change] },
+          { type: "text", text: "beta", marks: [comment, bold] },
+        ],
+      },
+    ],
+  };
+  const clean = cleanRevisionDocument(proposed);
+  expect(clean).toBe(cleanRevisionDocument(original));
+  expect(clean).toContain("**Alpha beta**");
+  expect(clean).toContain("title: Preserve this YAML");
+  expect(clean).toContain("other: true");
+  expect(clean).not.toContain("Keep this note.");
+  expect(clean).not.toContain("New");
+});
+
+it("a pending-only hydrated update preserves its stored accepted source while actual edits and Keep regenerate it", () => {
+  const comment = { type: "commentRef", attrs: { commentIds: ["c1"] } };
+  const bold = { type: "bold" };
+  const change = {
+    type: "criticChange",
+    attrs: {
+      kind: "addition",
+      changeId: "s1",
+      authorType: "user",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    },
+  };
+  const original = {
+    type: "doc",
+    content: [
+      {
+        type: "paragraph",
+        content: [{ type: "text", text: "Alpha beta", marks: [comment, bold] }],
+      },
+    ],
+  };
+  const pending = {
+    type: "doc",
+    content: [
+      {
+        type: "paragraph",
+        content: [
+          { type: "text", text: "Alpha ", marks: [comment, bold] },
+          { type: "text", text: "New ", marks: [comment, bold, change] },
+          { type: "text", text: "beta", marks: [comment, bold] },
+        ],
+      },
+    ],
+  };
+  const comments = new Map([
+    [
+      "c1",
+      {
+        id: "c1",
+        content: "Keep this note.",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ],
+  ]);
+  const baseline = {
+    markdown: editorStateToCriticMarkdown(pending, comments),
+    cleanMarkdown: cleanRevisionDocument(original),
+  };
+  const hydrated = criticMarkdownToEditorState(baseline.markdown).doc;
+  expect(cleanRevisionDocument(hydrated, baseline)).toBe("**Alpha beta**\n");
+  expect(
+    cleanRevisionDocument(
+      criticMarkdownToEditorState("Changed words.\n").doc,
+      baseline,
+    ),
+  ).toBe("Changed words.\n");
+  const kept = structuredClone(hydrated);
+  for (const node of kept.content?.[0].content ?? [])
+    node.marks = node.marks?.filter((mark) => mark.type !== "criticChange");
+  expect(cleanRevisionDocument(kept, baseline)).toContain("New");
+  expect(
+    cleanRevisionDocument(
+      {
+        ...hydrated,
+        attrs: {
+          sourceMetadata: {
+            frontmatter: "---\ntitle: Changed\n---\n\n",
+            endmatter: null,
+          },
+        },
+      },
+      baseline,
+    ),
+  ).toContain("title: Changed");
 });

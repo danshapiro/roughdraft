@@ -1,3 +1,4 @@
+import { cleanRoughdraftMarkdown } from "@roughdraft/rfm";
 import { getSchema, type JSONContent } from "@tiptap/core";
 import { diffChars } from "diff";
 import {
@@ -6,8 +7,8 @@ import {
 } from "./critic-markup";
 import { createEditorExtensions } from "./editor-extensions";
 import { type MarkdownOptions, splitYamlDocumentMetadata } from "./markdown";
-import { projectAcceptedDocument } from "./revision-projection";
 import { documentMetadata } from "./revision-metadata";
+import { projectAcceptedDocument } from "./revision-projection";
 
 const schema = getSchema(createEditorExtensions(""));
 
@@ -22,6 +23,30 @@ export function acceptedDocument(doc: JSONContent): JSONContent {
     ...doc,
     ...projectAcceptedDocument(schema.nodeFromJSON(doc)).doc.toJSON(),
   };
+}
+
+/** The live model is authoritative; review Markdown can split formatting spans. */
+export function cleanRevisionDocument(
+  doc: JSONContent,
+  previous?: { markdown: string; cleanMarkdown?: string },
+): string {
+  const metadata = doc.attrs?.sourceMetadata;
+  const projected = editorStateToCriticMarkdown(
+    acceptedDocument(doc),
+    new Map(),
+    metadata
+      ? { frontmatter: metadata.frontmatter, endmatter: metadata.endmatter }
+      : undefined,
+  );
+  // Hydration can split equivalent formatting spans. If the accepted content
+  // still matches the previous review, keep its already-preserved clean source.
+  // Actual accepted edits/decisions/metadata differ and use the live projection.
+  if (
+    previous?.cleanMarkdown !== undefined &&
+    projected === cleanRevisionMarkdown(previous.markdown)
+  )
+    return previous.cleanMarkdown;
+  return projected;
 }
 
 /** Generated dates may differ when anonymous review syntax is parsed again. */
@@ -63,7 +88,41 @@ export function cleanRevisionMarkdown(markdown: string): string {
         node.content?.some(hasChanges),
     );
   if (!comments.size && !hasChanges(doc)) return markdown;
-  return editorStateToCriticMarkdown(acceptedDocument(doc), new Map());
+  return cleanRevisionDocument(doc);
+}
+
+function needsSourceProjection(node: JSONContent, inCode = false): boolean {
+  const code =
+    inCode ||
+    node.type === "codeBlock" ||
+    Boolean(node.marks?.some((mark) => mark.type === "code"));
+  return Boolean(
+    node.type === "criticChangeBlock" ||
+      (code && node.marks?.some((mark) => mark.type === "commentRef")) ||
+      node.content?.some((child) => needsSourceProjection(child, code)),
+  );
+}
+
+/** Project code anchors and framed block proposals without changing source spelling. */
+export function cleanRevisionSourceMarkdown(markdown: string): string {
+  const sourceClean = cleanRoughdraftMarkdown(markdown);
+  if (!/\{(?:==|\+\+|--|~~)/.test(markdown)) return sourceClean;
+  const parsed = criticMarkdownToEditorState(markdown, editableMarkdownOptions);
+  // Ordinary fenced syntax examples stay literal. Only the editor's recognized
+  // code anchors/block proposals need the model's decoder and projection. Their
+  // framing newlines describe structure rather than extra document whitespace.
+  if (!needsSourceProjection(parsed.doc)) return sourceClean;
+  const canonicalReview = editorStateToCriticMarkdown(
+    parsed.doc,
+    parsed.comments,
+  );
+  const clean = editorStateToCriticMarkdown(
+    acceptedDocument(parsed.doc),
+    new Map(),
+  );
+  return (
+    createSourceSpellingPreserver(markdown, canonicalReview)(clean) ?? clean
+  );
 }
 
 /** Reuse the original byte spelling when an edit can be mapped there safely. */
