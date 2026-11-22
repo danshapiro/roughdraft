@@ -399,6 +399,10 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const { interaction, formatted, view } = preferences;
   const previewing = view !== "changes";
   const [historyOpen, setHistoryOpen] = useState(false);
+  const reopenedPassage = useRef<{
+    position: number;
+    metadata: boolean;
+  } | null>(null);
   const [sourceReading, setSourceReading] = useState<{
     quote: string[];
     offset: number;
@@ -872,6 +876,25 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       (headerRef.current?.offsetHeight ?? 0) -
       16;
     window.scrollTo({ top: Math.max(0, top), behavior: "instant" });
+  }
+
+  function revealReopenedPassage() {
+    const passage = reopenedPassage.current;
+    reopenedPassage.current = null;
+    if (!passage || !editor || editor.isDestroyed || !formatted) return;
+    const offset = (headerRef.current?.offsetHeight ?? 0) + 16;
+    const position = Math.min(passage.position, editor.state.doc.content.size);
+    const top = passage.metadata
+      ? (documentRef.current
+          ?.querySelector<HTMLElement>(
+            '[data-review-rail-anchor="document-metadata"]',
+          )
+          ?.getBoundingClientRect().top ?? 0)
+      : editor.view.coordsAtPos(position).top;
+    window.scrollTo({
+      top: Math.max(0, top + window.scrollY - offset),
+      behavior: "instant",
+    });
   }
 
   const reportError = (error: unknown) =>
@@ -1682,7 +1705,13 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           )}
         </div>
       </main>
-      <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
+      <Dialog
+        open={historyOpen}
+        onOpenChange={setHistoryOpen}
+        onOpenChangeComplete={(open) => {
+          if (!open) revealReopenedPassage();
+        }}
+      >
         <DialogContent
           className="max-w-2xl"
           data-testid="revision-reviewed-dialog"
@@ -1732,6 +1761,10 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                       );
                       return;
                     }
+                    reopenedPassage.current = {
+                      position: transaction.mapping.map(change.guard.from, -1),
+                      metadata: Boolean(change.metadata),
+                    };
                     editor.view.dispatch(
                       closeHistory(transaction)
                         .setMeta(referenceDecision, true)
