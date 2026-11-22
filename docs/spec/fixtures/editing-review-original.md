@@ -154,7 +154,7 @@ History Revert example: we keep the comment history alongside the document.
 
 Scroll to another section, open History and undo one of these decisions. The document should scroll back to the affected passage. Then try a new paragraph suggestion, Undo/Redo, and refresh.
 ## 15\. Phone, folding and saved review state
-Start editing the phone-draft comment above, leave the textarea open, then resize or unfold. The text, focus and draft should survive. Cancel should restore the original feedback. Try both a narrow screen and a short viewport with the keyboard open.
+Start editing the phone-draft comment above, leave the textarea open, then resize or unfold. The text, focus and draft should survive. Cancel should restore the original feedback. Try both a narrow screen and a short viewport with the keyboard open. When unfolded, toolbar actions should be visible whenever they fit; fold the screen to check that More appears only when needed.
 
 Switch between Changes, Original, Final and Markdown while reviewing. Copy and Download should match the visible clean outcome; the full Markdown view keeps the discussion and pending suggestions. Refresh should retain your review choices and comments.
 ## Footer caret target

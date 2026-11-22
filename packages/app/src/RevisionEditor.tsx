@@ -105,6 +105,7 @@ import {
   useRevisionPreferences,
 } from "./revision-preferences";
 import { suggestionPositions } from "./revision-projection";
+import { useRevisionToolbar } from "./useRevisionToolbar";
 import {
   type BaseSide,
   createReferenceComparison,
@@ -474,18 +475,15 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
-  const [compactTools, setCompactTools] = useState(
-    () => window.matchMedia("(max-width: 1023px), (pointer: coarse)").matches,
-  );
+  const {
+    containerRef: toolbarContainerRef,
+    toolsRef,
+    measureRef: measuredToolsRef,
+    compact: compactTools,
+  } = useRevisionToolbar();
   useEffect(() => {
-    const query = window.matchMedia("(max-width: 1023px), (pointer: coarse)");
-    const update = () => {
-      setCompactTools(query.matches);
-      setMoreOpen(false);
-    };
-    query.addEventListener("change", update);
-    return () => query.removeEventListener("change", update);
-  }, []);
+    if (!compactTools) setMoreOpen(false);
+  }, [compactTools]);
   const [disk, setDisk] = useState<InspectedDestination | null>(null);
   const [conflict, setConflict] = useState(initial.targetChanged);
   const [preservedReview, setPreservedReview] = useState(false);
@@ -1028,7 +1026,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       : writePaused
         ? "Paused"
         : "Saving…";
-  const secondaryTools = (
+  const secondaryTools = (measuring = false) => (
     <>
       <div
         className="revision-tool-group"
@@ -1041,7 +1039,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               ? "Show full Markdown source, including suggestions and comments. Source editing requires Edit mode."
               : "Show the formatted document."
           }
-          data-testid="revision-format"
+          data-testid={measuring ? undefined : "revision-format"}
           aria-label={formatted ? "Show Markdown" : "Show formatted document"}
           aria-pressed={!formatted}
           size="icon"
@@ -1062,7 +1060,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               : "Copy Markdown without pending suggestions or comments."
           }
           aria-label="Copy Markdown"
-          data-testid="revision-copy"
+          data-testid={measuring ? undefined : "revision-copy"}
           variant="ghost"
           size="icon"
           onClick={() => {
@@ -1086,7 +1084,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               : "Download Markdown without pending suggestions or comments."
           }
           aria-label="Download Markdown"
-          data-testid="revision-download"
+          data-testid={measuring ? undefined : "revision-download"}
           variant="ghost"
           size="icon"
           onClick={() => {
@@ -1105,7 +1103,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       <TipButton
         tip="Inspect reviewed changes and reopen a decision."
         aria-label="History"
-        data-testid="revision-reviewed"
+        data-testid={measuring ? undefined : "revision-reviewed"}
         variant="ghost"
         disabled={!reviewed.length}
         onClick={() => {
@@ -1123,7 +1121,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         >
           <TipButton
             tip="Send a snapshot and comments to the agent. This does not write a file."
-            data-testid="revision-send"
+            data-testid={measuring ? undefined : "revision-send"}
             variant="outline"
             disabled={busy || reviewChanged}
             onClick={() => {
@@ -1145,7 +1143,11 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         ref={headerRef}
         data-testid="revision-header"
       >
-        <div className="revision-header-inner">
+        <div
+          className="revision-header-inner"
+          ref={toolbarContainerRef}
+          data-compact-tools={compactTools}
+        >
           <div className="revision-identity" data-testid="revision-identity">
             <div className="revision-title-copy">
               <h1 data-testid="revision-path" title={initial.title}>
@@ -1227,7 +1229,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               {saved ? <Check aria-hidden="true" /> : fileState}
             </span>
           </div>
-          <div className="revision-tools">
+          <div className="revision-tools" ref={toolsRef}>
             <Select<DocumentInteractionMode>
               value={interaction}
               onValueChange={(mode) => {
@@ -1243,6 +1245,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               }}
             >
               <SelectTrigger
+                data-toolbar-primary
                 data-testid="revision-mode"
                 aria-label="Editing mode"
                 className="revision-mode-select"
@@ -1304,6 +1307,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               }}
             >
               <SelectTrigger
+                data-toolbar-primary
                 data-testid="revision-view"
                 aria-label="Document view"
                 className="revision-mode-select"
@@ -1345,6 +1349,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               </SelectContent>
             </Select>
             <div
+              data-toolbar-primary
               className="revision-tool-group"
               aria-label="Document history"
               role="group"
@@ -1387,6 +1392,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               </TipButton>
             </div>
             <div
+              data-toolbar-primary
               className="revision-tool-group revision-navigation"
               aria-label="Change navigation"
               role="group"
@@ -1485,12 +1491,21 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                   data-testid="revision-more-actions"
                   aria-label="More actions"
                 >
-                  {secondaryTools}
+                  {secondaryTools()}
                 </PopoverContent>
               </Popover>
             ) : (
-              secondaryTools
+              secondaryTools()
             )}
+          </div>
+          <div className="revision-toolbar-measure" aria-hidden="true" inert>
+            <div
+              className="revision-tools revision-measured-tools"
+              ref={measuredToolsRef}
+            >
+              <div className="revision-tool-group" />
+              {secondaryTools(true)}
+            </div>
           </div>
         </div>
       </header>
