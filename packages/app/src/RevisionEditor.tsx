@@ -480,10 +480,15 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     toolsRef,
     measureRef: measuredToolsRef,
     compact: compactTools,
+    visible: visibleTools,
   } = useRevisionToolbar();
+  const moreLayoutRef = useRef(visibleTools);
   useEffect(() => {
-    if (!compactTools) setMoreOpen(false);
-  }, [compactTools]);
+    if (moreLayoutRef.current !== visibleTools) {
+      moreLayoutRef.current = visibleTools;
+      setMoreOpen(false);
+    }
+  }, [visibleTools]);
   const [disk, setDisk] = useState<InspectedDestination | null>(null);
   const [conflict, setConflict] = useState(initial.targetChanged);
   const [preservedReview, setPreservedReview] = useState(false);
@@ -1026,116 +1031,137 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       : writePaused
         ? "Paused"
         : "Saving…";
-  const secondaryTools = (measuring = false) => (
-    <>
-      <div
-        className="revision-tool-group"
-        role="group"
-        aria-label="Document view"
-      >
-        <TipButton
-          tip={
-            formatted
-              ? "Show full Markdown source, including suggestions and comments. Source editing requires Edit mode."
-              : "Show the formatted document."
-          }
-          data-testid={measuring ? undefined : "revision-format"}
-          aria-label={formatted ? "Show Markdown" : "Show formatted document"}
-          aria-pressed={!formatted}
-          size="icon"
-          variant="ghost"
-          onClick={() => {
-            setMoreOpen(false);
-            setSourceReading(captures.current() ?? null);
-            if (formatted) currentDraft();
-            setPreferences({ formatted: !formatted });
-          }}
-        >
-          <FileCode2 aria-hidden="true" />
-        </TipButton>
-        <TipButton
-          tip={
-            previewing
-              ? "Copy the visible outcome preview as Markdown."
-              : "Copy Markdown without pending suggestions or comments."
-          }
-          aria-label="Copy Markdown"
-          data-testid={measuring ? undefined : "revision-copy"}
-          variant="ghost"
-          size="icon"
-          onClick={() => {
-            const draft = previewing ? null : currentDraft();
-            void copyRevisionMarkdown(
-              previewing
-                ? (preview?.markdown ?? "")
-                : (draft?.cleanMarkdown ?? draft?.markdown ?? ""),
-            ).then(() => {
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 1400);
-            }, reportError);
-          }}
-        >
-          {copied ? <Check /> : <Copy />}
-        </TipButton>
-        <TipButton
-          tip={
-            previewing
-              ? "Download the visible outcome preview as Markdown."
-              : "Download Markdown without pending suggestions or comments."
-          }
-          aria-label="Download Markdown"
-          data-testid={measuring ? undefined : "revision-download"}
-          variant="ghost"
-          size="icon"
-          onClick={() => {
-            const draft = previewing ? null : currentDraft();
-            downloadRevisionMarkdown(
-              previewing
-                ? (preview?.markdown ?? "")
-                : (draft?.cleanMarkdown ?? draft?.markdown ?? ""),
-              filename,
-            );
-          }}
-        >
-          <Download />
-        </TipButton>
-      </div>
-      <TipButton
-        tip="Inspect reviewed changes and reopen a decision."
-        aria-label="History"
-        data-testid={measuring ? undefined : "revision-reviewed"}
-        variant="ghost"
-        disabled={!reviewed.length}
-        onClick={() => {
-          setMoreOpen(false);
-          setHistoryOpen(true);
-        }}
-      >
-        History{reviewed.length ? ` (${reviewed.length})` : ""}
-      </TipButton>
-      {buttonHandoff && (
-        <div
-          className="revision-tool-group"
-          aria-label="Send feedback"
-          role="group"
-        >
+  const secondaryTools = (measuring = false, overflow = false) => {
+    const show = (index: number) =>
+      measuring || (overflow ? index >= visibleTools : index < visibleTools);
+    return (
+      <>
+        {(show(0) || show(1) || show(2)) && (
+          <div
+            className="revision-tool-group"
+            role="group"
+            aria-label="Document view"
+          >
+            {show(0) && (
+              <TipButton
+                tip={
+                  formatted
+                    ? "Show full Markdown source, including suggestions and comments. Source editing requires Edit mode."
+                    : "Show the formatted document."
+                }
+                data-testid={measuring ? undefined : "revision-format"}
+                data-toolbar-secondary={measuring ? "format" : undefined}
+                aria-label={
+                  formatted ? "Show Markdown" : "Show formatted document"
+                }
+                aria-pressed={!formatted}
+                size="icon"
+                variant="ghost"
+                onClick={() => {
+                  setMoreOpen(false);
+                  setSourceReading(captures.current() ?? null);
+                  if (formatted) currentDraft();
+                  setPreferences({ formatted: !formatted });
+                }}
+              >
+                <FileCode2 aria-hidden="true" />
+              </TipButton>
+            )}
+            {show(1) && (
+              <TipButton
+                tip={
+                  previewing
+                    ? "Copy the visible outcome preview as Markdown."
+                    : "Copy Markdown without pending suggestions or comments."
+                }
+                aria-label="Copy Markdown"
+                data-testid={measuring ? undefined : "revision-copy"}
+                data-toolbar-secondary={measuring ? "copy" : undefined}
+                variant="ghost"
+                size="icon"
+                onClick={() => {
+                  const draft = previewing ? null : currentDraft();
+                  void copyRevisionMarkdown(
+                    previewing
+                      ? (preview?.markdown ?? "")
+                      : (draft?.cleanMarkdown ?? draft?.markdown ?? ""),
+                  ).then(() => {
+                    setCopied(true);
+                    window.setTimeout(() => setCopied(false), 1400);
+                  }, reportError);
+                }}
+              >
+                {copied ? <Check /> : <Copy />}
+              </TipButton>
+            )}
+            {show(2) && (
+              <TipButton
+                tip={
+                  previewing
+                    ? "Download the visible outcome preview as Markdown."
+                    : "Download Markdown without pending suggestions or comments."
+                }
+                aria-label="Download Markdown"
+                data-testid={measuring ? undefined : "revision-download"}
+                data-toolbar-secondary={measuring ? "download" : undefined}
+                variant="ghost"
+                size="icon"
+                onClick={() => {
+                  const draft = previewing ? null : currentDraft();
+                  downloadRevisionMarkdown(
+                    previewing
+                      ? (preview?.markdown ?? "")
+                      : (draft?.cleanMarkdown ?? draft?.markdown ?? ""),
+                    filename,
+                  );
+                }}
+              >
+                <Download />
+              </TipButton>
+            )}
+          </div>
+        )}
+        {show(3) && (
           <TipButton
-            tip="Send a snapshot and comments to the agent. This does not write a file."
-            data-testid={measuring ? undefined : "revision-send"}
-            variant="outline"
-            disabled={busy || reviewChanged}
+            tip="Inspect reviewed changes and reopen a decision."
+            aria-label="History"
+            data-testid={measuring ? undefined : "revision-reviewed"}
+            data-toolbar-secondary={measuring ? "history" : undefined}
+            variant="ghost"
+            disabled={!reviewed.length}
             onClick={() => {
               setMoreOpen(false);
-              setActionError("");
-              setSendOpen(true);
+              setHistoryOpen(true);
             }}
           >
-            Send feedback
+            History{reviewed.length ? ` (${reviewed.length})` : ""}
           </TipButton>
-        </div>
-      )}
-    </>
-  );
+        )}
+        {buttonHandoff && show(4) && (
+          <div
+            className="revision-tool-group"
+            aria-label="Send feedback"
+            role="group"
+          >
+            <TipButton
+              tip="Send a snapshot and comments to the agent. This does not write a file."
+              data-testid={measuring ? undefined : "revision-send"}
+              data-toolbar-secondary={measuring ? "send" : undefined}
+              variant="outline"
+              disabled={busy || reviewChanged}
+              onClick={() => {
+                setMoreOpen(false);
+                setActionError("");
+                setSendOpen(true);
+              }}
+            >
+              Send feedback
+            </TipButton>
+          </div>
+        )}
+      </>
+    );
+  };
   return (
     <TooltipProvider delay={300}>
       <header
@@ -1147,6 +1173,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           className="revision-header-inner"
           ref={toolbarContainerRef}
           data-compact-tools={compactTools}
+          data-visible-tools={visibleTools}
         >
           <div className="revision-identity" data-testid="revision-identity">
             <div className="revision-title-copy">
@@ -1472,7 +1499,8 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                   </>
                 )}
             </div>
-            {compactTools ? (
+            {secondaryTools()}
+            {compactTools && (
               <Popover open={moreOpen} onOpenChange={setMoreOpen}>
                 <PopoverTrigger
                   render={
@@ -1491,11 +1519,9 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                   data-testid="revision-more-actions"
                   aria-label="More actions"
                 >
-                  {secondaryTools()}
+                  {secondaryTools(false, true)}
                 </PopoverContent>
               </Popover>
-            ) : (
-              secondaryTools()
             )}
           </div>
           <div className="revision-toolbar-measure" aria-hidden="true" inert>
@@ -1505,6 +1531,10 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
             >
               <div className="revision-tool-group" />
               {secondaryTools(true)}
+              <Button variant="outline" data-toolbar-overflow>
+                <MoreHorizontal />
+                More
+              </Button>
             </div>
           </div>
         </div>

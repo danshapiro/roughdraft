@@ -220,7 +220,8 @@
     order: 1;
   }
 
-  .revision-header-inner[data-compact-tools="false"] .revision-navigation {
+  .revision-header-inner[data-visible-tools]:not([data-visible-tools="0"])
+    .revision-navigation {
     order: 0;
   }
 
