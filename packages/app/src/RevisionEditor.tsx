@@ -1021,7 +1021,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       </div>
       <TipButton
         tip="Inspect reviewed changes and reopen a decision."
-        aria-label="Reviewed changes"
+        aria-label="History"
         data-testid="revision-reviewed"
         variant="ghost"
         disabled={!reviewed.length}
@@ -1030,7 +1030,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           setHistoryOpen(true);
         }}
       >
-        Reviewed changes{reviewed.length ? ` (${reviewed.length})` : ""}
+        History{reviewed.length ? ` (${reviewed.length})` : ""}
       </TipButton>
       {buttonHandoff && (
         <div
@@ -1687,7 +1687,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           className="max-w-2xl"
           data-testid="revision-reviewed-dialog"
         >
-          <DialogTitle>Reviewed changes</DialogTitle>
+          <DialogTitle>History</DialogTitle>
           <DialogDescription>
             Inspect previous decisions. Reopen a change to review it again;
             unrelated edits stay in place.
