@@ -118,6 +118,8 @@ Keep generated screenshot runs in `.context/ui-state-screenshots/` unless the us
 
 After every change, give Dan a working Roughdraft link to a real, complex Markdown document running on the updated app. Use `pnpm --silent preview --json` to build and preserve that review, with the real README and autosave `none` by default; pass `--document` or `--title` when useful. Return its complete verified `url` unchanged and retain its `readCommand` argument array for later feedback retrieval. Keep the review until accepted.
 
+For editing or review changes, use the maintained [editing review fixture](docs/spec/fixtures/editing-review.md) with `--document docs/spec/fixtures/editing-review.md --before docs/spec/fixtures/editing-review-original.md`; the README alone does not cover those behaviors. Keep `s10` and Revert `s11` to prepare the History examples, leaving the other changes pending. For file-write testing, choose a fresh practice autosave file and preserve its relative images and linked documents beside it; otherwise use `none`.
+
 For an existing server, use `--server URL`; `--port` is only a startup preference. Never reconstruct a review link from a different address and a saved ID. Read feedback using `comparison "FULL_REVIEW_URL" --read --json`, so it returns to the original server. A healthy application alone does not verify that the linked review exists.
 
 ## Worktree-Specific CLI
