@@ -10,6 +10,9 @@ Both deployments pin a tested commit from this repository. App changes need
 new deployment artifacts and each installation's documented rollout; merging
 app source alone does not update either running service.
 
+When the user requests an install or deployment, update every installation that
+uses Roughdraft, including garageserver and Glowfer, unless they specify a narrower scope.
+
 ## Testing Principles
 
 Use the repo-local `test-desiderata` skill when planning, adding, changing, or reviewing tests. Keep the core bar visible even when the skill is not loaded: tests should optimize for Kent Beck's Test Desiderata (https://testdesiderata.com/) as context-specific tradeoffs, not as a mechanical checklist.
