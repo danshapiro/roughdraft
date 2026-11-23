@@ -6,7 +6,7 @@ import type {
   EditorDraft,
 } from "./comparison-types";
 import { equalRevisionDraft as equalDraft } from "./revision-draft";
-import { cleanRevisionSourceMarkdown } from "./revision-markdown";
+import { cleanRevisionMarkdown } from "./revision-markdown";
 
 class RevisionRequestError extends Error {
   constructor(
@@ -69,7 +69,7 @@ function needsFileSave(
     !paused &&
     Boolean(review.destinationPath) &&
     (draft.cleanMarkdown ?? draft.markdown) !==
-      cleanRevisionSourceMarkdown(review.savedText ?? "")
+      cleanRevisionMarkdown(review.savedText ?? "")
   );
 }
 

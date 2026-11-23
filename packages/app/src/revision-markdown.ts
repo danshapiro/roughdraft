@@ -203,9 +203,14 @@ export function createSourceSpellingPreserver(
         original[start - 1] === "\r"
       )
         start--;
-      const end = removed
+      let end = removed
         ? (sourceIndices[at + removed.length - 1] ?? -1) + 1
         : start;
+      if (!removed && /[ \t]$/.test(added)) {
+        const next = sourceIndices[at];
+        if (next > start && /^[ \t]+$/.test(original.slice(start, next)))
+          end = next;
+      }
       const sourceText = original.slice(start, end);
       if (
         start < sourceOffset ||

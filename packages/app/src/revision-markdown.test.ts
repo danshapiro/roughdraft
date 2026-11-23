@@ -121,6 +121,15 @@ describe("preserving original Markdown when saving comparison choices", () => {
       now.mockRestore();
     }
   });
+
+  it("uses the inserted word's whitespace at a projected suggestion gap", () => {
+    expect(
+      createSourceSpellingPreserver(
+        "Alpha  beta.\r\n",
+        "Alpha beta.\n",
+      )("Alpha new beta.\n"),
+    ).toBe("Alpha new beta.\r\n");
+  });
 });
 
 it("formatted clean projection uses the live accepted document without turning split review formatting into a file edit", () => {

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { expect, test } from "@playwright/test";
 import {
   createMarkdownProject,
@@ -151,6 +152,53 @@ test("Undo restores deleted Markdown spelling after the draft has saved @smoke",
     await page.reload();
     await expect(richTextEditor(page)).toContainText("Final paragraph.");
     expect(fs.readFileSync(filename, "utf8")).toBe(source);
+  } finally {
+    removeMarkdownProject(project);
+  }
+});
+
+test("the complete editing fixture finishes saving after a review decision @smoke", async ({
+  page,
+  request,
+}) => {
+  const project = createMarkdownProject("typing-fixture-save");
+  const fixtures = path.resolve(
+    import.meta.dirname,
+    "../../../docs/spec/fixtures",
+  );
+  fs.cpSync(
+    path.join(fixtures, "editing-review-assets"),
+    path.join(project, "editing-review-assets"),
+    { recursive: true },
+  );
+  const filename = writeProjectFile(
+    project,
+    "review.md",
+    fs.readFileSync(path.join(fixtures, "editing-review.md"), "utf8"),
+  );
+  try {
+    const response = await request.post(`${api}/document`, {
+      headers: { Connection: "close" },
+      data: { targetPath: filename, autosave: filename, handoff: "chat" },
+    });
+    await expect(response).toBeOK();
+    const { id } = await response.json();
+    await page.goto(`/?comparison=${id}`);
+    await page.getByTestId("comment-rail-s10-action-accept").click();
+    await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
+      "aria-label",
+      "Saved to file",
+    );
+    const saved = fs.readFileSync(filename, "utf8");
+    expect(saved).toContain("return draft;");
+    expect(saved).toContain("Footer stays unchanged");
+    await page.reload();
+    await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
+      "aria-label",
+      "Saved to file",
+    );
+    expect(fs.readFileSync(filename, "utf8")).toBe(saved);
+    await expect(page.getByTestId("suggestion-thread-s7")).toHaveCount(1);
   } finally {
     removeMarkdownProject(project);
   }
