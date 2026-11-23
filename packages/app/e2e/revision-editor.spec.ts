@@ -711,8 +711,10 @@ test.describe("the single revision editor", () => {
     await richTextEditor(page)
       .getByRole("link", { name: "Second file" })
       .click();
-    await destination(page, second);
+    // The outgoing editor remains mounted while its queued save finishes.
+    // Wait for the linked document before interacting with its header.
     await expect(richTextEditor(page)).toContainText("Linked document");
+    await destination(page, second);
     expect(contents(first)).toBe(
       `Edited.\n\n[Second file](second.md)\n\n${body}\n`,
     );
