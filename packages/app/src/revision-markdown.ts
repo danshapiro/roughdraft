@@ -1,6 +1,6 @@
 import { cleanRoughdraftMarkdown } from "@roughdraft/rfm";
 import { getSchema, type JSONContent } from "@tiptap/core";
-import { diffChars } from "diff";
+import { type Change, diffChars, diffWordsWithSpace } from "diff";
 import {
   criticMarkdownToEditorState,
   editorStateToCriticMarkdown,
@@ -131,8 +131,12 @@ export function createSourceSpellingPreserver(
   before: string,
 ): (after: string) => string | null {
   if (before === original) return (after) => after;
+  // An edit-distance cap alone can still spend seconds on a short rewrite.
+  // The original alignment also serves Undo. Retain it rather than discarding
+  // deleted blocks' spelling when later edits are processed.
   const alignment = diffChars(before, original, { maxEditLength: 4096 });
   if (!alignment) return (after) => (before === after ? original : null);
+  const budget = { maxEditLength: 4096, timeout: 8 };
   const sourceIndices = new Int32Array(before.length).fill(-1);
   let canonicalOffset = 0;
   let sourceOffset = 0;
@@ -149,8 +153,25 @@ export function createSourceSpellingPreserver(
     !original.replaceAll("\r\n", "").includes("\n");
   return (after) => {
     if (before === after) return original;
-    const changes = diffChars(before, after, { maxEditLength: 4096 });
-    if (!changes) return null;
+    let changes = diffChars(before, after, budget);
+    if (!changes) {
+      // Broad prose rewrites are cheap to align as words even when comparing
+      // every character is expensive. Keep distant edits separate so an
+      // untouched spelling difference between them remains in the source.
+      // The final linear fallback is also checked against the original below.
+      changes =
+        diffWordsWithSpace(before, after, budget) ??
+        anchoredSourceChanges(before, after);
+      console.info(
+        JSON.stringify({
+          severity: "info",
+          component: "source-spelling",
+          event: "bounded-replacement",
+          beforeLength: before.length,
+          afterLength: after.length,
+        }),
+      );
+    }
     let result = "";
     let canonicalOffset = 0;
     let sourceOffset = 0;
@@ -170,23 +191,102 @@ export function createSourceSpellingPreserver(
       }
       i--;
       canonicalOffset += removed.length;
-      const start = removed
+      let start = removed
         ? (sourceIndices[at] ?? -1)
         : at === 0
           ? (sourceIndices[0] ?? 0)
           : (sourceIndices[at - 1] ?? -2) + 1;
       if (
+        crlf &&
+        removed.startsWith("\n") &&
+        original[start] === "\n" &&
+        original[start - 1] === "\r"
+      )
+        start--;
+      const end = removed
+        ? (sourceIndices[at + removed.length - 1] ?? -1) + 1
+        : start;
+      const sourceText = original.slice(start, end);
+      if (
         start < sourceOffset ||
-        (removed && original.slice(start, start + removed.length) !== removed)
+        end < start ||
+        (removed &&
+          (crlf ? sourceText.replaceAll("\r\n", "\n") : sourceText) !== removed)
       )
         return null;
       result +=
         original.slice(sourceOffset, start) +
         (crlf ? added.replaceAll("\n", "\r\n") : added);
-      sourceOffset = start + removed.length;
+      sourceOffset = end;
     }
     return result + original.slice(sourceOffset);
   };
+}
+
+/** Linear anchors keep untouched spelling between distant replacements. */
+function anchoredSourceChanges(before: string, after: string): Change[] {
+  const uniqueWords = (text: string) => {
+    const words = new Map<string, { from: number; to: number } | null>();
+    for (const match of text.matchAll(/\S+/g))
+      words.set(
+        match[0],
+        words.has(match[0])
+          ? null
+          : { from: match.index, to: match.index + match[0].length },
+      );
+    return words;
+  };
+  const oldWords = uniqueWords(before);
+  const newWords = uniqueWords(after);
+  const changes: Change[] = [];
+  let oldOffset = 0;
+  let newOffset = 0;
+  for (const [word, next] of newWords) {
+    const previous = oldWords.get(word);
+    if (!next || !previous || previous.from < oldOffset) continue;
+    changes.push(
+      ...changedSourceRange(
+        before.slice(oldOffset, previous.from),
+        after.slice(newOffset, next.from),
+      ),
+      { value: word, count: word.length, added: false, removed: false },
+    );
+    oldOffset = previous.to;
+    newOffset = next.to;
+  }
+  changes.push(
+    ...changedSourceRange(before.slice(oldOffset), after.slice(newOffset)),
+  );
+  return changes;
+}
+
+/** Linear fallback: only replace the range between identical source edges. */
+function changedSourceRange(before: string, after: string): Change[] {
+  let start = 0;
+  const shorter = Math.min(before.length, after.length);
+  while (start < shorter && before[start] === after[start]) start++;
+  let end = 0;
+  while (
+    end < shorter - start &&
+    before[before.length - end - 1] === after[after.length - end - 1]
+  )
+    end++;
+  return [
+    { value: before.slice(0, start), added: false, removed: false },
+    {
+      value: before.slice(start, before.length - end),
+      added: false,
+      removed: true,
+    },
+    {
+      value: after.slice(start, after.length - end),
+      added: true,
+      removed: false,
+    },
+    { value: after.slice(after.length - end), added: false, removed: false },
+  ]
+    .filter((part) => part.value.length)
+    .map((part) => ({ ...part, count: part.value.length }));
 }
 
 export async function copyRevisionMarkdown(markdown: string) {

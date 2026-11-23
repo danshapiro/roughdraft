@@ -338,7 +338,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     const parsed = criticMarkdownToEditorState(initial.afterText);
     return {
       markdown: initial.afterText,
-      cleanMarkdown: cleanRevisionMarkdown(initial.afterText),
+      cleanMarkdown: cleanRevisionSourceMarkdown(initial.afterText),
       decisions: {},
       reviewComments: [...parsed.comments.values()].map((comment) => ({
         ...comment,
@@ -888,7 +888,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const count = navigation.length;
   const markdown = draft.cleanMarkdown ?? draft.markdown;
   const cleanSaved = useMemo(
-    () => cleanRevisionMarkdown(session.savedText ?? ""),
+    () => cleanRevisionSourceMarkdown(session.savedText ?? ""),
     [session.savedText],
   );
   const persistedDraft = session.draft ?? seed;

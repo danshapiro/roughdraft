@@ -58,15 +58,29 @@ test("typing stays responsive after a substantial rewrite in the same review @sm
     // edit. Reloading here would hide the reported long-session failure.
     await selectRichText(page, opening);
     await page.keyboard.insertText(rewritten);
-    const started = performance.now();
-    await page.keyboard.type(suffix);
-    const elapsedMs = performance.now() - started;
-    await testInfo.attach("continued-typing-duration", {
-      body: JSON.stringify({
+    // Measure native character edits in the page, excluding controller/IPC
+    // contention from parallel browser tests. Yield after each edit so the
+    // editor processes each DOM mutation separately, as it does while typing.
+    const elapsedMs = await page.evaluate(async (text) => {
+      const started = performance.now();
+      for (const character of text) {
+        if (!document.execCommand("insertText", false, character))
+          throw new Error("The focused editor did not accept a character");
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      }
+      return performance.now() - started;
+    }, suffix);
+    const timingPath = testInfo.outputPath("continued-typing-duration.json");
+    fs.writeFileSync(
+      timingPath,
+      JSON.stringify({
         rewrittenCharacters: rewritten.length,
         typedCharacters: suffix.length,
         elapsedMs,
       }),
+    );
+    await testInfo.attach("continued-typing-duration", {
+      path: timingPath,
       contentType: "application/json",
     });
     // This deliberately generous boundary separates a normal typing burst from
@@ -99,6 +113,44 @@ test("typing stays responsive after a substantial rewrite in the same review @sm
     );
     await expect(page.getByTestId("suggestion-thread-s2")).toHaveCount(1);
     expect(fs.readFileSync(filename, "utf8")).toBe(saved);
+  } finally {
+    removeMarkdownProject(project);
+  }
+});
+
+test("Undo restores deleted Markdown spelling after the draft has saved @smoke", async ({
+  page,
+  request,
+}) => {
+  const project = createMarkdownProject("typing-spelling-undo");
+  const source =
+    "# Exact source\r\n\r\n* Keep this original marker.\r\n* Keep this second item.\r\n\r\nFinal paragraph.\r\n";
+  const filename = writeProjectFile(project, "review.md", source);
+  try {
+    const response = await request.post(`${api}/document`, {
+      headers: { Connection: "close" },
+      data: { targetPath: filename, autosave: filename, handoff: "chat" },
+    });
+    await expect(response).toBeOK();
+    const { id } = await response.json();
+    await page.goto(`/?comparison=${id}`);
+    await richTextEditor(page).focus();
+    await page.keyboard.press("Control+a");
+    await page.keyboard.press("Backspace");
+    await expect
+      .poll(() => fs.readFileSync(filename, "utf8"))
+      .not.toContain("Keep this original marker.");
+    await page.keyboard.press("Control+z");
+    await expect.poll(() => fs.readFileSync(filename, "utf8")).toBe(source);
+    await page.keyboard.press("Control+Shift+z");
+    await expect
+      .poll(() => fs.readFileSync(filename, "utf8"))
+      .not.toContain("Keep this original marker.");
+    await page.keyboard.press("Control+z");
+    await expect.poll(() => fs.readFileSync(filename, "utf8")).toBe(source);
+    await page.reload();
+    await expect(richTextEditor(page)).toContainText("Final paragraph.");
+    expect(fs.readFileSync(filename, "utf8")).toBe(source);
   } finally {
     removeMarkdownProject(project);
   }
