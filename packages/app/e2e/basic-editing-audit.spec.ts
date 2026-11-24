@@ -60,15 +60,19 @@ test.describe("basic editing audit", () => {
       page.getByTestId("selection-menu-action-comment"),
     ).toBeEnabled();
     await page.keyboard.press(side === "before" ? "ArrowLeft" : "ArrowRight");
-    // The helper's synthetic range has to reach the editor before the next
-    // key. This public control reports when the model has a collapsed caret.
+    // Check the native caret atomically. The selection menu unmounts as the
+    // range collapses, so polling its visibility and disabled state can race.
     await expect
-      .poll(async () => {
-        const comment = page.getByTestId("selection-menu-action-comment");
-        if (!(await comment.count()) || !(await comment.isVisible()))
-          return true;
-        return comment.isDisabled();
-      })
+      .poll(() =>
+        richTextEditor(page).evaluate((editor) => {
+          const selection = window.getSelection();
+          return Boolean(
+            document.activeElement === editor &&
+              selection?.isCollapsed &&
+              editor.contains(selection.anchorNode),
+          );
+        }),
+      )
       .toBe(true);
   }
 

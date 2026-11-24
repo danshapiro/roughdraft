@@ -47,7 +47,9 @@ test("reloading during the last draft save acknowledges that same saved snapshot
       await route.continue();
     });
     await selectRichText(page, "Original wording");
-    await page.keyboard.type("Reviewed wording");
+    // Hold the complete snapshot this reload is meant to acknowledge. Per-key
+    // typing can start an earlier save that blocks the final request behind it.
+    await page.keyboard.insertText("Reviewed wording");
     await expect
       .poll(() => pendingDraft?.cleanMarkdown)
       .toBe("Reviewed wording\n");

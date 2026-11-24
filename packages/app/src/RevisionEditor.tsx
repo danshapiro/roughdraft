@@ -443,9 +443,12 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       return { ...current, reviewComments: next };
     });
   }
-  const exactClean = useRef(
-    source.cleanMarkdown ?? cleanRevisionMarkdown(source.markdown),
+  const [initialClean] = useState(() =>
+    initial.draft
+      ? (source.cleanMarkdown ?? cleanRevisionMarkdown(source.markdown))
+      : cleanRevisionSourceMarkdown(source.markdown),
   );
+  const exactClean = useRef(initialClean);
   const preserveSource = useRef<ReturnType<
     typeof createSourceSpellingPreserver
   > | null>(null);
@@ -599,6 +602,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       setMarkdownQueued(false);
       const current = ownEditor.current?.state.doc;
       if (!current) return;
+      const previous = readDraft();
       const sourceClean = cleanRevisionSourceMarkdown(markdown);
       const metadataChanged = !sameMetadata(
         documentMetadata(sourceClean),
@@ -607,19 +611,21 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       const result =
         origin === "source"
           ? sourceClean
-          : cleanRevisionDocument(current.toJSON(), readDraft());
+          : cleanRevisionDocument(current.toJSON(), previous);
       preserveSource.current ??= createSourceSpellingPreserver(
         exactClean.current,
         canonical(exactClean.current),
       );
       const requested = canonical(result);
       const preserved = preserveSource.current(requested);
-      let cleanMarkdown =
-        origin === "source"
-          ? result
-          : preserved !== null && canonical(preserved) === requested
-            ? preserved
-            : result;
+      let cleanMarkdown = result;
+      if (
+        origin !== "source" &&
+        result !== previous.cleanMarkdown &&
+        preserved !== null &&
+        canonical(preserved) === requested
+      )
+        cleanMarkdown = preserved;
       if (metadataChanged && origin !== "source")
         cleanMarkdown = withDocumentMetadata(
           cleanMarkdown,

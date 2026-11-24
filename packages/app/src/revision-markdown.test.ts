@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   criticMarkdownToEditorState,
   editorStateToCriticMarkdown,
@@ -72,6 +72,63 @@ describe("preserving original Markdown when saving comparison choices", () => {
       "- Keep wording\n",
     );
     expect(preserve("Keep wording\n")).toBeNull();
+  });
+
+  it("keeps unrelated source spelling when a paragraph rewrite exhausts the detailed diff", () => {
+    const opening = "a".repeat(2_200);
+    const rewritten = "b".repeat(2_200);
+    const original = `# Notes\r\n\r\n* Keep this marker.\r\n\r\n${opening}\r\n\r\nFooter.\r\n`;
+    const canonical = `# Notes\n- Keep this marker.\n\n${opening}\n\nFooter.\n`;
+    const preserve = createSourceSpellingPreserver(original, canonical);
+
+    expect(preserve(canonical.replace(opening, rewritten))).toBe(
+      original.replace(opening, rewritten),
+    );
+  }, 15_000);
+
+  it("maps CRLF inside a broad replacement without consuming neighboring source", () => {
+    const opening = `${"a".repeat(1_100)}\n${"a".repeat(1_100)}`;
+    const rewritten = opening.replaceAll("a", "b");
+    const canonical = `- Keep this marker.\n\n${opening}\n\nFooter.\n`;
+    const original = `* Keep this marker.\r\n\r\n${opening.replaceAll("\n", "\r\n")}\r\n\r\nFooter.\r\n`;
+
+    expect(
+      createSourceSpellingPreserver(
+        original,
+        canonical,
+      )(canonical.replace(opening, rewritten)),
+    ).toBe(original.replaceAll("a".repeat(1_100), "b".repeat(1_100)));
+  });
+
+  it("consumes complete CRLF pairs when joining lines", () => {
+    expect(
+      createSourceSpellingPreserver("A\r\n\r\nB\r\n", "A\n\nB\n")("A B\n"),
+    ).toBe("A B\r\n");
+  });
+
+  it("keeps spelling between distant edits when both detailed comparisons time out", () => {
+    const original =
+      "Old lead.\r\n\r\n* Keep __this__ marker.\r\n\r\nOld tail.\r\n";
+    const canonical = "Old lead.\n- Keep **this** marker.\n\nOld tail.\n";
+    const preserve = createSourceSpellingPreserver(original, canonical);
+    let clock = 0;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => (clock += 100));
+    try {
+      expect(preserve(canonical.replaceAll("Old", "New"))).toBe(
+        original.replaceAll("Old", "New"),
+      );
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("uses the inserted word's whitespace at a projected suggestion gap", () => {
+    expect(
+      createSourceSpellingPreserver(
+        "Alpha  beta.\r\n",
+        "Alpha beta.\n",
+      )("Alpha new beta.\n"),
+    ).toBe("Alpha new beta.\r\n");
   });
 });
 

@@ -1827,7 +1827,6 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         const review = editableReviewRef.current;
         if (
           review?.markdownFlushRef &&
-          after.content.size >= 12_000 &&
           !transaction.getMeta(explicitReviewEdit)
         ) {
           // Serialize and remeasure the rail once per typing burst. The live
