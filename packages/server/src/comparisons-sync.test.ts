@@ -743,6 +743,90 @@ describe("guarded live review reconciliation", () => {
     });
   });
 
+  it("keeps unfinished feedback discoverable on a separate review after copy-result acknowledgment and pruning", async () => {
+    const base = await open();
+    const next = {
+      ...base.draft,
+      reviewComments: [
+        {
+          id: "c1",
+          changeId: "document",
+          content: "Existing comment",
+          createdAt: "2026-11-26T17:00:00.000Z",
+        },
+      ],
+    };
+    const uiDrafts = {
+      comments: {
+        c1: {
+          value: "Unfinished reply for the agent",
+          original: "Existing comment",
+          editing: true,
+        },
+      },
+    };
+    const destination = path.join(root, "feedback-copy.md");
+    const copied = await api()
+      .post(`/api/comparisons/${base.review.id}/copy`)
+      .send({
+        ...operation(base, "feedback-copy"),
+        generation: 1,
+        workingDraft: next,
+        path: destination,
+        relativeLinksAcknowledged: true,
+        uiDrafts,
+      });
+    expect(copied.body.status).toBe("committed");
+    let current = copied.body.state as SyncState<Comparison>;
+    let previous = "feedback-copy";
+    for (let sequence = 2; sequence <= 21; sequence++) {
+      const id = `feedback-ack-${sequence}`;
+      const saved = await api()
+        .post(`/api/comparisons/${current.review.id}/reconcile`)
+        .send({
+          ...payload(current, current.draft, id, "page-a", sequence),
+          writeFile: false,
+          acknowledgedOperationIds: [previous],
+        });
+      expect(saved.body.status).toBe("committed");
+      current = saved.body.state;
+      previous = id;
+    }
+    expect(
+      fs.existsSync(
+        path.join(root, "comparisons", "operations", "feedback-copy.json"),
+      ),
+    ).toBe(false);
+    host.dispose();
+    host = freshHost();
+    const review = (await api().get(`/api/comparisons/${current.review.id}`))
+      .body;
+    const metadata = review.recoveryCheckpoints?.find(
+      (entry: { reason: string }) =>
+        entry.reason === "Unfinished feedback saved with separate copy",
+    );
+    expect(metadata).toBeDefined();
+    expect(metadata.uiDrafts).toEqual(uiDrafts);
+    const preserved = (
+      await api().get(
+        `/api/comparisons/${current.review.id}/checkpoints/${metadata.id}`,
+      )
+    ).body;
+    expect(preserved.uiDrafts).toEqual(uiDrafts);
+    expect(preserved.workingDraft).toEqual(next);
+    expect(review.reviewComments).toEqual(next.reviewComments);
+    expect(fs.readFileSync(destination, "utf8")).not.toContain(
+      "Unfinished reply",
+    );
+    const descendants = (await api().get(`/api/comparisons/${base.review.id}`))
+      .body.recoveredReviews;
+    expect(
+      descendants.find(
+        (entry: { id: string }) => entry.id === current.review.id,
+      ).recoveryCheckpoints,
+    ).toContainEqual(expect.objectContaining({ id: metadata.id, uiDrafts }));
+  });
+
   it("returns root-relative paths, warns about moved links, and rejects existing copies", async () => {
     host.dispose();
     host = freshHost(root);

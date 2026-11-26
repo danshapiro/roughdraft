@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Comparison, ComparisonCompletion } from "./comparisons.js";
+import type { SyncResult, SyncState } from "@roughdraft/rfm";
 import { createApp } from "./index.js";
 
 interface CliEvent {
@@ -71,8 +72,7 @@ describe("comparison CLI actual subprocess and filesystem", () => {
         ...args,
         "--no-open",
         "--json",
-        "--port",
-        String(port),
+        ...(/^https?:\/\//.test(args[1] ?? "") ? [] : ["--port", String(port)]),
       ],
       {
         cwd: root,
@@ -135,6 +135,65 @@ describe("comparison CLI actual subprocess and filesystem", () => {
         .map((line) => JSON.parse(line) as CliEvent),
     };
   }
+
+  it("reads unfinished separate-copy feedback through the full review URL with the real CLI", async () => {
+    const target = path.join(directory, "original.md");
+    const destination = path.join(directory, "copy.md");
+    fs.writeFileSync(target, "Original document.\n");
+    const original = await api("/document", {
+      targetPath: target,
+      autosave: target,
+    });
+    const state = (await (
+      await fetch(
+        `http://127.0.0.1:${port}/api/comparisons/${original.id}/state`,
+      )
+    ).json()) as SyncState<Comparison>;
+    const uiDrafts = {
+      comments: {
+        c1: {
+          value: "Unfinished agent feedback",
+          original: "Existing comment",
+          editing: true,
+        },
+      },
+    };
+    const copied = (await api(`/${original.id}/copy`, {
+      operationId: "cli-copy-feedback",
+      pageInstanceId: "cli-copy-page",
+      operationSequence: 1,
+      operationContext: state.operationContext,
+      generation: 1,
+      workingDraft: {
+        ...state.draft,
+        reviewComments: [
+          {
+            id: "c1",
+            changeId: "document",
+            content: "Existing comment",
+            createdAt: "2026-11-26T17:00:00.000Z",
+          },
+        ],
+      },
+      path: destination,
+      relativeLinksAcknowledged: true,
+      uiDrafts,
+    })) as unknown as SyncResult<Comparison>;
+    expect(copied.status).toBe("committed");
+    const result = await command([
+      "comparison",
+      `http://127.0.0.1:${port}/?comparison=${copied.state?.review.id}`,
+      "--read",
+    ]);
+    expect(result.code, result.errors).toBe(0);
+    expect(result.events[0].event).toBe("comparison.read");
+    expect(result.events[0].comparison.recoveryCheckpoints).toContainEqual(
+      expect.objectContaining({ kind: "copy-feedback", uiDrafts }),
+    );
+    expect(result.events[0].comparison.reviewComments[0].content).toBe(
+      "Existing comment",
+    );
+  });
 
   it("proposes through the real command and reports whether the sent snapshot matches disk", async () => {
     const target = path.join(directory, "AGENTS.md");

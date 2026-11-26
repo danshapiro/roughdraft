@@ -147,6 +147,8 @@ export interface Comparison {
     id: string;
     generation: number;
     reason: string;
+    kind?: "copy-feedback";
+    uiDrafts?: Record<string, unknown>;
     createdAt: string;
     resolvedAt?: string;
     savedCopyId?: string;
@@ -177,6 +179,7 @@ interface StoredComparison
     writeFile: boolean;
     reason: string;
     uiDrafts?: Record<string, unknown>;
+    generation?: number;
     publishedIdentity?: {
       device: number;
       inode: number;
@@ -1839,6 +1842,9 @@ export class ComparisonStore {
         conflictId: conflict,
         generation,
         reason: stringField(body, "reason") ?? "Unsaved conflict recovery",
+        ...(body.kind === "copy-feedback"
+          ? { kind: "copy-feedback" as const }
+          : {}),
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
         entryDraft: previous?.entryDraft ?? draft,
@@ -1854,6 +1860,7 @@ export class ComparisonStore {
         id: checkpointId,
         generation,
         reason: snapshot.reason,
+        ...(snapshot.kind ? { kind: snapshot.kind } : {}),
         createdAt: String(snapshot.createdAt),
       });
       const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -1925,6 +1932,27 @@ export class ComparisonStore {
       entries: structuredClone(list),
     });
     this.watchers.invalidate(this.checkpointIndex(id));
+  }
+  private preserveCopyFeedback(review: StoredComparison): void {
+    const intent = review.pendingPublication;
+    if (intent?.reason !== "copy" || !intent.uiDrafts) return;
+    const hasDrafts = Object.values(intent.uiDrafts).some(
+      (value) =>
+        value &&
+        (typeof value === "object"
+          ? Object.keys(value).length > 0
+          : Boolean(value)),
+    );
+    if (!hasDrafts) return;
+    this.checkpoint(review.id, {
+      pageInstanceId: intent.operation.pageInstanceId,
+      conflictId: `copy-feedback-${intent.operation.operationId}`,
+      generation: intent.generation ?? intent.operation.operationSequence,
+      workingDraft: intent.draft,
+      uiDrafts: intent.uiDrafts,
+      kind: "copy-feedback",
+      reason: "Unfinished feedback saved with separate copy",
+    });
   }
   private logicalPath(filename: string): string {
     if (!this.options.documentRoot) return filename;
@@ -2153,6 +2181,7 @@ export class ComparisonStore {
         expectedDisk: null,
         writeFile: true,
         reason: "copy",
+        generation: typeof body.generation === "number" ? body.generation : 0,
         ...(body.uiDrafts &&
         typeof body.uiDrafts === "object" &&
         !Array.isArray(body.uiDrafts)
@@ -2161,6 +2190,7 @@ export class ComparisonStore {
       };
       this.save(copy);
       this.registerChild(id, copy.id);
+      this.preserveCopyFeedback(copy);
       const release = this.watchers.beginPublication(
         [destination.path, this.filename(copy.id)],
         operation.operationId,
@@ -2289,6 +2319,7 @@ export class ComparisonStore {
       };
     let record = this.operations.read(intent.operation.operationId);
     if (!record) record = this.operations.begin(intent.operation, review.id);
+    this.preserveCopyFeedback(review);
     const disk = intent.path ? this.diskAt(intent.path) : null;
     const clean = intent.draft.cleanMarkdown ?? intent.draft.markdown;
     let ownedFile = false;
@@ -2726,6 +2757,7 @@ export class ComparisonStore {
     review: StoredComparison,
     includeRecoveries = true,
     cachedDisk = false,
+    includeRecoveryFeedback = includeRecoveries,
   ): Comparison {
     const {
       targetVersion,
@@ -2771,13 +2803,29 @@ export class ComparisonStore {
           if (!child) continue;
           pending.push(child.id);
           if (child.recoveredFrom === parent)
-            recoveredReviews.push(this.view(child, false));
+            recoveredReviews.push(
+              this.view(child, false, false, includeRecoveryFeedback),
+            );
         }
       }
     }
     return {
       ...result,
       targetChanged,
+      ...(includeRecoveryFeedback
+        ? {
+            recoveryCheckpoints: this.checkpoints(review.id).map((entry) => {
+              if (entry.kind !== "copy-feedback") return entry;
+              const snapshot = this.readCheckpoint(review.id, entry.id) as {
+                uiDrafts?: Record<string, unknown>;
+              };
+              return {
+                ...entry,
+                ...(snapshot.uiDrafts ? { uiDrafts: snapshot.uiDrafts } : {}),
+              };
+            }),
+          }
+        : {}),
       ...(recoveredReviews.length ? { recoveredReviews } : {}),
     };
   }
