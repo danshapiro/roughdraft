@@ -1,43 +1,43 @@
-import { ComparisonEventStream } from "./comparison-event-stream.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { diffLines } from "diff";
-import { Router, type Request, type Response } from "express";
 import {
+  type CopyDestination,
   cleanRoughdraftMarkdown,
   extractRoughdraftReviewIndex,
   mergeReviewDrafts,
-  reviewDraftSignature,
-  sameReviewDraft,
-  type CopyDestination,
   type OutdatedSuggestion,
   type ReconcileRequest,
+  reviewDraftSignature,
   type SyncDisk,
   type SyncDraft,
   type SyncOperation,
   type SyncResult,
   type SyncState,
+  sameReviewDraft,
 } from "@roughdraft/rfm";
-import { ComparisonLocks, ComparisonLockBusy } from "./comparison-locks.js";
+import { diffLines } from "diff";
+import { type Request, type Response, Router } from "express";
+import {
+  atomicWrite,
+  FileChangedError,
+  type PreparedFileIdentity,
+  syncDirectory,
+  syncExistingFile,
+} from "./atomic-write.js";
+import { ComparisonEventStream } from "./comparison-event-stream.js";
+import { ComparisonLockBusy, ComparisonLocks } from "./comparison-locks.js";
 import {
   ComparisonOperations,
-  readOperation,
   type OperationRecord,
+  readOperation,
 } from "./comparison-operations.js";
 import {
   ReviewBaseCache,
   ReviewReservations,
 } from "./comparison-sync-cache.js";
-import { DocumentWatcherRegistry } from "./document-watchers.js";
 import { logServerEvent } from "./diagnostics.js";
-import {
-  atomicWrite,
-  FileChangedError,
-  syncDirectory,
-  syncExistingFile,
-  type PreparedFileIdentity,
-} from "./atomic-write.js";
+import { DocumentWatcherRegistry } from "./document-watchers.js";
 
 export type ComparisonMode = "proposal" | "applied" | "compare" | "document";
 export type ComparisonDecision = "pending" | "before" | "after";
@@ -106,6 +106,13 @@ export interface EditorFeedback {
   reviewComments: ComparisonReviewComment[];
   sentAt: string;
 }
+export interface ComparisonOverwriteNotice {
+  operationId: string;
+  pageInstanceId: string;
+  checkpointId: string;
+  displacedSignature: string;
+  createdAt: string;
+}
 export interface Comparison {
   id: string;
   revision: number;
@@ -138,6 +145,7 @@ export interface Comparison {
   baseOptions?: BaseOptions;
   feedback?: EditorFeedback | null;
   lastOperation?: { id: string; pageInstanceId: string; reason: string };
+  lastOverwrite?: ComparisonOverwriteNotice;
   liveSourcePath?: string | null;
   liveSourceVersion?: string | null;
   liveSourceChanged?: boolean;
@@ -179,6 +187,7 @@ interface StoredComparison
     expectedDisk: SyncDisk | null;
     writeFile: boolean;
     reason: string;
+    overwriteNotice?: ComparisonOverwriteNotice;
     uiDrafts?: Record<string, unknown>;
     generation?: number;
     publishedIdentity?: {
@@ -1593,6 +1602,25 @@ export class ComparisonStore {
           "Conflict resolution requires the inspected conflict choice",
         );
       const changed = !sameReviewDraft(candidate, latest);
+      const overwriteNotice: ComparisonOverwriteNotice | undefined =
+        request.reason === "resolve" &&
+        request.resolution?.choice === "local" &&
+        changed
+          ? {
+              operationId: operation.operationId,
+              pageInstanceId: operation.pageInstanceId,
+              displacedSignature: reviewDraftSignature(latest),
+              checkpointId: this.checkpoint(id, {
+                pageInstanceId: "displaced-overwrite",
+                generation: review.revision,
+                conflictId: operation.operationId,
+                workingDraft: latest,
+                reason:
+                  "Saved review before another tab overwrote conflicting changes",
+              }).checkpointId,
+              createdAt: new Date().toISOString(),
+            }
+          : undefined;
       const writeFile =
         request.writeFile === true &&
         Boolean(review.destinationPath) &&
@@ -1633,6 +1661,7 @@ export class ComparisonStore {
             expectedDisk: freshDisk,
             writeFile: true,
             reason: request.reason,
+            ...(overwriteNotice ? { overwriteNotice } : {}),
           };
           this.save(review);
           const verify = () => {
@@ -1689,6 +1718,7 @@ export class ComparisonStore {
           });
         }
         this.installDraft(review, candidate);
+        if (overwriteNotice) review.lastOverwrite = overwriteNotice;
         if (
           finalDisk &&
           finalDisk.availability === "available" &&
@@ -1762,6 +1792,13 @@ export class ComparisonStore {
           fileWritten: writeFile,
           reason: request.reason,
         });
+        if (overwriteNotice)
+          log("sync-overwrite", {
+            id,
+            operationId: operation.operationId,
+            checkpointId: overwriteNotice.checkpointId,
+            displacedSignature: overwriteNotice.displacedSignature,
+          });
         return completed;
       } catch (error) {
         if (error instanceof FileChangedError) {
@@ -2173,6 +2210,7 @@ export class ComparisonStore {
       delete copy.pendingPublication;
       delete copy.operationOutcomes;
       delete copy.lastOperation;
+      delete copy.lastOverwrite;
       this.installDraft(copy, draft);
       const record = this.operations.begin(operation, copy.id);
       // The accepted operation already names the new review. Persist its intent
@@ -2366,6 +2404,7 @@ export class ComparisonStore {
       (ownedFile && disk?.path === intent.path && disk.text === clean)
     ) {
       this.installDraft(review, intent.draft);
+      if (intent.overwriteNotice) review.lastOverwrite = intent.overwriteNotice;
       if (disk && intent.writeFile) {
         syncExistingFile(disk.path);
         review.savedPath = disk.path;

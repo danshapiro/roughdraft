@@ -8,9 +8,9 @@ import {
 } from "@roughdraft/rfm";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createApp } from "./index.js";
-import type { Comparison } from "./comparisons.js";
 import { ComparisonOperations } from "./comparison-operations.js";
+import type { Comparison } from "./comparisons.js";
+import { createApp } from "./index.js";
 
 describe("guarded live review reconciliation", () => {
   const parent = fileURLToPath(
@@ -1215,5 +1215,83 @@ describe("guarded live review reconciliation", () => {
       detachedReason: "Agent rewrote it",
     });
     expect(legacy.body.outdatedSuggestions).toEqual(next.outdatedSuggestions);
+  });
+  it("retains the displaced snapshot and overwrite notice through later saves, legacy drafts and restart", async () => {
+    const base = await open("none");
+    const route = `/api/comparisons/${base.review.id}`;
+    const incoming = await api()
+      .post(`${route}/reconcile`)
+      .send({
+        ...payload(
+          base,
+          draft(base, original.replace("First", "Incoming first")),
+          "notice-incoming",
+          "peer",
+        ),
+        writeFile: false,
+      });
+    expect(incoming.body.status).toBe("committed");
+    const local = draft(base, original.replace("First", "Local first"));
+    const resolved = await api()
+      .post(`${route}/reconcile`)
+      .send({
+        ...payload(
+          incoming.body.state,
+          local,
+          "notice-overwrite",
+          "resolver",
+          2,
+        ),
+        reason: "resolve",
+        resolution: {
+          choice: "local",
+          signature: "browser-inspected-conflict",
+        },
+        writeFile: false,
+      });
+    expect(resolved.body.status).toBe("committed");
+    const notice = resolved.body.state.review.lastOverwrite;
+    expect(notice).toMatchObject({
+      operationId: "notice-overwrite",
+      pageInstanceId: "resolver",
+      displacedSignature: incoming.body.state.signature,
+      checkpointId: expect.any(String),
+    });
+    const checkpoint = await api().get(
+      `${route}/checkpoints/${notice.checkpointId}`,
+    );
+    expect(checkpoint.body.workingDraft).toEqual(incoming.body.state.draft);
+    const next = resolved.body.state as SyncState<Comparison>;
+    const ordinary = await api()
+      .post(`${route}/reconcile`)
+      .send({
+        ...payload(
+          next,
+          draft(next, next.draft.markdown.replace("Second", "Later second")),
+          "notice-later",
+          "resolver",
+          3,
+        ),
+        writeFile: false,
+      });
+    expect(ordinary.body.status).toBe("committed");
+    expect(ordinary.body.state.review.lastOverwrite).toEqual(notice);
+    const legacy = await api().post(`${route}/draft`).send({
+      revision: ordinary.body.state.revision,
+      markdown: ordinary.body.state.draft.markdown,
+      decisions: {},
+      reviewComments: [],
+    });
+    expect(legacy.status).toBe(200);
+    expect(legacy.body.lastOverwrite).toEqual(notice);
+    host.dispose();
+    host = freshHost();
+    expect(
+      (await api().get(`${route}/state`)).body.review.lastOverwrite,
+    ).toEqual(notice);
+    expect(
+      (await api().get(`${route}/checkpoints/${notice.checkpointId}`)).body
+        .workingDraft,
+    ).toEqual(incoming.body.state.draft);
   });
 });
