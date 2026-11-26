@@ -44,7 +44,11 @@ const same = (a: unknown, b: unknown) =>
 const object = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
-function identityItems(draft: SyncDraft, parsed: RfmReviewItem[]) {
+function identityItems(
+  draft: SyncDraft,
+  parsed: RfmReviewItem[],
+  attachmentContext = false,
+) {
   const items = new Map<string, unknown>();
   for (const item of parsed) {
     items.set(item.id, {
@@ -56,7 +60,13 @@ function identityItems(draft: SyncDraft, parsed: RfmReviewItem[]) {
       parentId: item.parentId,
       author: item.author,
       createdAt: item.createdAt,
-      context: draft.markdown.slice(Math.max(0, item.offset - 40), item.offset),
+      ...(attachmentContext
+        ? {
+            context: cleanRoughdraftMarkdown(
+              draft.markdown.slice(0, item.offset),
+            ).slice(-40),
+          }
+        : {}),
     });
   }
   for (const comment of draft.reviewComments) {
@@ -198,6 +208,37 @@ function combinedComments(
     cleanRoughdraftMarkdown(incoming) !== clean
   )
     return null;
+  // A shared anchored comment is one diff token. An independent pending
+  // insertion immediately beside it can therefore share its replacement
+  // range even though the original comment's exact bytes are unchanged.
+  const existingIds = new Set(
+    extractRoughdraftReviewIndex(base).items.map((item) => item.id),
+  );
+  const annotationExtension = (extended: string, shared: string) => {
+    if (!shared) return null;
+    const at = extended.indexOf(shared);
+    if (at < 0 || extended.indexOf(shared, at + 1) >= 0) return null;
+    const extras = extended.slice(0, at) + extended.slice(at + shared.length);
+    if (!extras || cleanRoughdraftMarkdown(extras) !== "") return null;
+    const additions = extractRoughdraftReviewIndex(extras).items;
+    const sharedIds = new Set(
+      extractRoughdraftReviewIndex(shared).items.map((item) => item.id),
+    );
+    return additions.length &&
+      additions.every(
+        (item) =>
+          !existingIds.has(item.id) &&
+          !sharedIds.has(item.id) &&
+          item.endOffset > item.offset &&
+          (item.kind !== "suggestion" || item.suggestionKind === "addition"),
+      )
+      ? extended
+      : null;
+  };
+  const extension =
+    annotationExtension(local, incoming) ??
+    annotationExtension(incoming, local);
+  if (extension !== null) return extension;
   const sources = [base, local, incoming];
   const entries = sources.map(
     (source) => extractRoughdraftReviewIndex(source).items,
@@ -413,12 +454,15 @@ export function mergeReviewDrafts(
     );
     const used = new Set(indexes.flatMap((items) => [...items.keys()]));
     const mapping: Record<string, string> = {};
-    for (const [id, item] of indexes[1]) {
-      if (
-        !indexes[0].has(id) &&
-        indexes[2].has(id) &&
-        !same(item, indexes[2].get(id))
-      ) {
+    let attachments: Map<string, unknown>[] | undefined;
+    for (const id of indexes[1].keys()) {
+      if (indexes[0].has(id) || !indexes[2].has(id)) continue;
+      // Only simultaneous new IDs need attachment comparison. Existing review
+      // IDs retain their identity when nearby pending markup changes spelling.
+      attachments ??= [local, incoming].map((draft, index) =>
+        identityItems(draft, parsed[index + 1], true),
+      );
+      if (!same(attachments[0].get(id), attachments[1].get(id))) {
         if (options.server)
           throw new UnsupportedReviewMerge(
             "New review IDs collide; the browser must renumber its own items.",

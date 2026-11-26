@@ -28,6 +28,43 @@ const proposal = (body: string, id: string) =>
   `${body}\n\n---\nsuggestions:\n  ${id}:\n    by: AI\n    at: "2026-11-26T12:00:00.000Z"\n`;
 
 describe("review three-way reconciliation", () => {
+  it.each([
+    ["proposal", "Existing {++shared++}{#s1}", "s1"],
+    ["comment", "{==Existing==}{>>shared<<}{#c1}", "c1"],
+  ])("nearby pending markup does not duplicate a shared %s at the same accepted attachment", (_kind, shared, id) => {
+    const base = draft("Lead. Existing.\n");
+    const incoming = draft(`Lead. ${shared}.\n`);
+    const local = draft(`Lead. {++nearby++}{#s2}${shared}.\n`);
+    const result = mergeReviewDrafts(base, local, incoming, {
+      server: false,
+      budgetMs: 100,
+    });
+    expect(result.idRemap).toBeUndefined();
+    expect(result.status).toBe("merged");
+    const sharedItems = extractRoughdraftReviewIndex(
+      result.draft.markdown,
+    ).items.filter((item) => item.id === id);
+    expect(sharedItems).toHaveLength(1);
+    expect(sharedItems[0].text).toBe("shared");
+    expect(result.draft.markdown).toContain("{++nearby++}{#s2}");
+  });
+
+  it("literal markup remains part of accepted attachment context for genuinely different new items", () => {
+    const base = draft("Lead. Existing.\n");
+    const local = draft("Lead. `{++one++}{#s9}` Existing {++same++}{#s1}.\n");
+    const incoming = draft(
+      "Lead. `{++two++}{#s9}` Existing {++same++}{#s1}.\n",
+    );
+    const result = mergeReviewDrafts(base, local, incoming, {
+      server: false,
+      budgetMs: 100,
+    });
+    expect(result.idRemap).toEqual({ s1: "s2" });
+    expect(result.status).toBe("conflict");
+    expect(result.draft.markdown).toContain("`{++one++}{#s9}`");
+    expect(result.draft.markdown).not.toContain("{#s10}");
+  });
+
   it("materializes the same undated original comment once using its committed import date", () => {
     const markdown = "{==Text==}{>>An imported comment<<}{#c1}\n";
     const base = draft(markdown);
