@@ -1,0 +1,561 @@
+import { diffArrays } from "diff";
+import {
+  cleanRoughdraftMarkdown,
+  extractRoughdraftReviewIndex,
+  type RfmReviewItem,
+} from "./index.js";
+import { renumberReviewDraft } from "./review-identities.js";
+import type {
+  SyncConflict,
+  SyncDraft,
+  SyncHistory,
+  SyncMerge,
+} from "./review-sync.js";
+import {
+  canonicalValue,
+  contentSignature,
+  normalizedReviewComment,
+  reviewDraftSignature,
+  sameReviewDraft,
+} from "./review-values.js";
+import {
+  patchReviewYaml,
+  splitReviewSource,
+  UnsupportedReviewMerge,
+} from "./review-yaml.js";
+
+export { renumberReviewDraft, reviewDraftSignature, sameReviewDraft };
+export interface ReviewMergeOptions {
+  server?: boolean;
+  budgetMs?: number;
+  resolution?: "local" | "incoming";
+  projectedCleanMarkdown?: string;
+}
+interface Change {
+  from: number;
+  to: number;
+  text: string;
+  side: "local" | "incoming";
+}
+const same = (a: unknown, b: unknown) =>
+  a === undefined || b === undefined
+    ? a === b
+    : canonicalValue(a) === canonicalValue(b);
+const object = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
+function identityItems(draft: SyncDraft) {
+  const items = new Map<string, unknown>();
+  for (const item of extractRoughdraftReviewIndex(draft.markdown).items) {
+    items.set(item.id, {
+      kind: item.kind,
+      text: item.text,
+      originalText: item.originalText,
+      replacementText: item.replacementText,
+      anchorText: item.anchorText,
+      parentId: item.parentId,
+      author: item.author,
+      createdAt: item.createdAt,
+      context: draft.markdown.slice(Math.max(0, item.offset - 40), item.offset),
+    });
+  }
+  for (const comment of draft.reviewComments) {
+    const previous = items.get(comment.id);
+    items.set(comment.id, {
+      represented: previous,
+      sidecar: normalizedReviewComment(comment),
+    });
+  }
+  for (const history of draft.reviewed ?? []) items.set(history.id, history);
+  for (const proposal of draft.outdatedSuggestions ?? [])
+    items.set(proposal.id, proposal);
+  return items;
+}
+
+function nextIdentity(id: string, used: Set<string>) {
+  const numbered = /^(.*?)(\d+)$/.exec(id);
+  const prefix = numbered?.[1] ?? `${id}-`;
+  let next = numbered ? Number(numbered[2]) + 1 : 2;
+  for (const value of used) {
+    if (!value.startsWith(prefix)) continue;
+    const suffix = value.slice(prefix.length);
+    if (/^\d+$/.test(suffix)) next = Math.max(next, Number(suffix) + 1);
+  }
+  while (used.has(`${prefix}${next}`)) next++;
+  return `${prefix}${next}`;
+}
+
+function tokenize(source: string): string[] {
+  const ranges: Array<{ from: number; to: number }> = [];
+  if (source.includes("{")) {
+    for (const item of extractRoughdraftReviewIndex(source).items) {
+      if (item.endOffset <= item.offset) continue;
+      const anchor =
+        item.anchorText === undefined ? "" : `{==${item.anchorText}==}`;
+      const from =
+        anchor && source.slice(0, item.offset).endsWith(anchor)
+          ? item.offset - anchor.length
+          : item.offset;
+      ranges.push({ from, to: item.endOffset });
+    }
+  }
+  for (const match of source.matchAll(
+    /^([ \t]*)(`{3,}|~{3,})[^\r\n]*\r?\n/gm,
+  )) {
+    const marker = match[2];
+    const closing = new RegExp(
+      `^${match[1]}${marker[0] === "`" ? "`" : "~"}{${marker.length},}[ \\t]*(?:\\r?\\n|$)`,
+      "gm",
+    );
+    closing.lastIndex = match.index + match[0].length;
+    const end = closing.exec(source);
+    if (end) ranges.push({ from: match.index, to: end.index + end[0].length });
+  }
+  ranges.sort((a, b) => a.from - b.from || b.to - a.to);
+  const merged: typeof ranges = [];
+  for (const range of ranges) {
+    const last = merged.at(-1);
+    if (last && range.from <= last.to) last.to = Math.max(last.to, range.to);
+    else merged.push({ ...range });
+  }
+  const tokens: string[] = [];
+  let position = 0;
+  const plain = (text: string) =>
+    tokens.push(...(text.match(/\r\n|\n|[ \t]+|[^\s\p{P}\p{S}]+|./gu) ?? []));
+  for (const range of merged) {
+    plain(source.slice(position, range.from));
+    tokens.push(source.slice(range.from, range.to));
+    position = range.to;
+  }
+  plain(source.slice(position));
+  return tokens;
+}
+
+function changes(
+  base: string[],
+  next: string[],
+  side: Change["side"],
+  remaining: number,
+): Change[] {
+  const parts = Number.isFinite(remaining)
+    ? diffArrays(base, next, { timeout: Math.max(1, remaining) })
+    : diffArrays(base, next);
+  if (!parts)
+    throw new UnsupportedReviewMerge(
+      "The bounded comparison needs the browser merge path.",
+    );
+  const result: Change[] = [];
+  let from = 0;
+  let pending: Change | null = null;
+  for (const part of parts) {
+    if (part.added || part.removed) {
+      pending ??= { from, to: from, text: "", side };
+      if (part.added) pending.text += part.value.join("");
+      else {
+        from += part.value.length;
+        pending.to = from;
+      }
+    } else {
+      if (pending) result.push(pending);
+      pending = null;
+      from += part.value.length;
+    }
+  }
+  if (pending) result.push(pending);
+  return result;
+}
+
+function overlapping(a: Change, b: Change) {
+  if (a.from === a.to) return a.from >= b.from && a.from <= b.to;
+  if (b.from === b.to) return b.from >= a.from && b.from <= a.to;
+  return a.from < b.to && b.from < a.to;
+}
+
+function renderRange(
+  base: string[],
+  from: number,
+  to: number,
+  edits: Change[],
+) {
+  let text = "";
+  let position = from;
+  for (const edit of edits.sort((a, b) => a.from - b.from)) {
+    text += base.slice(position, edit.from).join("") + edit.text;
+    position = edit.to;
+  }
+  return text + base.slice(position, to).join("");
+}
+
+/** A same-anchor discussion can gain independent threads without text conflict. */
+function combinedComments(
+  base: string,
+  local: string,
+  incoming: string,
+): string | null {
+  const clean = cleanRoughdraftMarkdown(base);
+  if (
+    cleanRoughdraftMarkdown(local) !== clean ||
+    cleanRoughdraftMarkdown(incoming) !== clean
+  )
+    return null;
+  const sources = [base, local, incoming];
+  const entries = sources.map(
+    (source) => extractRoughdraftReviewIndex(source).items,
+  );
+  if (
+    entries.some((items) =>
+      items.some(
+        (item) => item.kind === "suggestion" || item.anchorText === undefined,
+      ),
+    )
+  )
+    return null;
+  const chosen = new Map<string, { source: string; item: RfmReviewItem }>();
+  const maps = entries.map(
+    (items, index) =>
+      new Map(items.map((item) => [item.id, { source: sources[index], item }])),
+  );
+  for (const id of new Set([
+    ...maps[0].keys(),
+    ...maps[1].keys(),
+    ...maps[2].keys(),
+  ])) {
+    const [before, left, right] = maps.map((map) => map.get(id));
+    const raw = (value: typeof before) =>
+      value
+        ? value.source.slice(value.item.offset, value.item.endOffset)
+        : undefined;
+    const b = raw(before),
+      l = raw(left),
+      r = raw(right);
+    const next = l === r || r === b ? left : l === b ? right : undefined;
+    if (!next && l !== undefined && r !== undefined && l !== r) return null;
+    if (next) chosen.set(id, next);
+  }
+  const anchors = new Map<
+    string,
+    { from: number; to: number; raw: string; comments: string[] }
+  >();
+  for (const { source, item } of chosen.values()) {
+    const anchor = `{==${item.anchorText}==}`;
+    const start = source.lastIndexOf(anchor, item.offset);
+    if (start < 0) return null;
+    const from = cleanRoughdraftMarkdown(source.slice(0, start)).length;
+    if (item.anchorText === undefined) return null;
+    const to = from + cleanRoughdraftMarkdown(item.anchorText).length;
+    const key = `${from}:${to}`;
+    const group = anchors.get(key) ?? { from, to, raw: anchor, comments: [] };
+    if (group.raw !== anchor) return null;
+    group.comments.push(source.slice(item.offset, item.endOffset));
+    anchors.set(key, group);
+  }
+  let result = clean;
+  let position = clean.length + 1;
+  for (const anchor of [...anchors.values()].sort((a, b) => b.from - a.from)) {
+    if (anchor.to > position) return null;
+    result =
+      result.slice(0, anchor.from) +
+      anchor.raw +
+      anchor.comments.join("") +
+      result.slice(anchor.to);
+    position = anchor.from;
+  }
+  return result;
+}
+
+export function mergeReviewDrafts(
+  base: SyncDraft,
+  submitted: SyncDraft,
+  incoming: SyncDraft,
+  options: ReviewMergeOptions = {},
+): SyncMerge {
+  const begin = performance.now();
+  const budget =
+    options.budgetMs ?? (options.server ? 16 : Number.POSITIVE_INFINITY);
+  const conflicts: SyncConflict[] = [];
+  const occurrence = new Map<string, number>();
+  let local = submitted;
+  let idRemap: Record<string, string> | undefined;
+  const remaining = () => budget - (performance.now() - begin);
+  const check = () => {
+    if (remaining() <= 0)
+      throw new UnsupportedReviewMerge("The comparison budget was exhausted.");
+  };
+  const conflict = (
+    kind: SyncConflict["kind"],
+    label: string,
+    before: unknown,
+    left: unknown,
+    right: unknown,
+  ) => {
+    const signature = contentSignature(
+      canonicalValue([kind, label, before, left, right]),
+    );
+    const count = occurrence.get(signature) ?? 0;
+    occurrence.set(signature, count + 1);
+    conflicts.push({
+      id: `${signature}-${count}`,
+      kind,
+      label,
+      base: before,
+      local: left,
+      incoming: right,
+    });
+    return options.resolution === "incoming" ? right : left;
+  };
+  const value = (
+    before: unknown,
+    left: unknown,
+    right: unknown,
+    kind: SyncConflict["kind"],
+    label: string,
+  ): unknown => {
+    const nullableCommentField =
+      kind === "comment" &&
+      /\.(?:authorType|authorId|parentCommentId|scope|originalQuote|detachedReason)$/.test(
+        label,
+      );
+    const equal = (a: unknown, b: unknown) =>
+      nullableCommentField ? same(a ?? null, b ?? null) : same(a, b);
+    if (equal(left, right) || equal(right, before)) return left;
+    if (equal(left, before)) return right;
+    if (
+      object(left) &&
+      object(right) &&
+      (before === undefined || before === null || object(before))
+    ) {
+      const previous = object(before) ? before : {};
+      const result: Record<string, unknown> = {};
+      for (const key of new Set([
+        ...Object.keys(right),
+        ...Object.keys(left),
+        ...Object.keys(previous),
+      ])) {
+        const merged = value(
+          previous[key],
+          left[key],
+          right[key],
+          kind,
+          `${label}.${key}`,
+        );
+        if (merged !== undefined) result[key] = merged;
+      }
+      return result;
+    }
+    return conflict(kind, label, before, left, right);
+  };
+  const collection = <T extends { id: string }>(
+    before: T[] = [],
+    left: T[] = [],
+    right: T[] = [],
+    kind: SyncConflict["kind"],
+  ): T[] => {
+    const maps = [before, left, right].map(
+      (items) => new Map(items.map((item) => [item.id, item])),
+    );
+    const result: T[] = [];
+    for (const id of new Set([
+      ...right.map((item) => item.id),
+      ...left.map((item) => item.id),
+      ...before.map((item) => item.id),
+    ])) {
+      const item = value(
+        maps[0].get(id),
+        maps[1].get(id),
+        maps[2].get(id),
+        kind,
+        `${kind}:${id}`,
+      );
+      if (item !== undefined) result.push(item as T);
+    }
+    return result;
+  };
+  try {
+    check();
+    if (
+      options.server &&
+      [base, local, incoming].some((draft) => draft.markdown.length > 50 * 1024)
+    )
+      throw new UnsupportedReviewMerge(
+        "Large documents use the bounded browser merge path.",
+      );
+    const indexes = [base, local, incoming].map(identityItems);
+    const used = new Set(indexes.flatMap((items) => [...items.keys()]));
+    const mapping: Record<string, string> = {};
+    for (const [id, item] of indexes[1]) {
+      if (
+        !indexes[0].has(id) &&
+        indexes[2].has(id) &&
+        !same(item, indexes[2].get(id))
+      ) {
+        if (options.server)
+          throw new UnsupportedReviewMerge(
+            "New review IDs collide; the browser must renumber its own items.",
+          );
+        const replacement = nextIdentity(id, used);
+        mapping[id] = replacement;
+        used.add(replacement);
+      }
+    }
+    if (Object.keys(mapping).length) {
+      local = renumberReviewDraft(local, mapping);
+      idRemap = mapping;
+    }
+    check();
+    const parity = [base, local, incoming].every(
+      (draft) =>
+        cleanRoughdraftMarkdown(draft.markdown) ===
+        (draft.cleanMarkdown ?? draft.markdown),
+    );
+    if (options.server && !parity)
+      throw new UnsupportedReviewMerge(
+        "The annotated and clean browser projections require client reconciliation.",
+      );
+    const parts = [base, local, incoming].map((draft) =>
+      splitReviewSource(draft.markdown),
+    );
+    check();
+    const metadata = (key: "frontmatter" | "endmatter") => {
+      const [b, l, r] = parts.map((part) => part[key]);
+      const merged = value(b?.data, l?.data, r?.data, "metadata", key) as
+        | Record<string, unknown>
+        | undefined;
+      if (!merged) return "";
+      for (const block of [r, l, b]) {
+        if (block && same(block.data, merged))
+          return block.prefix + block.source + block.suffix;
+      }
+      const basis = r ?? l ?? b;
+      if (!basis) return "";
+      return basis.prefix + patchReviewYaml(basis, merged, l, r) + basis.suffix;
+    };
+    const frontmatter = metadata("frontmatter");
+    const endmatter = metadata("endmatter");
+    const [beforeBody, localBody, incomingBody] = parts.map(
+      (part) => part.body,
+    );
+    let body: string;
+    if (localBody === incomingBody || incomingBody === beforeBody)
+      body = localBody;
+    else if (localBody === beforeBody) body = incomingBody;
+    else {
+      const tokens = tokenize(beforeBody);
+      const patches = [
+        ...changes(tokens, tokenize(localBody), "local", remaining()),
+        ...changes(tokens, tokenize(incomingBody), "incoming", remaining()),
+      ].sort((a, b) => a.from - b.from || a.to - b.to);
+      body = "";
+      let position = 0;
+      for (let index = 0; index < patches.length; ) {
+        check();
+        const group = [patches[index++]];
+        while (
+          index < patches.length &&
+          group.some((item) => overlapping(item, patches[index]))
+        )
+          group.push(patches[index++]);
+        const from = Math.min(...group.map((item) => item.from));
+        const to = Math.max(...group.map((item) => item.to));
+        body += tokens.slice(position, from).join("");
+        const left = group.filter((item) => item.side === "local");
+        const right = group.filter((item) => item.side === "incoming");
+        const before = tokens.slice(from, to).join("");
+        const l = renderRange(tokens, from, to, left);
+        const r = renderRange(tokens, from, to, right);
+        body += !left.length
+          ? r
+          : !right.length || l === r
+            ? l
+            : (combinedComments(before, l, r) ??
+              (conflict("text", "Document passage", before, l, r) as string));
+        position = to;
+      }
+      body += tokens.slice(position).join("");
+    }
+    check();
+    const markdown = frontmatter + body + endmatter;
+    const reviewed = collection(
+      base.reviewed,
+      local.reviewed,
+      incoming.reviewed,
+      "history",
+    );
+    const origin = reviewDraftSignature(base);
+    const mapped = reviewed.map((item): SyncHistory => {
+      const from = base.reviewed?.some((entry) => same(entry, item))
+        ? base
+        : incoming.reviewed?.some((entry) => same(entry, item))
+          ? incoming
+          : local;
+      if (from.markdown === markdown) return item;
+      return {
+        ...item,
+        stale: true,
+        staleReason:
+          item.stale && item.staleReason !== "needs-remap"
+            ? item.staleReason
+            : "needs-remap",
+        unmappedSince: item.unmappedSince ?? origin,
+        originSignature: item.originSignature ?? reviewDraftSignature(from),
+      };
+    });
+    const result: SyncDraft = {
+      markdown,
+      decisions: value(
+        base.decisions,
+        local.decisions,
+        incoming.decisions,
+        "decision",
+        "Decision",
+      ) as SyncDraft["decisions"],
+      reviewComments: collection(
+        base.reviewComments,
+        local.reviewComments,
+        incoming.reviewComments,
+        "comment",
+      ),
+      ...(mapped.length ? { reviewed: mapped } : {}),
+      ...(base.outdatedSuggestions?.length ||
+      local.outdatedSuggestions?.length ||
+      incoming.outdatedSuggestions?.length
+        ? {
+            outdatedSuggestions: collection(
+              base.outdatedSuggestions,
+              local.outdatedSuggestions,
+              incoming.outdatedSuggestions,
+              "suggestion",
+            ),
+          }
+        : {}),
+    };
+    if (!options.server && options.projectedCleanMarkdown !== undefined)
+      result.cleanMarkdown = options.projectedCleanMarkdown;
+    else if (parity) result.cleanMarkdown = cleanRoughdraftMarkdown(markdown);
+    else {
+      const exact = [local, incoming, base].find(
+        (draft) => draft.markdown === markdown,
+      );
+      if (exact) result.cleanMarkdown = exact.cleanMarkdown;
+    }
+    check();
+    const signature = conflicts.length
+      ? contentSignature(canonicalValue(conflicts))
+      : reviewDraftSignature(result);
+    return {
+      status: conflicts.length && !options.resolution ? "conflict" : "merged",
+      draft: result,
+      conflicts,
+      signature,
+      ...(idRemap ? { idRemap } : {}),
+    };
+  } catch (error) {
+    if (!(error instanceof UnsupportedReviewMerge)) throw error;
+    return {
+      status: "client-merge-required",
+      draft: submitted,
+      conflicts: [],
+      signature: reviewDraftSignature(submitted),
+      reason: error.message,
+    };
+  }
+}

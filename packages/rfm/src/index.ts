@@ -1,3 +1,12 @@
+export type { ReviewMergeOptions } from "./review-merge.js";
+export {
+  mergeReviewDrafts,
+  renumberReviewDraft,
+  reviewDraftSignature,
+  sameReviewDraft,
+} from "./review-merge.js";
+export type * from "./review-sync.js";
+
 export type RfmDiagnosticSeverity = "error" | "warning";
 
 export interface RfmDiagnostic {
