@@ -470,3 +470,71 @@ test("reopening after a completed copy can prefill a fresh default until the use
   ).toBe(next.path);
   expect(save).toHaveBeenCalledTimes(1);
 });
+
+test.each([
+  "success",
+  "failure",
+])("the initial name lookup settles before path editing, while Cancel stays available: %s", async (outcome) => {
+  vi.useFakeTimers();
+  let releaseStatus = (_value: null) => {};
+  const status = new Promise<null>((resolve) => {
+    releaseStatus = resolve;
+  });
+  let releaseDefault = (_value: CopyDestination) => {};
+  let rejectDefault = (_error: Error) => {};
+  const name = new Promise<CopyDestination>((resolve, reject) => {
+    releaseDefault = resolve;
+    rejectDefault = reject;
+  });
+  const inspect = vi.fn(async (path?: string) =>
+    path ? { ...destination, path, displayPath: path } : await name,
+  );
+  const save = vi.fn(async (path: string) => ({
+    status: "committed" as const,
+    savedPath: path,
+  }));
+  await act(async () =>
+    root.render(
+      <RevisionSaveCopyDialog
+        open
+        onOpenChange={() => {}}
+        inspect={inspect}
+        save={save}
+        unlock={() => {}}
+        checkStatus={async () => await status}
+      />,
+    ),
+  );
+  const input = document.querySelector<HTMLInputElement>(
+    '[data-testid="revision-copy-path"]',
+  );
+  if (!input) throw new Error("The copy path field is unavailable");
+  expect(input.disabled).toBe(true);
+  expect(confirm()?.disabled).toBe(true);
+  expect(document.body.textContent).toContain("Choosing a file name");
+  const cancel = [
+    ...document.querySelectorAll<HTMLButtonElement>("button"),
+  ].find((button) => button.textContent === "Cancel");
+  expect(cancel?.disabled).toBe(false);
+  await act(async () => releaseStatus(null));
+  expect(input.disabled).toBe(true);
+  await act(async () =>
+    outcome === "success"
+      ? releaseDefault(destination)
+      : rejectDefault(new Error("Default name lookup unavailable")),
+  );
+  expect(input.disabled).toBe(false);
+  expect(document.body.textContent).not.toContain("Choosing a file name");
+  expect(input.value).toBe(outcome === "success" ? destination.path : "");
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set?.call(input, "/after-ready-copy.md");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await act(async () => vi.advanceTimersByTimeAsync(250));
+  expect(confirm()?.disabled).toBe(false);
+  await act(async () => confirm()?.click());
+  expect(save).toHaveBeenCalledExactlyOnceWith("/after-ready-copy.md", false);
+});

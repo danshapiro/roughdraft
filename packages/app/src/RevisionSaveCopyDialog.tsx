@@ -45,6 +45,7 @@ export function RevisionSaveCopyDialog({
     null,
   );
   const [error, setError] = useState("");
+  const [initializing, setInitializing] = useState(true);
   const [composing, setComposing] = useState(false);
   const inspection = useRef(0);
   const pathEdits = useRef(0);
@@ -68,6 +69,7 @@ export function RevisionSaveCopyDialog({
   }, []);
   useEffect(() => {
     if (!open) return;
+    setInitializing(true);
     let active = true;
     const editVersion = pathEdits.current;
     inspection.current++;
@@ -111,14 +113,19 @@ export function RevisionSaveCopyDialog({
           editVersion === pathEdits.current
         )
           setError(caught instanceof Error ? caught.message : String(caught));
+      })
+      .finally(() => {
+        if (active) setInitializing(false);
       });
     return () => {
       active = false;
       inspection.current++;
+      if (alive.current) setInitializing(true);
     };
   }, [open]);
   useEffect(() => {
-    if (!open || !path || status !== "editing" || composing) return;
+    if (!open || !path || status !== "editing" || composing || initializing)
+      return;
     let active = true;
     const sequence = ++inspection.current;
     const timer = setTimeout(() => {
@@ -135,9 +142,9 @@ export function RevisionSaveCopyDialog({
       active = false;
       clearTimeout(timer);
     };
-  }, [path, open, status, composing, inspect]);
+  }, [path, open, status, composing, initializing, inspect]);
   async function submit() {
-    if (pending.current) return;
+    if (pending.current || initializing) return;
     if (composing) {
       setError(
         "Finish typing the path before saving. Cancel remains available.",
@@ -311,7 +318,8 @@ export function RevisionSaveCopyDialog({
                 className="min-h-11 text-base"
                 data-testid="revision-copy-path"
                 value={path}
-                disabled={status === "saving"}
+                disabled={status === "saving" || initializing}
+                aria-busy={initializing}
                 onCompositionStart={() => setComposing(true)}
                 onCompositionEnd={() => setComposing(false)}
                 onChange={(event) => {
@@ -324,6 +332,7 @@ export function RevisionSaveCopyDialog({
                 }}
               />
             </label>
+            {initializing && <p role="status">Choosing a file name…</p>}
             {destination?.relativeLinks.length ? (
               <div className="space-y-2 rounded border p-3 text-sm">
                 <p>
@@ -376,6 +385,7 @@ export function RevisionSaveCopyDialog({
                   data-testid="revision-save-copy-confirm"
                   disabled={
                     status === "saving" ||
+                    initializing ||
                     !path ||
                     !destination?.allowed ||
                     Boolean(destination.relativeLinks.length && !acknowledged)
