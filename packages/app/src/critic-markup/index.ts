@@ -48,6 +48,8 @@ export interface CriticComment {
   authorId?: string | null;
   parentCommentId?: string | null;
   scope?: "document";
+  originalQuote?: string;
+  detachedReason?: string;
 }
 
 export interface CriticCommentThread {
@@ -58,6 +60,8 @@ export interface CriticCommentThread {
 export interface CriticMarkdownOptions extends MarkdownOptions {
   /** Explicit compatibility mode for code reviews authored before the marker. */
   legacyCodeComments?: boolean;
+  /** Global definition labels when parsing one unchanged-context source block. */
+  endnoteDefinitions?: ReadonlySet<string>;
 }
 
 export type { CriticChangeAttrs, CriticChangeKind };
@@ -380,6 +384,14 @@ function addEndmatterFeedback(
       }),
     );
   }
+}
+
+/** Read review registry data without rendering the document again. */
+export function readReviewEndmatter(endmatter?: string | null) {
+  const metadata = parseReviewEndmatter(endmatter);
+  const comments = new Map<string, CriticComment>();
+  addEndmatterFeedback(comments, metadata);
+  return { metadata, comments };
 }
 
 function areEndmatterEntriesEqual(
@@ -1648,7 +1660,7 @@ function createCriticMarked(
     async: false,
     renderer,
   });
-  parser.use(endnoteExtension());
+  parser.use(endnoteExtension(undefined, markdownOptions?.endnoteDefinitions));
 
   parser.use({
     extensions: [
@@ -1891,14 +1903,35 @@ export function criticMarkdownToEditorState(
   endmatter: string | null;
 } {
   const { frontmatter, body, endmatter } = splitYamlDocumentMetadata(markdown);
-  const parsedEndmatter = parseReviewEndmatter(endmatter);
-  const { parser, comments } = createCriticMarked(options, parsedEndmatter);
+  return criticMarkdownBodyToEditorState(
+    body,
+    {
+      frontmatter,
+      endmatter,
+      review: parseReviewEndmatter(endmatter),
+    },
+    options,
+  );
+}
+
+/** Parse a body block using its containing document's already-read metadata. */
+export function criticMarkdownBodyToEditorState(
+  body: string,
+  context: {
+    frontmatter: string | null;
+    endmatter: string | null;
+    review: ParsedEndmatter;
+  },
+  options?: CriticMarkdownOptions,
+): ReturnType<typeof criticMarkdownToEditorState> {
+  const { frontmatter, endmatter, review } = context;
+  const { parser, comments } = createCriticMarked(options, review);
   const html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
   const doc = markBlockChangeContent(parseHtml(html)) as JSONContent & {
     yamlFrontmatter?: string;
     yamlEndmatter?: string;
   };
-  addEndmatterFeedback(comments, parsedEndmatter);
+  addEndmatterFeedback(comments, review);
   if (frontmatter) {
     doc.yamlFrontmatter = frontmatter;
   }

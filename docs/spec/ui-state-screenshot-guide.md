@@ -234,7 +234,31 @@ Before/Diff/After comparison views. Use only disposable fixture documents.
 
 ## Single editor
 
-Capture the rendered editor with no reference, a comparison with an unreviewed change, and a pending suggestion overlapping a reference change. In each state, include the compact header at a scrolled position. Capture the Markdown icon view at that same passage, the Read/Edit/Suggest dropdown, and file details with friendly version labels and full source paths. Capture an agent-selected destination, explicit-none review-only editing, the quiet saved icon and an external file conflict with unsaved text visible. Capture a stale-browser conflict and its Preserve this review action, followed by the detached saved-review confirmation. Chat reviews have no Send feedback action; capture that action separately for explicit button handoff and legacy waiting reviews.
+Capture the rendered editor with no reference, a comparison with an unreviewed change, and a pending suggestion overlapping a reference change. In each state, include the compact header at a scrolled position. Capture the Markdown icon view at that same passage, the Read/Edit/Suggest dropdown, and file details with friendly version labels and full source paths. Capture an agent-selected destination, explicit-none review-only editing, the quiet saved icon and an external file conflict with unsaved text visible. Capture the unified conflict actions and Save separately path/success dialogs described below. Chat reviews have no Send feedback action; capture that action separately for explicit button handoff and legacy waiting reviews.
+
+## Unified live updates and recovery
+
+Use the maintained complete editing fixture, with Keep `s10` and Revert `s11` prepared for History. For file writes use a fresh practice file beside copies of its linked images/documents. The normal live-update view should have no conflict banner for independent edits, saved feedback, equal-content replacements or this page's own save.
+
+| State | Prepare | Capture and verify |
+| --- | --- | --- |
+| Safe outside update | Change another paragraph on disk or in another tab | Updated passage with the current caret, reading position, local Undo and active comment draft retained. Include an agent edit to a saved commented passage. |
+| True overlap | Change the same passage locally and externally | Visible Discard my changes, Overwrite with my changes, Save separately and Compare changes; helper text says only overlapping changes are replaced. Actions stay reachable outside More. |
+| Compare and confirmation | Open Compare changes, then a destructive action | My version and Latest version, stacked on a phone; overlap count matches the confirmation. An unrelated new edit keeps the confirmation usable; a changed overlap refreshes it. |
+| Outside update waiting | Make a source mapping/composition unsafe | Specific waiting explanation, preserved local buffer, Reload from file, keep feedback when applicable, and Save separately. No fabricated content conflict. |
+| Missing or unwritable file | Rename/remove the practice file or use a read-only practice directory | Actual failure, visible recovery status and available actions; no false Saved indicator. Include an unobservable single-file mount when supported by the harness. |
+| Recovery checkpoint | Leave a conflict open while typing | Checkpoint pending/saved/error status and separate Recovery copies in Review details; open both the initial and latest saved snapshots. Inspect unfinished feedback and explicitly restore it to unchanged comment targets, including a changed-target refusal and checkpoint failure. User-created copies remain distinct. |
+| Another tab overwrites a conflict | Resolve an overlap in favour of the other tab's text | A non-blocking notice links the displaced recovery copy. Include reconnecting after the overwrite; opening recovery must not block current editing or replace its text. |
+| Copy path dialog | Click Save separately | Editable unused path, installation/folder label, working-draft explanation, Cancel and Save copy. Include long/root-relative paths, existing-path error and a changed-folder relative-link acknowledgment. |
+| Saved separately | Complete the copy | Popup remains open with the actual returned path, Copy path, Open saved review and Done. Header destination changes only with the intended session switch. |
+| Slow/uncertain copy | Delay or lose the save response beyond the lock bound | Save status unknown, original editor usable with writes paused; repeated requests use the same identity. Late success shows path/link without moving newer typing into the older copy. |
+| Reload/reconnect | Reload during rejected, never-received and committed-but-unacknowledged saves | Normal saving resumes after a definite outcome; a genuinely indeterminate result exposes Retry save status, Compare latest and Save separately while keeping edits. |
+| Detached feedback | Replace the passage carrying a saved comment/suggestion | Original quoted context and displaced proposal remain available with their author, time and replies, without an Overwrite action that restores old agent text. |
+| History mapping | Rebase around earlier decisions and repeated text | Reopen remains available only after exact mapping/validation; unsafe entries explain why they are unavailable. Reopen scrolls to the correct passage. |
+
+Repeat applicable recovery states across Read/Edit/Suggest, Changes/Original/Final and formatted/Markdown views. The dialog must say it saves the working draft when an outcome is visible. Capture 390px folded, 840px unfolded, desktop, landscape and short keyboard viewports. Resize with an open path field and reply draft; controls remain reachable, touch targets remain at least 44px and neither draft is lost. Use real Android/Gboard when available and record its absence separately from viewport emulation.
+
+Capture rapid remote updates while typing in the 100 KiB fixture. Verify unchanged blocks do not repeatedly parse, independent pages continue saving, and the receiving page stays responsive. Include concurrent new comment/suggestion IDs, an open reply during renumbering, local Undo/Redo and reload before acknowledgment. Use the shared stream on supported raw HTTP and the visible-only short-request fallback otherwise; eight tabs must still save promptly.
 
 
 ## Mobile and foldable layouts

@@ -19,8 +19,9 @@ export const noteId = (label: string) =>
 // A caller parsing a display projection can retain the full-document numbering.
 export function endnoteExtension(
   numbers = new Map<string, number>(),
+  knownDefinitions?: ReadonlySet<string>,
 ): MarkedExtension {
-  const definitions = new Set<string>();
+  const definitions = new Set<string>(knownDefinitions);
   const occurrences = new Map<string, number>();
   const numberFor = (label: string) => {
     const key = noteKey(label);

@@ -22,6 +22,11 @@ import {
   type CriticCommentThread,
 } from "./critic-markup";
 import { cn } from "./lib/utils";
+import {
+  commentDraftMatchesTarget,
+  privateRootTarget,
+  useRevisionUiDrafts,
+} from "./revision-ui-drafts";
 
 interface CommentEditorListProps {
   comments: CriticComment[];
@@ -117,6 +122,8 @@ export function CommentEditorList({
   renderCommentContent,
   getCommentActions,
 }: CommentEditorListProps) {
+  const { store: recoveryStore, snapshot: recoveryDrafts } =
+    useRevisionUiDrafts();
   const interactive = interactiveProp && !readOnly;
   const textareaRefs = useRef(new Map<string, HTMLTextAreaElement>());
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -130,6 +137,34 @@ export function CommentEditorList({
     () => new Map(comments.map((comment) => [comment.id, comment])),
     [comments],
   );
+  useEffect(() => {
+    if (!recoveryStore) return;
+    const relevant = comments.filter(
+      (comment) =>
+        recoveryDrafts.comments[comment.id] &&
+        commentDraftMatchesTarget(recoveryDrafts.comments[comment.id], comment),
+    );
+    if (!relevant.length) return;
+    setDrafts((current) => {
+      const next = { ...current };
+      for (const comment of relevant)
+        next[comment.id] = recoveryDrafts.comments[comment.id].value;
+      return Object.keys(next).every((id) => next[id] === current[id])
+        ? current
+        : next;
+    });
+    setEditingCommentIds((current) => {
+      const next = new Set(current);
+      for (const comment of relevant) {
+        const draft = recoveryDrafts.comments[comment.id];
+        originalContent.current.set(comment.id, draft.original);
+        if (draft.editing) next.add(comment.id);
+      }
+      return next.size === current.length && current.every((id) => next.has(id))
+        ? current
+        : [...next];
+    });
+  }, [comments, recoveryDrafts, recoveryStore]);
   const hasActiveSelection =
     !!selectedCommentId &&
     comments.some((comment) => comment.id === selectedCommentId);
@@ -153,7 +188,16 @@ export function CommentEditorList({
   };
 
   useEffect(() => {
-    const validCommentIds = new Set(comments.map((comment) => comment.id));
+    const validCommentIds = new Set(
+      comments
+        .filter((comment) =>
+          commentDraftMatchesTarget(
+            recoveryDrafts.comments[comment.id],
+            comment,
+          ),
+        )
+        .map((comment) => comment.id),
+    );
 
     setDrafts((current) =>
       Object.fromEntries(
@@ -165,7 +209,7 @@ export function CommentEditorList({
     setEditingCommentIds((current) =>
       current.filter((commentId) => validCommentIds.has(commentId)),
     );
-  }, [comments]);
+  }, [comments, recoveryDrafts]);
 
   useEffect(() => {
     if (!interactive) return;
@@ -214,10 +258,26 @@ export function CommentEditorList({
 
   if (comments.length === 0) return null;
 
+  const privateFields = (comment: CriticComment | undefined) => {
+    if (!comment || comment.content) return {};
+    if (comment.parentCommentId) return { target: comment };
+    const previous = recoveryDrafts.comments[comment.id];
+    return privateRootTarget(comment.id, previous) &&
+      commentDraftMatchesTarget(previous, comment)
+      ? { target: comment, anchor: previous.anchor }
+      : {};
+  };
+
   const startEditingComment = (commentId: string) => {
     const comment = commentMap.get(commentId);
     if (!comment) return;
     originalContent.current.set(commentId, comment.content);
+    recoveryStore?.setComment(commentId, {
+      value: drafts[commentId] ?? comment.content,
+      original: comment.content,
+      editing: true,
+      ...privateFields(comment),
+    });
 
     setDrafts((current) => ({
       ...current,
@@ -242,6 +302,7 @@ export function CommentEditorList({
 
     const nextContent = (drafts[commentId] ?? comment.content).trim();
     originalContent.current.delete(commentId);
+    recoveryStore?.setComment(commentId, null);
 
     if (nextContent.length === 0) {
       onDeleteComment(commentId);
@@ -265,6 +326,7 @@ export function CommentEditorList({
     if (!comment) return;
     const original = originalContent.current.get(commentId) ?? comment.content;
     originalContent.current.delete(commentId);
+    recoveryStore?.setComment(commentId, null);
 
     setDrafts((current) => {
       const nextDrafts = { ...current };
@@ -331,6 +393,15 @@ export function CommentEditorList({
           renderCommentContent={renderCommentContent}
           getCommentActions={getCommentActions}
           onChangeDraft={(commentId, nextContent) => {
+            recoveryStore?.setComment(commentId, {
+              value: nextContent,
+              original:
+                originalContent.current.get(commentId) ??
+                commentMap.get(commentId)?.content ??
+                "",
+              editing: true,
+              ...privateFields(commentMap.get(commentId)),
+            });
             setDrafts((current) => ({
               ...current,
               [commentId]: nextContent,
@@ -732,6 +803,19 @@ function CommentThreadNode({
               <div className="comment-author truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
                 {authorLabel}
               </div>
+              {comment.detachedReason && (
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {comment.detachedReason}
+                </p>
+              )}
+              {comment.originalQuote && (
+                <blockquote
+                  className="my-2 border-l-2 pl-3 text-sm whitespace-pre-wrap break-words"
+                  data-testid={`comment-${variant}-${comment.id}-original-quote`}
+                >
+                  {comment.originalQuote}
+                </blockquote>
+              )}
               <div
                 className={cn(
                   "comment-content mt-0.5 text-[13px] leading-5 whitespace-pre-wrap",
@@ -764,6 +848,12 @@ function CommentThreadNode({
                       ? "border-amber-200 dark:border-amber-700 bg-white/90 dark:bg-slate-800/90 text-slate-800 dark:text-slate-200"
                       : "border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 shadow-none",
                   )}
+                  onCompositionStart={(event) => {
+                    event.currentTarget.dataset.composing = "true";
+                  }}
+                  onCompositionEnd={(event) => {
+                    delete event.currentTarget.dataset.composing;
+                  }}
                   onPointerDown={(event) => {
                     event.stopPropagation();
                     onSelectComment?.(comment.id);

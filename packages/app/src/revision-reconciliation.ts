@@ -5,6 +5,7 @@ import {
   type SyncDraft,
   type SyncMerge,
 } from "@roughdraft/rfm";
+import { measureRevision, recordRevisionTiming } from "./revision-performance";
 
 export interface MergeWorkerRequest {
   id: number;
@@ -16,6 +17,7 @@ export interface MergeWorkerRequest {
 export interface MergeWorkerReply {
   id: number;
   result: SyncMerge;
+  timing?: { startedAt: number; durationMs: number };
 }
 interface Pending {
   local: SyncDraft;
@@ -47,7 +49,11 @@ export function disposeReviewMergeWorker(): void {
 function releaseWorker(): void {
   if (idle) clearTimeout(idle);
   idle = null;
-  worker?.terminate();
+  if (worker) {
+    worker.onmessage = null;
+    worker.onerror = null;
+    worker.terminate();
+  }
   worker = null;
   for (const entry of pending.values()) {
     clearTimeout(entry.timeout);
@@ -74,13 +80,40 @@ function startWorker() {
   if (worker || performance.now() < retryAfter) return worker;
   try {
     if (typeof Worker === "undefined") return null;
-    worker = new Worker(
-      new URL("./revision-merge-worker.ts", import.meta.url),
-      { type: "module", name: "roughdraft-review-merge-v1" },
+    worker = measureRevision(
+      "merge-worker-start",
+      () =>
+        new Worker(new URL("./revision-merge-worker.ts", import.meta.url), {
+          type: "module",
+          name: "roughdraft-review-merge-v1",
+        }),
     );
-    worker.onmessage = (event: MessageEvent<MergeWorkerReply>) =>
+    const active = worker;
+    worker.onmessage = (event: MessageEvent<MergeWorkerReply>) => {
+      if (worker !== active) return;
+      const timing = event.data.timing;
+      if (timing) {
+        recordRevisionTiming(
+          "merge-worker-compute",
+          timing.startedAt,
+          timing.durationMs,
+        );
+        recordRevisionTiming(
+          "merge-worker-delivery",
+          timing.startedAt + timing.durationMs,
+          Math.max(
+            0,
+            performance.timeOrigin +
+              performance.now() -
+              timing.startedAt -
+              timing.durationMs,
+          ),
+        );
+      }
       settle(event.data.id, event.data.result);
+    };
     worker.onerror = () => {
+      if (worker !== active) return;
       console.warn(
         JSON.stringify({
           severity: "warn",
@@ -94,6 +127,13 @@ function startWorker() {
     retryAfter = performance.now() + 1_000;
   }
   return worker;
+}
+
+/** Load the large-review comparison module before a short save reservation. */
+export function prepareReviewMergeWorker(markdown: string) {
+  if (markdown.length <= 50 * 1024 || !startWorker() || pending.size) return;
+  if (idle) clearTimeout(idle);
+  idle = setTimeout(disposeReviewMergeWorker, 30_000);
 }
 
 /** Only strings and review data cross this boundary; PM application stays local. */

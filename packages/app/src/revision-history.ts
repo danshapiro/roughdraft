@@ -69,6 +69,45 @@ export function mapReviewedChanges(
   });
 }
 
+/** A remote-origin mapping is usable only when its guard and every inverse still apply. */
+export function validateReviewedChange(
+  doc: Node,
+  change: ReviewedChange,
+): boolean {
+  if (!matches(doc, change)) return false;
+  const transaction = EditorState.create({ doc }).tr;
+  try {
+    for (const json of change.inverse)
+      if (transaction.maybeStep(Step.fromJSON(doc.type.schema, json)).failed)
+        return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function mapRemoteReviewedChanges(
+  changes: ReviewedChange[],
+  transaction: Transaction,
+): ReviewedChange[] {
+  return mapReviewedChanges(
+    changes.map((change) =>
+      change.staleReason === "needs-remap"
+        ? { ...change, stale: false }
+        : change,
+    ),
+    transaction,
+  ).map((change) => {
+    if (change.stale || !validateReviewedChange(transaction.doc, change))
+      return { ...change, stale: true };
+    const next = { ...change, stale: false };
+    delete next.staleReason;
+    delete next.unmappedSince;
+    delete next.originSignature;
+    return next;
+  });
+}
+
 export function recordReviewedChange(
   transaction: Transaction,
   detail: Pick<

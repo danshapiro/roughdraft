@@ -9,27 +9,27 @@ const scope = globalThis as unknown as {
   postMessage: (reply: MergeWorkerReply) => void;
 };
 scope.onmessage = ({ data }) => {
-  try {
+  const began = performance.now();
+  const startedAt = performance.timeOrigin + began;
+  const reply = (result: MergeWorkerReply["result"]) => {
     scope.postMessage({
       id: data.id,
-      result: mergeReviewDrafts(
-        data.base,
-        data.local,
-        data.incoming,
-        data.options,
-      ),
+      result,
+      timing: { startedAt, durationMs: performance.now() - began },
     });
+  };
+  try {
+    reply(
+      mergeReviewDrafts(data.base, data.local, data.incoming, data.options),
+    );
   } catch {
-    scope.postMessage({
-      id: data.id,
-      result: {
-        status: "client-merge-required",
-        draft: data.local,
-        conflicts: [],
-        signature: reviewDraftSignature(data.local),
-        reason:
-          "The outside update could not be compared safely. Your work is preserved.",
-      },
+    reply({
+      status: "client-merge-required",
+      draft: data.local,
+      conflicts: [],
+      signature: reviewDraftSignature(data.local),
+      reason:
+        "The outside update could not be compared safely. Your work is preserved.",
     });
   }
 };

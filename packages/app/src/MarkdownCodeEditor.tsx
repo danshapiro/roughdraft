@@ -3,6 +3,7 @@ import { markdown } from "@codemirror/lang-markdown";
 import { yamlFrontmatter } from "@codemirror/lang-yaml";
 import {
   Compartment,
+  ChangeSet,
   EditorState,
   Prec,
   type Extension,
@@ -10,6 +11,7 @@ import {
 } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { useEffect, useRef } from "react";
+import { diffChars, diffWordsWithSpace } from "diff";
 import { cn } from "./lib/utils";
 
 interface MarkdownCodeEditorProps {
@@ -21,6 +23,85 @@ interface MarkdownCodeEditorProps {
   testId?: string;
   readingPosition?: { quote: string[]; offset: number } | null;
   sourceHistory?: { undo: () => void; redo: () => void };
+}
+
+/** Keep unchanged source ranges so CodeMirror maps selections and local history. */
+function incomingSourceChanges(state: EditorState, value: string): ChangeSet {
+  const before = state.doc.toString();
+  const after = state.toText(value).toString();
+  const changes: Array<{ from: number; to: number; insert: string }> = [];
+  const budget = { timeout: 8, maxEditLength: 4096 };
+  const parts =
+    diffChars(before, after, budget) ??
+    diffWordsWithSpace(before, after, budget);
+  if (parts) {
+    let position = 0;
+    for (let index = 0; index < parts.length; index++) {
+      const part = parts[index];
+      if (!part.added && !part.removed) {
+        position += part.value.length;
+        continue;
+      }
+      const from = position;
+      let insert = "";
+      while (
+        index < parts.length &&
+        (parts[index].added || parts[index].removed)
+      ) {
+        const change = parts[index++];
+        if (change.removed) position += change.value.length;
+        else insert += change.value;
+      }
+      index--;
+      changes.push({ from, to: position, insert });
+    }
+  } else {
+    // A broad rewrite must stay bounded. Unique unchanged lines provide linear
+    // anchors, retaining distant selections even when the diff budget expires.
+    const uniqueLines = (text: string) => {
+      const lines = new Map<string, { from: number; to: number } | null>();
+      for (const match of text.matchAll(/[^\n]*(?:\n|$)/g)) {
+        if (!match[0]) continue;
+        lines.set(
+          match[0],
+          lines.has(match[0])
+            ? null
+            : { from: match.index, to: match.index + match[0].length },
+        );
+      }
+      return lines;
+    };
+    const oldLines = uniqueLines(before);
+    let oldOffset = 0;
+    let newOffset = 0;
+    const replaceUntil = (oldEnd: number, newEnd: number) => {
+      let from = oldOffset;
+      let start = newOffset;
+      while (from < oldEnd && start < newEnd && before[from] === after[start]) {
+        from++;
+        start++;
+      }
+      while (
+        oldEnd > from &&
+        newEnd > start &&
+        before[oldEnd - 1] === after[newEnd - 1]
+      ) {
+        oldEnd--;
+        newEnd--;
+      }
+      if (from !== oldEnd || start !== newEnd)
+        changes.push({ from, to: oldEnd, insert: after.slice(start, newEnd) });
+    };
+    for (const [line, next] of uniqueLines(after)) {
+      const previous = oldLines.get(line);
+      if (!next || !previous || previous.from < oldOffset) continue;
+      replaceUntil(previous.from, next.from);
+      oldOffset = previous.to;
+      newOffset = next.to;
+    }
+    replaceUntil(before.length, after.length);
+  }
+  return ChangeSet.of(changes, state.doc.length, "\n");
 }
 
 export function createMarkdownCodeEditorExtensions(
@@ -243,12 +324,11 @@ export function MarkdownCodeEditor({
 
     lastValueRef.current = value;
     view.dispatch({
-      annotations: Transaction.addToHistory.of(false),
-      changes: {
-        from: 0,
-        to: view.state.doc.length,
-        insert: value,
-      },
+      annotations: [
+        Transaction.addToHistory.of(false),
+        Transaction.remote.of(true),
+      ],
+      changes: incomingSourceChanges(view.state, value),
     });
   }, [value]);
 

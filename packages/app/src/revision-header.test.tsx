@@ -17,9 +17,21 @@ vi.mock("./revision-session", () => ({
     run: vi.fn(),
     inspect: vi.fn(),
     recoveryPending: false,
+    fileWritePending: false,
     writePaused: false,
     reviewChanged: false,
     flush: vi.fn(),
+    registerAdapter: vi.fn(),
+    resolveConflict: vi.fn(),
+    retrySync: vi.fn(),
+    inspectCopy: vi.fn(),
+    saveCopy: vi.fn(),
+    setCopyLocked: vi.fn(),
+    checkCopyStatus: vi.fn(),
+    copyLocked: false,
+    conflict: null,
+    orphans: [],
+    restoreOrphan: vi.fn(),
   }),
 }));
 vi.mock("./PageCard", () => ({
@@ -138,6 +150,24 @@ test("review details expose the exact source paths and preset save destination",
   expect(byId("revision-details-autosave")?.textContent).toBe(
     "/project/skills/laser/SKILL.md",
   );
+});
+
+test("opening Recovery copies closes Review details before its dialog takes input", async () => {
+  await render({
+    recoveryCheckpoints: [
+      {
+        id: "saved-feedback",
+        reason: "Unfinished feedback saved with separate copy",
+        updatedAt: "2026-11-26T12:00:00.000Z",
+      },
+    ],
+  });
+  await act(async () => byId("revision-details")?.click());
+  expect(byId("revision-details")?.getAttribute("aria-expanded")).toBe("true");
+  await act(async () => byId("revision-recovery-copies")?.click());
+  expect(byId("revision-recovery-dialog")).not.toBeNull();
+  expect(byId("revision-recovery-copy-saved-feedback")).not.toBeNull();
+  expect(byId("revision-details")?.getAttribute("aria-expanded")).toBe("false");
 });
 
 test("chat reviews have no send-feedback or file-picker actions", async () => {

@@ -6,6 +6,10 @@ import {
   criticMarkdownToEditorState,
 } from "./critic-markup";
 import { editableMarkdownOptions } from "./revision-markdown";
+import {
+  parseRemoteRevision,
+  replaceRevisionContent,
+} from "./revision-remote-source";
 
 export interface RevisionSourceMetadata {
   markdown: string;
@@ -13,6 +17,7 @@ export interface RevisionSourceMetadata {
   endmatter: string | null;
   sourceComments?: CriticComment[];
   sourceSpelling?: string;
+  identityGeneration?: number;
 }
 
 export const RevisionSource = Extension.create({
@@ -117,7 +122,7 @@ export function mergeSourceHistoryComments(
 }
 
 /** Keep generated dates stable while typing source that has no explicit dates. */
-function stableSuggestionDates(
+export function stableSuggestionDates(
   doc: JSONContent,
   before: ProseMirrorNode,
   markdown: string,
@@ -151,25 +156,12 @@ function stableSuggestionDates(
 
 /** Replace only the changed rendered range, retaining mappings and history. */
 export function replaceRevisionSource(state: EditorState, markdown: string) {
-  const parsed = criticMarkdownToEditorState(markdown, editableMarkdownOptions);
-  stableSuggestionDates(parsed.doc, state.doc, markdown);
-  const next = state.schema.nodeFromJSON(parsed.doc);
-  const transaction = state.tr;
-  const start = state.doc.content.findDiffStart(next.content);
-  if (start !== null) {
-    const end = state.doc.content.findDiffEnd(next.content) ?? {
-      a: state.doc.content.size,
-      b: next.content.size,
-    };
-    const overlap = start - Math.min(end.a, end.b);
-    if (overlap > 0) {
-      end.a += overlap;
-      end.b += overlap;
-    }
-    transaction.replace(start, end.a, next.slice(start, end.b));
-  }
+  const cached = parseRemoteRevision(markdown, state);
+  const parsed = { ...cached, doc: cached.doc.toJSON() };
+  const transaction = replaceRevisionContent(state, cached.doc);
   transaction.setDocAttribute("sourceMetadata", {
     markdown,
+    identityGeneration: state.doc.attrs.sourceMetadata?.identityGeneration ?? 0,
     frontmatter: parsed.frontmatter,
     endmatter: parsed.endmatter,
   } satisfies RevisionSourceMetadata);

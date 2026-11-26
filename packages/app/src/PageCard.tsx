@@ -5,11 +5,13 @@ import type {
   Node as ProseMirrorNode,
 } from "@tiptap/pm/model";
 import {
-  type EditorState,
+  EditorState,
   Plugin,
   PluginKey,
   TextSelection,
+  type Transaction,
 } from "@tiptap/pm/state";
+import { Mapping } from "@tiptap/pm/transform";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
@@ -74,13 +76,40 @@ import {
   type ReviewDecision,
   reviewShortcut,
 } from "./review-decisions";
-import { createReviewedChangesPlugin } from "./revision-history";
+import { cleanRevisionNode, cleanSourceFromNode } from "./revision-clean-cache";
+import {
+  createReviewedChangesPlugin,
+  mapRemoteReviewedChanges,
+  reviewedChanges,
+} from "./revision-history";
+import {
+  createReviewIdentityPlugin,
+  remapReviewIdentity,
+  reviewIdentityGeneration,
+} from "./revision-identity";
 import {
   createSourceSpellingPreserver,
   editableMarkdownOptions,
   sameRevisionMarkup,
 } from "./revision-markdown";
+import { measureRevision } from "./revision-performance";
+import {
+  capturePrivateCommentAnchor,
+  resolvePrivateCommentAnchor,
+} from "./revision-private-anchors";
+import { publicRevisionNode } from "./revision-private-comments";
 import { suggestionPositions } from "./revision-projection";
+import { rebaseRemoteMetadata } from "./revision-remote-metadata";
+import {
+  parseRemoteRevision,
+  replaceRevisionContent,
+} from "./revision-remote-source";
+import {
+  outsideComposition,
+  rebaseRemoteTransaction,
+} from "./revision-remote-steps";
+import { serializeRevisionNode } from "./revision-review-cache";
+import type { RevisionRemoteAdapter } from "./revision-session";
 import {
   mergeSourceHistoryComments,
   RevisionSource,
@@ -89,6 +118,12 @@ import {
   revisionSourceMetadata,
   sameSourceContent,
 } from "./revision-source";
+import {
+  createPrivateCommentId,
+  privateReplyTarget,
+  privateRootTarget,
+  type RevisionUiDraftStore,
+} from "./revision-ui-drafts";
 import type { Page, StorageBackend } from "./storage";
 import {
   graphemeBoundary,
@@ -190,6 +225,10 @@ interface EditableReviewSurface {
     ((markdown: string, previous?: string) => void) | null
   >;
   onMarkdownQueued?: () => void;
+  remoteUpdateRef?: RefObject<RevisionRemoteAdapter["apply"] | null>;
+  uiDraftStore?: RevisionUiDraftStore;
+  cleanMarkdown?: string;
+  copyLocked?: boolean;
 }
 
 const ReviewDecisions = Extension.create({
@@ -203,7 +242,12 @@ const ReviewDecisions = Extension.create({
       },
     },
   ],
-  addProseMirrorPlugins: () => [createReviewedChangesPlugin()],
+  addProseMirrorPlugins: () => [
+    createReviewedChangesPlugin(),
+    createReviewIdentityPlugin(() =>
+      window.dispatchEvent(new Event("roughdraft-history-blocked")),
+    ),
+  ],
 });
 
 interface CodeEditorSurfaceProps {
@@ -220,6 +264,22 @@ export interface DraftSuggestionState {
   to: number;
   sourceText: string;
   text: string;
+}
+
+function rangesOfId(doc: ProseMirrorNode, id: string) {
+  let found = false;
+  doc.descendants((node) => {
+    if (
+      node.attrs.change?.changeId === id ||
+      node.attrs.changeId === id ||
+      node.marks.some(
+        (mark) =>
+          mark.attrs.changeId === id || mark.attrs.commentIds?.includes(id),
+      )
+    )
+      found = true;
+  });
+  return found;
 }
 
 function areCommentIdListsEqual(
@@ -851,8 +911,8 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const suppressNextMarkdownUpdateRef = useRef(false);
   const resolvingSuggestionRef = useRef(false);
   const currentMarkdownRef = useRef(sourceMarkdown);
+  const sourceDocSnapshots = useRef(new Map<string, ProseMirrorNode>());
   const markdownTimer = useRef<number | null>(null);
-  const markdownQueuedAt = useRef<number | null>(null);
   const compositionSessionRef = useRef<NativeCompositionSession | null>(null);
   const lastFocusRequestKeyRef = useRef<string | null>(null);
   const selectedCommentIdRef = useRef<string | null>(null);
@@ -890,11 +950,13 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
 
   const parsedContent = useMemo(
     () =>
-      criticMarkdownToEditorState(
-        sourceMarkdown,
-        isEditableReview
-          ? editableMarkdownOptions
-          : { resolveFileUrl, resolveLinkUrl },
+      measureRevision("page-content-parse", () =>
+        criticMarkdownToEditorState(
+          sourceMarkdown,
+          isEditableReview
+            ? editableMarkdownOptions
+            : { resolveFileUrl, resolveLinkUrl },
+        ),
       ),
     [isEditableReview, resolveFileUrl, resolveLinkUrl, sourceMarkdown],
   );
@@ -976,12 +1038,14 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       criticChangeFrameRef.current = null;
       if (markdownTimer.current !== null) return;
       setCriticChanges(
-        getDocumentCriticChangeRailItems(
-          editorRef.current,
-          commentsRef.current,
-          controlledReviewRef.current?.suggestions ??
-            editableReviewRef.current?.suggestions,
-          Boolean(editableReviewRef.current),
+        measureRevision("rail-layout", () =>
+          getDocumentCriticChangeRailItems(
+            editorRef.current,
+            commentsRef.current,
+            controlledReviewRef.current?.suggestions ??
+              editableReviewRef.current?.suggestions,
+            Boolean(editableReviewRef.current),
+          ),
         ),
       );
     });
@@ -994,25 +1058,35 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         window.clearTimeout(markdownTimer.current);
         markdownTimer.current = null;
       }
-      markdownQueuedAt.current = null;
       const currentEditor = editorRef.current;
-      const currentDoc = doc ?? currentEditor?.getJSON();
-      if (!currentDoc) return;
+      if (!doc && !currentEditor) return;
 
       const sourceMetadata = currentEditor
         ? revisionSourceMetadata(currentEditor.state.doc)
         : null;
-      const nextMarkdown = editorStateToCriticMarkdown(
-        currentDoc,
-        nextComments ?? commentsRef.current,
-        {
-          frontmatter: sourceMetadata
-            ? sourceMetadata.frontmatter
-            : frontmatterRef.current,
-          endmatter: sourceMetadata
-            ? sourceMetadata.endmatter
-            : endmatterRef.current,
-        },
+      const serializationOptions = {
+        frontmatter: sourceMetadata
+          ? sourceMetadata.frontmatter
+          : frontmatterRef.current,
+        endmatter: sourceMetadata
+          ? sourceMetadata.endmatter
+          : endmatterRef.current,
+      };
+      const nextMarkdown = measureRevision("review-serialize", () =>
+        currentEditor
+          ? serializeRevisionNode(
+              currentEditor.state.doc,
+              nextComments ?? commentsRef.current,
+              serializationOptions,
+              editableReviewRef.current?.uiDraftStore?.privateCommentIds(
+                nextComments ?? commentsRef.current,
+              ),
+            )
+          : editorStateToCriticMarkdown(
+              doc ?? { type: "doc", content: [] },
+              nextComments ?? commentsRef.current,
+              serializationOptions,
+            ),
       );
       currentMarkdownRef.current = nextMarkdown;
       if (
@@ -1035,6 +1109,21 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         } finally {
           resolvingSuggestionRef.current = false;
         }
+      }
+      if (currentEditor) {
+        sourceDocSnapshots.current.set(
+          nextMarkdown,
+          publicRevisionNode(
+            currentEditor.state.doc,
+            editableReviewRef.current?.uiDraftStore?.privateCommentIds(
+              nextComments ?? commentsRef.current,
+            ),
+          ),
+        );
+        while (sourceDocSnapshots.current.size > 16)
+          sourceDocSnapshots.current.delete(
+            sourceDocSnapshots.current.keys().next().value as string,
+          );
       }
       onMarkdownChange(nextMarkdown);
     },
@@ -1074,7 +1163,6 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         window.clearTimeout(markdownTimer.current);
         markdownTimer.current = null;
       }
-      markdownQueuedAt.current = null;
     };
   }, [flushPendingMarkdown, markdownFlushRef]);
 
@@ -1711,6 +1799,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       onUpdate: ({ editor: currentEditor, transaction }) => {
         if (
           controlledReviewRef.current ||
+          transaction.getMeta("roughdraftProjection") ||
           resolvingSuggestionRef.current ||
           compositionSessionRef.current
         )
@@ -1829,23 +1918,16 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           review?.markdownFlushRef &&
           !transaction.getMeta(explicitReviewEdit)
         ) {
-          // Serialize and remeasure the rail once per typing burst. The live
+          // Serialize and remeasure at a fixed cadence while typing. The live
           // editor still owns selection, decisions and navigation positions.
           // Explicit file/export actions flush the draft before reading it.
-          const now = performance.now();
-          if (markdownQueuedAt.current === null) {
-            markdownQueuedAt.current = now;
+          if (markdownTimer.current === null) {
             review.onMarkdownQueued?.();
+            markdownTimer.current = window.setTimeout(
+              flushPendingMarkdown,
+              225,
+            );
           }
-          if (markdownTimer.current !== null)
-            window.clearTimeout(markdownTimer.current);
-          markdownTimer.current = window.setTimeout(
-            flushPendingMarkdown,
-            Math.max(
-              0,
-              Math.min(225, 1_200 - (now - markdownQueuedAt.current)),
-            ),
-          );
         } else {
           emitMarkdownChange(currentEditor.getJSON());
         }
@@ -1856,6 +1938,75 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   );
 
   editorRef.current = editor;
+  useEffect(() => {
+    const store = editableReview?.uiDraftStore;
+    if (!store) return;
+    const restorePrivateReplies = () => {
+      let next: Map<string, CriticComment> | undefined;
+      let anchors: Transaction | undefined;
+      const added: string[] = [];
+      for (const [id, value] of Object.entries(store.getSnapshot().comments)) {
+        if (commentsRef.current.has(id)) continue;
+        const root = privateRootTarget(id, value);
+        const target = privateReplyTarget(id, value) ?? root;
+        if (root) {
+          if (!editor || rangesOfId(editor.state.doc, id)) continue;
+          const anchor =
+            value.anchor &&
+            resolvePrivateCommentAnchor(editor.state.doc, value.anchor);
+          const markType = editor.schema.marks.commentRef;
+          if (!anchor || !markType) continue;
+          anchors ??= editor.state.tr;
+          anchors.doc.nodesBetween(anchor.from, anchor.to, (node, pos) => {
+            if (!node.isText) return;
+            const previous = markType.isInSet(node.marks);
+            anchors?.addMark(
+              Math.max(anchor.from, pos),
+              Math.min(anchor.to, pos + node.nodeSize),
+              markType.create({
+                commentIds: [
+                  ...new Set([...(previous?.attrs.commentIds ?? []), id]),
+                ],
+              }),
+            );
+          });
+        }
+        const parent = target?.parentCommentId ?? "";
+        const parentSuggestion =
+          target && editor && suggestionPositions(editor.state.doc).has(parent);
+        if (
+          !target ||
+          (!root &&
+            !parentSuggestion &&
+            (!comments.has(parent) || !commentsRef.current.has(parent)))
+        )
+          continue;
+        next ??= new Map(commentsRef.current);
+        next.set(id, target);
+        added.push(id);
+      }
+      if (!next) return;
+      commentsRef.current = next;
+      if (anchors && editor) {
+        resolvingSuggestionRef.current = true;
+        try {
+          editor.view.dispatch(
+            anchors
+              .setMeta("addToHistory", false)
+              .setMeta(explicitReviewEdit, true),
+          );
+        } finally {
+          resolvingSuggestionRef.current = false;
+        }
+      }
+      setComments(next);
+      setNewCommentDraftIds((ids) => [...new Set([...ids, ...added])]);
+      setSelectedCommentId((id) => id ?? added[0] ?? null);
+      // Recreate editors only. Save is the operation that submits their text.
+    };
+    restorePrivateReplies();
+    return store.subscribe(restorePrivateReplies);
+  }, [editableReview?.uiDraftStore, comments, editor]);
   useEffect(() => {
     if (!editor) return;
     return () => {
@@ -1931,6 +2082,19 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         );
         review.onCommentsChange(nextComments);
         currentMarkdownRef.current = markdown;
+        sourceDocSnapshots.current.set(
+          markdown,
+          publicRevisionNode(
+            editor.state.doc,
+            editableReviewRef.current?.uiDraftStore?.privateCommentIds(
+              nextComments,
+            ),
+          ),
+        );
+        while (sourceDocSnapshots.current.size > 16)
+          sourceDocSnapshots.current.delete(
+            sourceDocSnapshots.current.keys().next().value as string,
+          );
         onMarkdownChange(markdown, "source");
         refreshCriticChanges();
       } finally {
@@ -1948,9 +2112,340 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     sourceUpdateRef,
   ]);
 
+  const remoteUpdateRef = editableReview?.remoteUpdateRef;
+  useLayoutEffect(() => {
+    if (!remoteUpdateRef || !editor) return;
+    sourceDocSnapshots.current.set(
+      currentMarkdownRef.current,
+      publicRevisionNode(
+        editor.state.doc,
+        editableReviewRef.current?.uiDraftStore?.privateCommentIds(
+          commentsRef.current,
+        ),
+      ),
+    );
+    remoteUpdateRef.current = (draft, options) => {
+      if (editor.isDestroyed) return null;
+      const active = document.activeElement;
+      if (
+        options?.idRemap &&
+        (compositionSessionRef.current ||
+          editor.view.composing ||
+          (active instanceof HTMLTextAreaElement &&
+            active.dataset.composing === "true"))
+      )
+        return null;
+      const previous = editor.state;
+      const previousMarkdown = currentMarkdownRef.current;
+      // Source spelling belongs to the last serialized snapshot. The live
+      // document may already contain buffered keystrokes absent from that
+      // source; aligning against it would silently omit those newer edits.
+      let previousSourceDoc = sourceDocSnapshots.current.get(previousMarkdown);
+      if (!previousSourceDoc) {
+        const parsedSource = parseRemoteRevision(previousMarkdown, previous);
+        previousSourceDoc = parsedSource.doc.type.create(
+          {
+            ...parsedSource.doc.attrs,
+            sourceMetadata: {
+              markdown: previousMarkdown,
+              frontmatter: parsedSource.frontmatter,
+              endmatter: parsedSource.endmatter,
+            },
+          },
+          parsedSource.doc.content,
+        );
+      }
+      const previousClean = cleanRevisionNode(previousSourceDoc);
+      const previousComments = new Map(commentsRef.current);
+      const previousPrivateIds =
+        editableReviewRef.current?.uiDraftStore?.privateCommentIds(
+          previousComments,
+        );
+      const nextPrivateIds =
+        previousPrivateIds &&
+        new Set(
+          [...previousPrivateIds].map((id) => options?.idRemap?.[id] ?? id),
+        );
+      if (options?.localBase) {
+        const rebased = rebaseRemoteMetadata(
+          options.localBase.markdown,
+          previousMarkdown,
+          draft.markdown,
+        );
+        if (rebased === null) return null;
+        if (rebased !== draft.markdown)
+          draft = { ...draft, markdown: rebased, cleanMarkdown: undefined };
+      }
+      let baseDoc = options?.localBase
+        ? (sourceDocSnapshots.current.get(options.localBase.markdown) ??
+          parseRemoteRevision(options.localBase.markdown, previous).doc)
+        : previous.doc;
+      if (options?.idRemap)
+        for (const target of Object.values(options.idRemap)) {
+          const existing = rangesOfId(previous.doc, target);
+          if (existing && !rangesOfId(baseDoc, target)) return null;
+        }
+      const parsed = measureRevision("remote-parse", () =>
+        parseRemoteRevision(draft.markdown, previous),
+      );
+      let identityState = previous;
+      let identityComments = previousComments;
+      let commitIdentity = () => {};
+      resolvingSuggestionRef.current = true;
+      try {
+        if (options?.idRemap && Object.keys(options.idRemap).length) {
+          const ids = options.idRemap;
+          const identityTransaction = remapReviewIdentity(previous, ids);
+          identityState = previous.apply(identityTransaction);
+          identityComments = new Map(
+            [...commentsRef.current].map(([id, comment]) => [
+              ids[id] ?? id,
+              {
+                ...comment,
+                id: ids[id] ?? id,
+                parentCommentId: comment.parentCommentId
+                  ? (ids[comment.parentCommentId] ?? comment.parentCommentId)
+                  : comment.parentCommentId,
+              },
+            ]),
+          );
+          commitIdentity = () => {
+            const activeId = selectedCommentIdRef.current;
+            editableReviewRef.current?.uiDraftStore?.remap(ids);
+            commentsRef.current = identityComments;
+            if (activeId && ids[activeId]) {
+              setSelectedCommentId(ids[activeId]);
+              selectedCommentIdRef.current = ids[activeId];
+              if (active instanceof HTMLTextAreaElement)
+                setPendingFocusCommentId(ids[activeId]);
+            }
+            setPendingFocusCommentId((id) => (id ? (ids[id] ?? id) : id));
+            setNewCommentDraftIds((current) =>
+              current.map((id) => ids[id] ?? id),
+            );
+            setSelectedChangeId((id) => (id ? (ids[id] ?? id) : id));
+            editor.view.dispatch(identityTransaction);
+          };
+          const baseState = EditorState.create({
+            schema: editor.schema,
+            doc: baseDoc,
+          });
+          baseDoc = baseState.apply(remapReviewIdentity(baseState, ids)).doc;
+        }
+        const baseState = EditorState.create({
+          schema: editor.schema,
+          doc: baseDoc,
+        });
+        const newerLocal = !baseDoc.content.eq(identityState.doc.content);
+        const transaction = rebaseRemoteTransaction(
+          baseState,
+          identityState,
+          parsed.doc,
+        );
+        if (!transaction) return null;
+        const composing = compositionSessionRef.current;
+        if (composing || editor.view.composing) {
+          const $from = editor.state.selection.$from;
+          const depth = Math.max(1, $from.depth);
+          const from = $from.before(depth);
+          const to = $from.after(depth);
+          const partial = outsideComposition(editor.state, transaction, {
+            from,
+            to,
+          });
+          if (!partial) return null;
+          if (partial.docChanged) {
+            if (composing) {
+              const native = replaceRevisionContent(
+                composing.before,
+                editor.state.doc,
+              );
+              let mapping = native.mapping.invert();
+              const before = composing.before.tr;
+              for (const step of partial.steps) {
+                const mapped = step.map(mapping);
+                if (!mapped || before.maybeStep(mapped).failed) return null;
+                const next = new Mapping();
+                next.appendMap(step.getMap().invert());
+                next.appendMapping(mapping);
+                next.appendMap(mapped.getMap());
+                mapping = next;
+              }
+              composing.before = composing.before.apply(before);
+            }
+            editor.view.dispatch(
+              partial
+                .setMeta("addToHistory", false)
+                .setMeta(explicitReviewEdit, true),
+            );
+          }
+          return null;
+        }
+        transaction.setDocAttribute("sourceMetadata", {
+          ...transaction.doc.attrs.sourceMetadata,
+          markdown: draft.markdown,
+          frontmatter: parsed.frontmatter,
+          endmatter: parsed.endmatter,
+        });
+        const localHistory = new Map(
+          mapRemoteReviewedChanges(
+            reviewedChanges(identityState.doc),
+            transaction,
+          ).map((change) => [change.id, change]),
+        );
+        const history = (draft.reviewed ?? []).map((change) => {
+          const local = localHistory.get(change.id);
+          if (local && local.decision === change.decision) return local;
+          const origin = change.originSignature
+            ? options?.originDrafts?.[change.originSignature]
+            : undefined;
+          if (!origin && !newerLocal)
+            return change.staleReason === "needs-remap"
+              ? { ...change, stale: true }
+              : change;
+          if (!origin && change.staleReason === "needs-remap")
+            return { ...change, stale: true };
+          const source = origin
+            ? parseRemoteRevision(origin.markdown, identityState)
+            : parsed;
+          const originState = EditorState.create({
+            schema: editor.schema,
+            doc: source.doc.type.create(
+              {
+                ...source.doc.attrs,
+                sourceMetadata: {
+                  markdown: origin?.markdown ?? draft.markdown,
+                  frontmatter: source.frontmatter,
+                  endmatter: source.endmatter,
+                },
+              },
+              source.doc.content,
+            ),
+          });
+          const mapping = replaceRevisionContent(originState, transaction.doc);
+          return mapRemoteReviewedChanges([change], mapping)[0];
+        });
+        const nextComments = new Map(
+          draft.reviewComments.map((comment) => [comment.id, comment]),
+        );
+        // Empty unsubmitted comments remain UI drafts and keep their semantic target.
+        for (const [id, comment] of identityComments)
+          if (!comment.content.trim() && !nextComments.has(id))
+            nextComments.set(
+              id,
+              comment as (typeof draft.reviewComments)[number],
+            );
+        const nextMarkdown = newerLocal
+          ? (createSourceSpellingPreserver(
+              previousMarkdown,
+              serializeRevisionNode(
+                previousSourceDoc,
+                previousComments,
+                {
+                  frontmatter:
+                    revisionSourceMetadata(previousSourceDoc)?.frontmatter,
+                  endmatter:
+                    revisionSourceMetadata(previousSourceDoc)?.endmatter,
+                },
+                previousPrivateIds,
+              ),
+            )(
+              serializeRevisionNode(
+                transaction.doc,
+                nextComments,
+                {
+                  frontmatter: parsed.frontmatter,
+                  endmatter: parsed.endmatter,
+                },
+                nextPrivateIds,
+              ),
+            ) ??
+            serializeRevisionNode(
+              transaction.doc,
+              nextComments,
+              {
+                frontmatter: parsed.frontmatter,
+                endmatter: parsed.endmatter,
+              },
+              nextPrivateIds,
+            ))
+          : draft.markdown;
+        transaction
+          .setDocAttribute("kept", Object.keys(draft.decisions))
+          .setDocAttribute("reviewed", history)
+          .setDocAttribute("sourceMetadata", {
+            markdown: nextMarkdown,
+            frontmatter: parsed.frontmatter,
+            endmatter: parsed.endmatter,
+            sourceSpelling: nextMarkdown,
+            sourceComments: [...nextComments.values()],
+            identityGeneration: reviewIdentityGeneration(identityState),
+          });
+        const canonicalClean = cleanRevisionNode(transaction.doc);
+        const sourceClean = options?.forceCleanProjection
+          ? measureRevision("accepted-source-projection", () =>
+              cleanSourceFromNode(
+                nextMarkdown,
+                transaction.doc,
+                nextComments,
+                nextPrivateIds,
+              ),
+            )
+          : newerLocal || draft.cleanMarkdown === undefined
+            ? (createSourceSpellingPreserver(
+                options?.currentCleanMarkdown ??
+                  editableReviewRef.current?.cleanMarkdown ??
+                  previousClean,
+                previousClean,
+              )(canonicalClean) ?? canonicalClean)
+            : draft.cleanMarkdown;
+        commitIdentity();
+        frontmatterRef.current = parsed.frontmatter;
+        endmatterRef.current = parsed.endmatter;
+        commentsRef.current = nextComments;
+        sourceCommentsRef.current = nextComments;
+        setComments(nextComments);
+        editor.view.dispatch(
+          transaction
+            .setMeta("addToHistory", false)
+            .setMeta(explicitReviewEdit, true)
+            .setMeta("roughdraftRemote", true),
+        );
+        currentMarkdownRef.current = nextMarkdown;
+        sourceDocSnapshots.current.set(
+          nextMarkdown,
+          publicRevisionNode(editor.state.doc, nextPrivateIds),
+        );
+        while (sourceDocSnapshots.current.size > 16)
+          sourceDocSnapshots.current.delete(
+            sourceDocSnapshots.current.keys().next().value as string,
+          );
+        refreshCriticChanges();
+        return {
+          ...draft,
+          markdown: nextMarkdown,
+          cleanMarkdown: sourceClean,
+          reviewed: reviewedChanges(
+            publicRevisionNode(transaction.doc, nextPrivateIds),
+          ),
+        };
+      } finally {
+        resolvingSuggestionRef.current = false;
+      }
+    };
+    return () => {
+      remoteUpdateRef.current = null;
+    };
+  }, [editor, remoteUpdateRef, refreshCriticChanges]);
+
   useEffect(() => {
-    editor?.setEditable(!isControlled && interactionMode !== "viewing", false);
-  }, [editor, interactionMode, isControlled]);
+    editor?.setEditable(
+      !isControlled &&
+        interactionMode !== "viewing" &&
+        !editableReview?.copyLocked,
+      false,
+    );
+  }, [editor, interactionMode, isControlled, editableReview?.copyLocked]);
 
   useLayoutEffect(() => {
     if (!editor || editor.isDestroyed) return;
@@ -2440,12 +2935,28 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     const currentEditor = editorRef.current;
     if (!currentEditor || currentEditor.state.selection.empty) return;
 
-    const comment = createCriticComment(undefined, {
-      existingComments: commentsRef.current.values(),
-    });
+    const comment = createCriticComment(
+      editableReviewRef.current ? { id: createPrivateCommentId() } : undefined,
+      {
+        existingComments: commentsRef.current.values(),
+      },
+    );
+    const anchor = capturePrivateCommentAnchor(
+      currentEditor.state.doc,
+      currentEditor.state.selection.from,
+      currentEditor.state.selection.to,
+    );
     const nextComments = new Map(commentsRef.current);
     nextComments.set(comment.id, comment);
     commentsRef.current = nextComments;
+    if (anchor)
+      editableReviewRef.current?.uiDraftStore?.setComment(comment.id, {
+        value: "",
+        original: "",
+        editing: true,
+        target: comment,
+        anchor,
+      });
     setComments(nextComments);
     setNewCommentDraftIds((current) =>
       current.includes(comment.id) ? current : [...current, comment.id],
@@ -2641,6 +3152,9 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       const comment = createCriticComment(
         {
           parentCommentId: commentId,
+          ...(editableReviewRef.current
+            ? { id: createPrivateCommentId() }
+            : {}),
         },
         {
           existingComments: commentsRef.current.values(),
@@ -2667,6 +3181,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       setPendingFocusCommentId(comment.id);
       if (editableReviewRef.current)
         setNewCommentDraftIds((ids) => [...ids, comment.id]);
+      editableReviewRef.current?.uiDraftStore?.setComment(comment.id, {
+        value: "",
+        original: "",
+        editing: true,
+        target: comment,
+      });
       requestAnimationFrame(() => {
         measureLayout();
       });
@@ -2818,6 +3338,9 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       const comment = createCriticComment(
         {
           parentCommentId: changeId,
+          ...(editableReviewRef.current
+            ? { id: createPrivateCommentId() }
+            : {}),
         },
         {
           existingComments: commentsRef.current.values(),
@@ -2840,6 +3363,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       const nextComments = new Map(commentsRef.current);
       nextComments.set(comment.id, comment);
       commentsRef.current = nextComments;
+      editableReviewRef.current?.uiDraftStore?.setComment(comment.id, {
+        value: "",
+        original: "",
+        editing: true,
+        target: comment,
+      });
       setComments(nextComments);
       setSelectedChangeId(changeId);
       setSelectedCommentId(comment.id);
@@ -3192,7 +3721,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
                 : undefined
           }
           testId="document-review-rail"
-          autosaveComments={isEditableReview}
+          autosaveComments={false}
           commentGroups={reviewCommentGroups}
           comments={comments}
           suggestions={reviewSuggestions}

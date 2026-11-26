@@ -1,11 +1,13 @@
-import { parse as parseYaml } from "yaml";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { parseDocument, parse as parseYaml } from "yaml";
+import { splitYamlDocumentMetadata } from "./markdown";
 import {
   documentMetadata,
   sameMetadata,
   withDocumentMetadata,
 } from "./revision-metadata";
-import { splitYamlDocumentMetadata } from "./markdown";
+
+vi.mock("yaml", { spy: true });
 
 const feedback = [
   "comments:",
@@ -27,6 +29,25 @@ function metadataYaml(endmatter: string | null) {
 }
 
 describe("review document metadata", () => {
+  it("does not reparse unchanged review YAML on repeated editor reads", () => {
+    const source = `# Metadata cache\n\n{++A proposal++}{#s1}.\n\n---\ncategory: cached\n${feedback}`;
+    vi.mocked(parseYaml).mockClear();
+    vi.mocked(parseDocument).mockClear();
+    const first = documentMetadata(source);
+    const calls = () =>
+      vi.mocked(parseYaml).mock.calls.length +
+      vi.mocked(parseDocument).mock.calls.length;
+    const coldCalls = calls();
+    expect(coldCalls).toBeGreaterThan(0);
+    for (let index = 0; index < 10; index++)
+      expect(documentMetadata(source)).toEqual(first);
+    expect(calls()).toBe(coldCalls);
+    expect(
+      documentMetadata(source.replace("category: cached", "category: fresh"))
+        .endmatter,
+    ).toContain("category: fresh");
+  });
+
   it("compares document YAML while excluding review feedback", () => {
     const source = `---\r\ntitle: Old\r\n---\r\n\r\n${body}\r\n---\ncategory: plan\n${feedback}`;
     const metadata = documentMetadata(source);

@@ -80,6 +80,25 @@ it("preserves a large draft when background comparison is unavailable", async ()
   expect(result.conflicts).toEqual([]);
 });
 
+it("prepares one idle worker for a large review before its first comparison", async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal("Worker", ComparisonWorker);
+  active.prepareReviewMergeWorker("Small document.");
+  expect(ComparisonWorker.instances).toHaveLength(0);
+  const base = draft("Unchanged paragraph.\n\n".repeat(3000));
+  active.prepareReviewMergeWorker(base.markdown);
+  active.prepareReviewMergeWorker(base.markdown);
+  expect(ComparisonWorker.instances).toHaveLength(1);
+  const worker = ComparisonWorker.instances[0];
+  expect(worker.messages).toEqual([]);
+  const compared = active.mergeReviewDraftsAsync(base, base, base);
+  worker.complete();
+  expect((await compared).status).toBe("merged");
+  expect(ComparisonWorker.instances).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(worker.terminated).toBe(true);
+});
+
 it("matches out-of-order background results to their own local generations", async () => {
   vi.stubGlobal("Worker", ComparisonWorker);
   const base = draft("Untouched.\n".repeat(6000));
@@ -168,4 +187,27 @@ it("a failed worker preserves pending work and an idle worker is terminated", as
   expect((await complete).status).toBe("merged");
   await vi.runOnlyPendingTimersAsync();
   expect(worker.terminated).toBe(true);
+});
+
+it("a late error from a released worker cannot cancel its replacement's comparison", async () => {
+  vi.stubGlobal("Worker", ComparisonWorker);
+  const prefix = "Unchanged paragraph.\n\n".repeat(3000);
+  const base = draft(`${prefix}First.\n\nSecond.`);
+  const local = draft(`${prefix}Local typing.\n\nSecond.`);
+  const incoming = draft(`${prefix}First.\n\nPeer update.`);
+  const cancelled = active.mergeReviewDraftsAsync(base, local, incoming);
+  const previous = ComparisonWorker.instances[0];
+  const delayedError = previous.onerror;
+  active.disposeReviewMergeWorker();
+  expect((await cancelled).status).toBe("client-merge-required");
+
+  const retry = active.mergeReviewDraftsAsync(base, local, incoming);
+  const replacement = ComparisonWorker.instances[1];
+  expect(replacement).toBeDefined();
+  delayedError?.();
+  expect(replacement.terminated).toBe(false);
+  replacement.complete();
+  const result = await retry;
+  expect(result.status).toBe("merged");
+  expect(result.draft.markdown).toBe(`${prefix}Local typing.\n\nPeer update.`);
 });

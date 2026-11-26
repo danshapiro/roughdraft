@@ -70,6 +70,10 @@ import {
   type DocumentInteractionMode,
   RichTextEditorSurface,
 } from "./PageCard";
+import { RevisionConflictBanner } from "./RevisionConflictBanner";
+import { RevisionOutdatedFeedback } from "./RevisionOutdatedFeedback";
+import { RevisionRecoveryDialog } from "./RevisionRecoveryDialog";
+import { RevisionSaveCopyDialog } from "./RevisionSaveCopyDialog";
 import {
   applySuggestionDecisions,
   type ReviewDecision,
@@ -77,6 +81,17 @@ import {
   reviewShortcutLabel,
 } from "./review-decisions";
 import { decideReviewChanges, suggestionDetail } from "./revision-bulk";
+import {
+  cleanRevisionNode,
+  cleanSourceFromNode,
+  projectCleanRevisionNode,
+} from "./revision-clean-cache";
+import {
+  type CommentHistoryEntry,
+  remapCommentHistory,
+  restoreCommentHistory,
+} from "./revision-comment-history";
+import { adoptRevisionDisk } from "./revision-disk-adoption";
 import { equalRevisionDraft } from "./revision-draft";
 import {
   recordReviewedChange,
@@ -84,15 +99,12 @@ import {
   reviewedChanges,
 } from "./revision-history";
 import {
-  acceptedDocument,
-  cleanRevisionDocument,
   cleanRevisionMarkdown,
   cleanRevisionSourceMarkdown,
   copyRevisionMarkdown,
   createSourceSpellingPreserver,
   downloadRevisionMarkdown,
   editableMarkdownOptions,
-  sameRevisionMarkup,
 } from "./revision-markdown";
 import {
   documentMetadata,
@@ -100,12 +112,18 @@ import {
   withDocumentMetadata,
 } from "./revision-metadata";
 import { outcomeDocument } from "./revision-outcomes";
+import { measureRevision } from "./revision-performance";
 import {
   type RevisionView,
   useRevisionPreferences,
 } from "./revision-preferences";
+import { prepareRevisionDraft } from "./revision-prepare";
+import {
+  containsReviewIdentity,
+  resolvePrivateCommentAnchor,
+} from "./revision-private-anchors";
+import { publicRevisionNode } from "./revision-private-comments";
 import { suggestionPositions } from "./revision-projection";
-import { useRevisionToolbar } from "./useRevisionToolbar";
 import {
   type BaseSide,
   createReferenceComparison,
@@ -114,11 +132,22 @@ import {
   referenceDecorations,
   revertReferenceChange,
 } from "./revision-reference";
+import { serializeRevisionNode } from "./revision-review-cache";
+import type { RevisionRemoteAdapter } from "./revision-session";
 import {
   type InspectedDestination,
   type RevisionDraft,
   useRevisionSession,
 } from "./revision-session";
+import { RevisionSpellingProof } from "./revision-spelling-proof";
+import {
+  type CommentDraftState,
+  commentDraftMatchesTarget,
+  privateRootTarget,
+  RevisionUiDraftContext,
+  RevisionUiDraftStore,
+} from "./revision-ui-drafts";
+import { useRevisionToolbar } from "./useRevisionToolbar";
 import "./RevisionEditor.css";
 
 const referenceKey = new PluginKey<ReferenceChange[]>(
@@ -171,11 +200,6 @@ function rebaseCommentSnapshots(
         "document",
     }));
   });
-}
-
-function canonical(markdown: string) {
-  const { doc } = criticMarkdownToEditorState(markdown);
-  return editorStateToCriticMarkdown(acceptedDocument(doc), new Map());
 }
 
 function referenceDocument(schema: Editor["schema"], markdown: string) {
@@ -335,7 +359,9 @@ function TipButton({
 
 export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const seed = useMemo<RevisionDraft>(() => {
-    const parsed = criticMarkdownToEditorState(initial.afterText);
+    const parsed = measureRevision("seed-parse", () =>
+      criticMarkdownToEditorState(initial.afterText),
+    );
     return {
       markdown: initial.afterText,
       cleanMarkdown: cleanRevisionMarkdown(initial.afterText),
@@ -355,9 +381,26 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     inspect,
     recoveryError,
     recoveryPending,
+    fileWritePending,
     writePaused,
     reviewChanged,
     flush,
+    conflict: liveConflict,
+    notice: syncNotice,
+    copyLocked,
+    registerAdapter,
+    resolveConflict,
+    reloadFromFile,
+    retrySync,
+    inspectCopy,
+    saveCopy,
+    setCopyLocked,
+    checkCopyStatus,
+    acknowledgeCopyResult,
+    orphans,
+    inspectRecovery,
+    inspectOrphan,
+    restoreRecoveryUi,
   } = useRevisionSession(initial, seed);
   const markdownFlushRef = useRef<(() => void) | null>(null);
   const [markdownQueued, setMarkdownQueued] = useState(false);
@@ -386,9 +429,14 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     };
   }, [flush]);
   const [source] = useState(draft);
+  const [uiDraftStore] = useState(() => new RevisionUiDraftStore());
+  const [copyOpen, setCopyOpen] = useState(false);
+  const [recoveryOpen, setRecoveryOpen] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const remoteUpdateRef = useRef<RevisionRemoteAdapter["apply"] | null>(null);
   const commentHistory = useRef<{
-    past: ComparisonReviewComment[][];
-    future: ComparisonReviewComment[][];
+    past: CommentHistoryEntry[];
+    future: CommentHistoryEntry[];
   }>({ past: [], future: [] });
   const reviewComments = draft.reviewComments ?? [];
   const commentMap = useMemo(
@@ -413,18 +461,22 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         if (origin === "document") {
           // Parent moves belong to document history. Rebase both comment stacks
           // so older text edits keep their attachment through document Undo.
-          commentHistory.current.past = rebaseCommentSnapshots(
-            commentHistory.current.past,
-            previous,
-            comments,
-          );
-          commentHistory.current.future = rebaseCommentSnapshots(
-            commentHistory.current.future,
-            previous,
-            comments,
-          );
+          const rebase = (entry: CommentHistoryEntry) => {
+            const [before, after] = rebaseCommentSnapshots(
+              [entry.before, entry.after],
+              previous,
+              comments,
+            );
+            return { before, after };
+          };
+          commentHistory.current.past = commentHistory.current.past.map(rebase);
+          commentHistory.current.future =
+            commentHistory.current.future.map(rebase);
         } else {
-          commentHistory.current.past.push(previous);
+          commentHistory.current.past.push({
+            before: previous,
+            after: comments,
+          });
           commentHistory.current.future = [];
         }
         return { ...current, reviewComments: comments };
@@ -434,21 +486,38 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   );
   function moveCommentHistory(direction: "past" | "future") {
     const history = commentHistory.current;
-    const next = history[direction].pop();
-    if (!next) return;
+    const entry = history[direction].at(-1);
+    if (!entry) return;
     updateDraft((current) => {
-      history[direction === "past" ? "future" : "past"].push(
+      const next = restoreCommentHistory(
         current.reviewComments,
+        entry,
+        direction === "past" ? "undo" : "redo",
       );
+      if (!next) {
+        setActionError(
+          "That comment changed in another page. Its current feedback is preserved; this older comment step cannot be restored safely.",
+        );
+        return current;
+      }
+      history[direction].pop();
+      history[direction === "past" ? "future" : "past"].push(entry);
       return { ...current, reviewComments: next };
     });
   }
   const [initialClean] = useState(() =>
     initial.draft
       ? (source.cleanMarkdown ?? cleanRevisionMarkdown(source.markdown))
-      : cleanRevisionSourceMarkdown(source.markdown),
+      : measureRevision("initial-source-projection", () =>
+          cleanRevisionSourceMarkdown(source.markdown),
+        ),
   );
   const exactClean = useRef(initialClean);
+  const lastCleanProjection = useRef<{
+    canonical: string;
+    source: string;
+  } | null>(null);
+  const canonicalCleanBaseline = useRef<string | null>(null);
   const preserveSource = useRef<ReturnType<
     typeof createSourceSpellingPreserver
   > | null>(null);
@@ -456,8 +525,10 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const reviewSpelling = useRef<ReturnType<
     typeof createSourceSpellingPreserver
   > | null>(null);
+  const acceptedSpellingProof = useRef(new RevisionSpellingProof());
+  const reviewSpellingProof = useRef(new RevisionSpellingProof());
   const [editor, setEditor] = useState<Editor | null>(null);
-  const [preferences, setPreferences] = useRevisionPreferences(initial.id);
+  const [preferences, setPreferences] = useRevisionPreferences(session.id);
   const { interaction, formatted, view } = preferences;
   const previewing = view !== "changes";
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -493,8 +564,6 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     }
   }, [visibleTools]);
   const [disk, setDisk] = useState<InspectedDestination | null>(null);
-  const [conflict, setConflict] = useState(initial.targetChanged);
-  const [preservedReview, setPreservedReview] = useState(false);
   const [sendOpen, setSendOpen] = useState(false);
   const [comment, setComment] = useState("");
   const [activeChange, setActiveChange] = useState<string | null>(null);
@@ -570,20 +639,140 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         const comments = new Map(
           readDraft().reviewComments.map((comment) => [comment.id, comment]),
         );
-        const canonical = editorStateToCriticMarkdown(
-          next.getJSON(),
+        const canonical = serializeRevisionNode(
+          next.state.doc,
           comments,
-          { frontmatter: parsed.frontmatter, endmatter: parsed.endmatter },
+          {
+            frontmatter: parsed.frontmatter,
+            endmatter: parsed.endmatter,
+          },
+          uiDraftStore.privateCommentIds(comments),
         );
-        reviewSpelling.current = createSourceSpellingPreserver(
+        reviewSpelling.current = measureRevision("review-spelling-align", () =>
+          createSourceSpellingPreserver(exactReview.current, canonical),
+        );
+        reviewSpellingProof.current.matches(
           exactReview.current,
-          canonical,
+          publicRevisionNode(
+            next.state.doc,
+            uiDraftStore.privateCommentIds(comments),
+          ),
+          next.state,
+        );
+        acceptedSpellingProof.current.matches(
+          exactClean.current,
+          projectCleanRevisionNode(next.state.doc),
+          next.state,
         );
       }
+      if (next)
+        canonicalCleanBaseline.current ??= cleanRevisionNode(next.state.doc);
       setEditor(next);
     },
-    [readDraft],
+    [readDraft, uiDraftStore],
   );
+
+  useEffect(() => {
+    if (!editor) return;
+    const adapter: RevisionRemoteAdapter = {
+      rebasesBufferedDocument: true,
+      prepare: (draft) =>
+        measureRevision("detached-prepare", () =>
+          prepareRevisionDraft(draft, editor.state),
+        ),
+      canRestorePrivateComment: (id, value) => {
+        const draft = value as CommentDraftState;
+        const root = privateRootTarget(id, draft);
+        if (!root || !draft.anchor) return false;
+        const existing = uiDraftStore.getSnapshot().comments[id];
+        if (
+          containsReviewIdentity(editor.state.doc, id) &&
+          (!privateRootTarget(id, existing) ||
+            !commentDraftMatchesTarget(existing, root) ||
+            JSON.stringify(existing.anchor) !== JSON.stringify(draft.anchor))
+        )
+          return false;
+        return Boolean(
+          resolvePrivateCommentAnchor(editor.state.doc, draft.anchor),
+        );
+      },
+      apply: (next, options) => {
+        const result =
+          remoteUpdateRef.current?.(next, {
+            ...options,
+            currentCleanMarkdown: readDraft().cleanMarkdown,
+          }) ?? null;
+        if (result) {
+          if (options?.idRemap && Object.keys(options.idRemap).length) {
+            const remap = (entry: CommentHistoryEntry) =>
+              remapCommentHistory(entry, options.idRemap ?? {});
+            commentHistory.current.past =
+              commentHistory.current.past.map(remap);
+            commentHistory.current.future =
+              commentHistory.current.future.map(remap);
+          }
+          exactReview.current = result.markdown;
+          exactClean.current = result.cleanMarkdown ?? result.markdown;
+          canonicalCleanBaseline.current = cleanRevisionNode(editor.state.doc);
+          lastCleanProjection.current = {
+            canonical: canonicalCleanBaseline.current,
+            source: exactClean.current,
+          };
+          preserveSource.current = measureRevision(
+            "remote-accepted-align",
+            () =>
+              createSourceSpellingPreserver(
+                exactClean.current,
+                canonicalCleanBaseline.current as string,
+              ),
+          );
+          const metadata = editor.state.doc.attrs.sourceMetadata;
+          reviewSpelling.current = measureRevision("remote-review-align", () =>
+            createSourceSpellingPreserver(
+              result.markdown,
+              serializeRevisionNode(
+                editor.state.doc,
+                new Map(
+                  result.reviewComments.map((comment) => [comment.id, comment]),
+                ),
+                {
+                  frontmatter: metadata?.frontmatter,
+                  endmatter: metadata?.endmatter,
+                },
+                uiDraftStore.privateCommentIds(
+                  new Map(
+                    result.reviewComments.map((comment) => [
+                      comment.id,
+                      comment,
+                    ]),
+                  ),
+                ),
+              ),
+            ),
+          );
+        }
+        return result;
+      },
+      adopt: (base, markdown, force) =>
+        measureRevision("disk-adoption", () =>
+          adoptRevisionDisk(base, markdown, editor.schema, force),
+        ),
+      readUiDrafts: uiDraftStore.read,
+      restoreUiDrafts: uiDraftStore.restore,
+      subscribeUiDrafts: uiDraftStore.subscribe,
+      flush: () => markdownFlushRef.current?.(),
+    };
+    registerAdapter(adapter);
+    const blockedHistory = () =>
+      setActionError(
+        "That older undo step cannot be safely restored after the review IDs changed. Your current work and recovery copy are preserved.",
+      );
+    window.addEventListener("roughdraft-history-blocked", blockedHistory);
+    return () => {
+      registerAdapter(null);
+      window.removeEventListener("roughdraft-history-blocked", blockedHistory);
+    };
+  }, [editor, registerAdapter, uiDraftStore, readDraft]);
 
   useReference(editor, reference, baseSide, interaction);
 
@@ -598,77 +787,138 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   }, [editor]);
 
   const changeMarkdown = useCallback(
-    (markdown: string, origin?: "source") => {
-      setMarkdownQueued(false);
-      const current = ownEditor.current?.state.doc;
-      if (!current) return;
-      const previous = readDraft();
-      const sourceClean = cleanRevisionSourceMarkdown(markdown);
-      const metadataChanged = !sameMetadata(
-        documentMetadata(sourceClean),
-        documentMetadata(exactClean.current),
-      );
-      const result =
-        origin === "source"
-          ? sourceClean
-          : cleanRevisionDocument(current.toJSON(), previous);
-      preserveSource.current ??= createSourceSpellingPreserver(
-        exactClean.current,
-        canonical(exactClean.current),
-      );
-      const requested = canonical(result);
-      const preserved = preserveSource.current(requested);
-      let cleanMarkdown = result;
-      if (
-        origin !== "source" &&
-        result !== previous.cleanMarkdown &&
-        preserved !== null &&
-        canonical(preserved) === requested
-      )
-        cleanMarkdown = preserved;
-      if (metadataChanged && origin !== "source")
-        cleanMarkdown = withDocumentMetadata(
-          cleanMarkdown,
-          documentMetadata(sourceClean),
+    (markdown: string, origin?: "source") =>
+      measureRevision("draft-change", () => {
+        setMarkdownQueued(false);
+        const editorState = ownEditor.current?.state;
+        if (!editorState) return;
+        const current = editorState.doc;
+        const previous = readDraft();
+        const privateIds = uiDraftStore.privateCommentIds(
+          new Map(
+            previous.reviewComments.map((comment) => [comment.id, comment]),
+          ),
         );
-      if (origin === "source" || metadataChanged) {
-        exactClean.current = cleanMarkdown;
-        preserveSource.current = null;
-      }
-      let reviewMarkdown = markdown;
-      if (origin !== "source") {
-        const preserved = reviewSpelling.current?.(markdown);
-        if (preserved != null && sameRevisionMarkup(preserved, markdown))
-          reviewMarkdown = preserved;
-      } else {
-        exactReview.current = markdown;
-        const parsed = criticMarkdownToEditorState(
-          markdown,
-          editableMarkdownOptions,
+        const publicCurrent = publicRevisionNode(current, privateIds);
+        const metadata = documentMetadata(markdown);
+        const metadataChanged = !sameMetadata(
+          metadata,
+          documentMetadata(exactClean.current),
         );
-        const comments = new Map(
-          readDraft().reviewComments.map((comment) => [comment.id, comment]),
+        const canonicalClean = measureRevision("accepted-cache", () =>
+          cleanRevisionNode(current),
         );
-        const canonical = editorStateToCriticMarkdown(
-          current.toJSON(),
-          comments,
-          { frontmatter: parsed.frontmatter, endmatter: parsed.endmatter },
+        const result =
+          origin === "source"
+            ? cleanSourceFromNode(
+                markdown,
+                current,
+                new Map(previous.reviewComments.map((item) => [item.id, item])),
+                privateIds,
+              )
+            : canonicalClean;
+        preserveSource.current ??= measureRevision(
+          "accepted-spelling-align",
+          () =>
+            createSourceSpellingPreserver(
+              exactClean.current,
+              canonicalCleanBaseline.current ?? canonicalClean,
+            ),
         );
-        reviewSpelling.current = createSourceSpellingPreserver(
-          markdown,
-          canonical,
+        let cleanMarkdown = result;
+        const unchangedAccepted =
+          origin !== "source" &&
+          !metadataChanged &&
+          lastCleanProjection.current?.canonical === canonicalClean;
+        if (unchangedAccepted && lastCleanProjection.current)
+          cleanMarkdown = lastCleanProjection.current.source;
+        const preserved =
+          origin === "source" || unchangedAccepted
+            ? null
+            : measureRevision(
+                "accepted-spelling",
+                () => preserveSource.current?.(canonicalClean) ?? null,
+              );
+        if (preserved !== null) {
+          if (
+            preserved === canonicalClean ||
+            measureRevision("accepted-parse", () =>
+              acceptedSpellingProof.current.matches(
+                preserved,
+                measureRevision("accepted-model", () =>
+                  projectCleanRevisionNode(current),
+                ),
+                editorState,
+              ),
+            )
+          )
+            cleanMarkdown = preserved;
+        }
+        if (metadataChanged && origin !== "source")
+          cleanMarkdown = withDocumentMetadata(cleanMarkdown, metadata);
+        if (origin === "source" || metadataChanged) {
+          exactClean.current = cleanMarkdown;
+          canonicalCleanBaseline.current = canonicalClean;
+          preserveSource.current = null;
+        }
+        lastCleanProjection.current = {
+          canonical: canonicalClean,
+          source: cleanMarkdown,
+        };
+        let reviewMarkdown = markdown;
+        if (origin !== "source") {
+          const retained = measureRevision("review-spelling", () =>
+            reviewSpelling.current?.(markdown),
+          );
+          if (
+            retained != null &&
+            (retained === markdown ||
+              measureRevision("review-parse", () =>
+                reviewSpellingProof.current.matches(
+                  retained,
+                  publicCurrent,
+                  editorState,
+                ),
+              ))
+          )
+            reviewMarkdown = retained;
+        } else {
+          exactReview.current = markdown;
+          const sourceMetadata = current.attrs.sourceMetadata;
+          const canonicalReview = serializeRevisionNode(
+            current,
+            new Map(
+              readDraft().reviewComments.map((comment) => [
+                comment.id,
+                comment,
+              ]),
+            ),
+            {
+              frontmatter: sourceMetadata?.frontmatter,
+              endmatter: sourceMetadata?.endmatter,
+            },
+            privateIds,
+          );
+          reviewSpelling.current = createSourceSpellingPreserver(
+            markdown,
+            canonicalReview,
+          );
+        }
+        updateDraft(
+          (previous) => ({
+            ...previous,
+            markdown: reviewMarkdown,
+            cleanMarkdown,
+            decisions: Object.fromEntries(
+              kept(current).map((id) => [id, "kept"]),
+            ),
+            reviewed: reviewedChanges(publicCurrent),
+          }),
+          { readyToSave: origin !== "source" },
         );
-      }
-      updateDraft((previous) => ({
-        ...previous,
-        markdown: reviewMarkdown,
-        cleanMarkdown,
-        decisions: Object.fromEntries(kept(current).map((id) => [id, "kept"])),
-        reviewed: reviewedChanges(current),
-      }));
-      setBlocked(false);
-    },
-    [updateDraft, readDraft],
+        setBlocked(false);
+      }),
+    [updateDraft, readDraft, uiDraftStore],
   );
 
   const deciding = useCallback(
@@ -796,9 +1046,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     busy ||
     sendOpen ||
     Boolean(disk) ||
-    conflict ||
-    session.targetChanged ||
-    writePaused;
+    copyLocked;
   const reviewSurface = useMemo(
     () => ({
       suggestions: visibleChanges,
@@ -807,6 +1055,10 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       decisions,
       reviewed: source.reviewed,
       sourceUpdateRef,
+      remoteUpdateRef,
+      uiDraftStore,
+      cleanMarkdown: draft.cleanMarkdown,
+      copyLocked,
       markdownFlushRef,
       onMarkdownQueued,
       comments: commentMap,
@@ -823,6 +1075,9 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       decisionsDisabled,
       onMarkdownQueued,
       source.reviewed,
+      uiDraftStore,
+      draft.cleanMarkdown,
+      copyLocked,
       updateComments,
       visibleChanges,
     ],
@@ -830,16 +1085,26 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const editorDoc = editor?.state.doc;
   const workingSource =
     editorDoc?.attrs.sourceMetadata?.markdown ?? draft.markdown;
+  const workingMetadata = useMemo(
+    () => documentMetadata(workingSource),
+    [workingSource],
+  );
+  const referenceMetadata = useMemo(
+    () => (reference === null ? null : documentMetadata(reference)),
+    [reference],
+  );
   const metadataPending =
-    reference !== null &&
+    referenceMetadata !== null &&
     !decisions.includes("document-metadata") &&
-    !sameMetadata(documentMetadata(workingSource), documentMetadata(reference));
-  const metadataOld = documentMetadata(
-    baseSide === "new" ? (reference ?? workingSource) : workingSource,
-  );
-  const metadataNew = documentMetadata(
-    baseSide === "new" ? workingSource : (reference ?? workingSource),
-  );
+    !sameMetadata(workingMetadata, referenceMetadata);
+  const metadataOld =
+    baseSide === "new"
+      ? (referenceMetadata ?? workingMetadata)
+      : workingMetadata;
+  const metadataNew =
+    baseSide === "new"
+      ? workingMetadata
+      : (referenceMetadata ?? workingMetadata);
   const reviewed = editorDoc
     ? reviewedChanges(editorDoc)
     : (source.reviewed ?? []);
@@ -892,11 +1157,6 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       .map(([id]) => id);
   }, [decisions, editorDoc, renderedChanges, metadataPending]);
   const count = navigation.length;
-  const markdown = draft.cleanMarkdown ?? draft.markdown;
-  const cleanSaved = useMemo(
-    () => cleanRevisionMarkdown(session.savedText ?? ""),
-    [session.savedText],
-  );
   const persistedDraft = session.draft ?? seed;
   const reviewSaved =
     !markdownQueued &&
@@ -910,8 +1170,8 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     });
   const saved =
     reviewSaved &&
-    (!destination ||
-      (destination === session.savedPath && markdown === cleanSaved)) &&
+    !fileWritePending &&
+    (!destination || destination === session.savedPath) &&
     !writePaused &&
     !session.targetChanged;
   const filename = pathLeaf(destination ?? (sourcePath || "Untitled.md"));
@@ -968,35 +1228,12 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
 
   const reportError = (error: unknown) =>
     setActionError(error instanceof Error ? error.message : String(error));
-  async function preserveReview() {
-    setBusy(true);
-    setActionError("");
-    try {
-      await run("recover", currentDraft(), {
-        autosave: "none",
-        baseVersion: session.baseVersion ?? null,
-      });
-      setConflict(false);
-      setDisk(null);
-      setPreservedReview(true);
-    } catch (error) {
-      reportError(error);
-    } finally {
-      setBusy(false);
-    }
-  }
   async function save() {
     setBusy(true);
     setActionError("");
     try {
       await run("sync", currentDraft());
-      setConflict(false);
     } catch (error) {
-      if (
-        error instanceof Error &&
-        error.message.includes("destination changed")
-      )
-        setConflict(true);
       reportError(error);
     } finally {
       setBusy(false);
@@ -1032,7 +1269,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     ? destination
       ? "Saved to file"
       : "Review saved"
-    : conflict || session.targetChanged
+    : liveConflict?.kind === "conflict" || session.targetChanged
       ? "File changed"
       : writePaused
         ? "Paused"
@@ -1169,786 +1406,862 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     );
   };
   return (
-    <TooltipProvider delay={300}>
-      <header
-        className="revision-header comparison-header-bar"
-        ref={headerRef}
-        data-testid="revision-header"
-      >
-        <div
-          className="revision-header-inner"
-          ref={toolbarContainerRef}
-          data-compact-tools={compactTools}
-          data-visible-tools={visibleTools}
+    <RevisionUiDraftContext.Provider value={uiDraftStore}>
+      <TooltipProvider delay={300}>
+        <header
+          className="revision-header comparison-header-bar"
+          ref={headerRef}
+          data-testid="revision-header"
         >
-          <div className="revision-identity" data-testid="revision-identity">
-            <div className="revision-title-copy">
-              <h1 data-testid="revision-path" title={initial.title}>
-                {initial.title}
-              </h1>
-              {reference !== null && (
-                <div className="revision-version-labels">
-                  <span
-                    data-testid="revision-before-label"
-                    title={beforePath ?? beforeLabel}
-                  >
-                    {beforeLabel}
-                  </span>
-                  <span aria-hidden="true">→</span>
-                  <span
-                    data-testid="revision-after-label"
-                    title={afterPath ?? afterLabel}
-                  >
-                    {afterLabel}
-                  </span>
-                </div>
-              )}
-            </div>
-            <Popover>
-              <PopoverTrigger
-                render={
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label="Review details"
-                    data-testid="revision-details"
-                    title="Review details and file paths"
-                  />
-                }
-              >
-                <Info aria-hidden="true" />
-              </PopoverTrigger>
-              <PopoverContent
-                align="start"
-                collisionPadding={8}
-                aria-label="Review details"
-                data-testid="revision-details-content"
-              >
-                <p className="mb-3 font-semibold">{initial.title}</p>
-                <dl className="revision-details-list">
-                  {reference !== null && (
-                    <>
-                      <dt>{beforeLabel}</dt>
-                      <dd data-testid="revision-details-before">
-                        {beforePath ?? "Text supplied by the agent"}
-                      </dd>
-                    </>
-                  )}
-                  <dt>{afterLabel}</dt>
-                  <dd data-testid="revision-details-after">
-                    {afterPath ?? "Text supplied by the agent"}
-                  </dd>
-                  <dt>Autosave</dt>
-                  <dd data-testid="revision-details-autosave">
-                    {destination ??
-                      "No Markdown file writes. Your review is saved for the agent."}
-                  </dd>
-                </dl>
-              </PopoverContent>
-            </Popover>
-            <span
-              className="revision-file-status"
-              data-testid="revision-file-status"
-              role="status"
-              aria-label={fileState}
-              title={
-                saved
-                  ? destination
-                    ? `Saved to ${destination}`
-                    : "Review saved for the agent. No Markdown file writes."
-                  : fileState
-              }
-            >
-              {saved ? <Check aria-hidden="true" /> : fileState}
-            </span>
-          </div>
-          <div className="revision-tools" ref={toolsRef}>
-            <Select<DocumentInteractionMode>
-              value={interaction}
-              onValueChange={(mode) => {
-                if (
-                  mode !== "editing" &&
-                  mode !== "suggesting" &&
-                  mode !== "viewing"
-                )
-                  return;
-                currentDraft();
-                setPreferences({ interaction: mode });
-                setBlocked(false);
-              }}
-            >
-              <SelectTrigger
-                data-toolbar-primary
-                data-testid="revision-mode"
-                aria-label="Editing mode"
-                className="revision-mode-select"
-                disabled={previewing}
-                title={
-                  blocked
-                    ? "This edit could not be recorded as a suggestion. Try again, or use Edit."
-                    : "Read without editing, edit directly, or suggest changes for review."
-                }
-              >
-                <SelectValue>
-                  {interaction === "suggesting"
-                    ? "Suggest"
-                    : interaction === "viewing"
-                      ? "Read"
-                      : "Edit"}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem
-                  value="viewing"
-                  label="Read"
-                  data-testid="revision-mode-read"
-                  className="min-h-11 text-sm"
-                >
-                  <SelectItemText>Read</SelectItemText>
-                </SelectItem>
-                <SelectItem
-                  value="editing"
-                  label="Edit"
-                  data-testid="revision-mode-edit"
-                  className="min-h-11 text-sm"
-                >
-                  <SelectItemText>Edit</SelectItemText>
-                </SelectItem>
-                <SelectItem
-                  value="suggesting"
-                  label="Suggest"
-                  data-testid="revision-mode-suggest"
-                  className="min-h-11 text-sm"
-                >
-                  <SelectItemText>Suggest</SelectItemText>
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            <Select<RevisionView>
-              value={view}
-              onValueChange={(next) => {
-                if (
-                  next !== "changes" &&
-                  next !== "accepted" &&
-                  next !== "rejected"
-                )
-                  return;
-                setSourceReading(captures.current() ?? null);
-                currentDraft();
-                setPreferences({ view: next });
-                setMoreOpen(false);
-              }}
-            >
-              <SelectTrigger
-                data-toolbar-primary
-                data-testid="revision-view"
-                aria-label="Document view"
-                className="revision-mode-select"
-                title="Preview the original or final document without changing the review or file."
-              >
-                <SelectValue>
-                  {view === "accepted"
-                    ? "Final"
-                    : view === "rejected"
-                      ? "Original"
-                      : "Changes"}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem
-                  value="changes"
-                  data-testid="revision-view-changes"
-                  label="Changes"
-                  className="min-h-11 text-sm"
-                >
-                  <SelectItemText>Changes</SelectItemText>
-                </SelectItem>
-                <SelectItem
-                  value="rejected"
-                  data-testid="revision-view-rejected"
-                  label="Original"
-                  className="min-h-11 text-sm"
-                >
-                  <SelectItemText>Original</SelectItemText>
-                </SelectItem>
-                <SelectItem
-                  value="accepted"
-                  data-testid="revision-view-accepted"
-                  label="Final"
-                  className="min-h-11 text-sm"
-                >
-                  <SelectItemText>Final</SelectItemText>
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            <div
-              data-toolbar-primary
-              className="revision-tool-group"
-              aria-label="Document history"
-              role="group"
-            >
-              <TipButton
-                tip="Undo document edit or review choice"
-                aria-label="Undo"
-                data-testid="revision-undo"
-                variant="ghost"
-                size="icon"
-                disabled={
-                  !editor ||
-                  previewing ||
-                  interaction === "viewing" ||
-                  busy ||
-                  writePaused ||
-                  undoDepth(editor.state) === 0
-                }
-                onClick={() => editor?.commands.undo()}
-              >
-                <Undo2 />
-              </TipButton>
-              <TipButton
-                tip="Redo document edit or review choice"
-                aria-label="Redo"
-                data-testid="revision-redo"
-                variant="ghost"
-                size="icon"
-                disabled={
-                  !editor ||
-                  previewing ||
-                  interaction === "viewing" ||
-                  busy ||
-                  writePaused ||
-                  redoDepth(editor.state) === 0
-                }
-                onClick={() => editor?.commands.redo()}
-              >
-                <Redo2 />
-              </TipButton>
-            </div>
-            <div
-              data-toolbar-primary
-              className="revision-tool-group revision-navigation"
-              aria-label="Change navigation"
-              role="group"
-              onKeyDown={(event) => {
-                const decision = reviewShortcut(event.nativeEvent);
-                const id = activeChange;
-                if (
-                  !decision ||
-                  !id ||
-                  !navigation.includes(id) ||
-                  decisionsDisabled
-                )
-                  return;
-                event.preventDefault();
-                if (event.repeat || deciding(id, decision === "accept")) return;
-                editor?.view.dispatch(closeHistory(editor.state.tr));
-                if (decision === "accept")
-                  editor?.commands.acceptCriticChange(id);
-                else editor?.commands.rejectCriticChange(id);
-                editor?.view.dispatch(closeHistory(editor.state.tr));
-              }}
-            >
-              <TipButton
-                tip="Previous change"
-                aria-label="Previous change"
-                data-testid="revision-previous-change"
-                variant="ghost"
-                size="icon"
-                disabled={!formatted || previewing || !count}
-                onClick={() => navigate(-1)}
-              >
-                <ArrowUp />
-              </TipButton>
-              <span
-                className="tabular-nums text-xs text-muted-foreground"
-                data-testid="revision-pending"
-                title="Unreviewed changes and pending suggestions"
-              >
-                {count || ""}
-              </span>
-              <TipButton
-                tip="Next change"
-                aria-label="Next change"
-                data-testid="revision-next-change"
-                variant="ghost"
-                size="icon"
-                disabled={!formatted || previewing || !count}
-                onClick={() => navigate(1)}
-              >
-                <ArrowDown />
-              </TipButton>
-              {formatted &&
-                !previewing &&
-                interaction !== "viewing" &&
-                count > 0 && (
-                  <>
-                    <TipButton
-                      tip={`Accept pending changes. Current change: ${reviewShortcutLabel("accept")}`}
-                      variant="outline"
-                      size="sm"
-                      disabled={decisionsDisabled}
-                      data-testid="revision-accept-all"
-                      onClick={() => decideAll("accept")}
+          <div
+            className="revision-header-inner"
+            ref={toolbarContainerRef}
+            data-compact-tools={compactTools}
+            data-visible-tools={visibleTools}
+          >
+            <div className="revision-identity" data-testid="revision-identity">
+              <div className="revision-title-copy">
+                <h1 data-testid="revision-path" title={initial.title}>
+                  {initial.title}
+                </h1>
+                {reference !== null && (
+                  <div className="revision-version-labels">
+                    <span
+                      data-testid="revision-before-label"
+                      title={beforePath ?? beforeLabel}
                     >
-                      Accept all
-                    </TipButton>
-                    <TipButton
-                      tip={`Reject pending changes. Current change: ${reviewShortcutLabel("reject")}`}
-                      variant="outline"
-                      size="sm"
-                      disabled={decisionsDisabled}
-                      data-testid="revision-reject-all"
-                      onClick={() => decideAll("reject")}
+                      {beforeLabel}
+                    </span>
+                    <span aria-hidden="true">→</span>
+                    <span
+                      data-testid="revision-after-label"
+                      title={afterPath ?? afterLabel}
                     >
-                      Reject all
-                    </TipButton>
-                  </>
+                      {afterLabel}
+                    </span>
+                  </div>
                 )}
-            </div>
-            {secondaryTools()}
-            {compactTools && (
-              <Popover open={moreOpen} onOpenChange={setMoreOpen}>
+              </div>
+              <Popover open={detailsOpen} onOpenChange={setDetailsOpen}>
                 <PopoverTrigger
                   render={
                     <Button
-                      variant="outline"
-                      aria-label="More actions"
-                      data-testid="revision-more"
+                      variant="ghost"
+                      size="icon"
+                      aria-label="Review details"
+                      data-testid="revision-details"
+                      title="Review details and file paths"
                     />
                   }
                 >
-                  <MoreHorizontal />
-                  More
+                  <Info aria-hidden="true" />
                 </PopoverTrigger>
                 <PopoverContent
-                  className="revision-more-actions"
-                  data-testid="revision-more-actions"
-                  aria-label="More actions"
+                  align="start"
+                  collisionPadding={8}
+                  aria-label="Review details"
+                  data-testid="revision-details-content"
                 >
-                  {secondaryTools(false, true)}
+                  <p className="mb-3 font-semibold">{initial.title}</p>
+                  <dl className="revision-details-list">
+                    {reference !== null && (
+                      <>
+                        <dt>{beforeLabel}</dt>
+                        <dd data-testid="revision-details-before">
+                          {beforePath ?? "Text supplied by the agent"}
+                        </dd>
+                      </>
+                    )}
+                    <dt>{afterLabel}</dt>
+                    <dd data-testid="revision-details-after">
+                      {afterPath ?? "Text supplied by the agent"}
+                    </dd>
+                    <dt>Autosave</dt>
+                    <dd data-testid="revision-details-autosave">
+                      {destination ??
+                        "No Markdown file writes. Your review is saved for the agent."}
+                    </dd>
+                  </dl>
+                  <Button
+                    className="mt-3 min-h-11"
+                    variant="outline"
+                    data-testid="revision-recovery-copies"
+                    onClick={() => {
+                      setDetailsOpen(false);
+                      setRecoveryOpen(true);
+                    }}
+                  >
+                    Recovery copies
+                    {session.recoveryCheckpoints?.length
+                      ? ` (${session.recoveryCheckpoints.length})`
+                      : ""}
+                  </Button>
                 </PopoverContent>
               </Popover>
-            )}
-          </div>
-          <div className="revision-toolbar-measure" aria-hidden="true" inert>
-            <div
-              className="revision-tools revision-measured-tools"
-              ref={measuredToolsRef}
-            >
-              <div className="revision-tool-group" />
-              {secondaryTools(true)}
-              <Button variant="outline" data-toolbar-overflow>
-                <MoreHorizontal />
-                More
-              </Button>
-            </div>
-          </div>
-        </div>
-      </header>
-      <main
-        className="revision-page comparison-page"
-        data-testid="revision-page"
-      >
-        {(recoveryError || (actionError && !sendOpen)) && (
-          <p
-            role="alert"
-            className="comparison-error"
-            data-testid="revision-error"
-          >
-            {actionError || recoveryError}
-          </p>
-        )}
-        {(conflict || session.targetChanged || writePaused) && (
-          <div className="comparison-conflict" data-testid="revision-conflict">
-            <strong>
-              {reviewChanged
-                ? "This review changed in another browser. Your edits are still here."
-                : "Autosave paused."}
-            </strong>{" "}
-            {destination && (
-              <Button
-                variant="outline"
-                data-testid="revision-inspect"
-                onClick={() => void inspect().then(setDisk, reportError)}
-              >
-                Inspect file
-              </Button>
-            )}{" "}
-            <Button
-              variant="outline"
-              data-testid="revision-recover"
-              disabled={busy}
-              onClick={() => void preserveReview()}
-            >
-              Preserve this review
-            </Button>{" "}
-            Save your complete feedback separately for the agent, without
-            writing a Markdown file.
-          </div>
-        )}
-        {preservedReview && (
-          <p role="status" data-testid="revision-recovered">
-            Your complete review is saved separately for the agent. Edits here
-            save in this review without writing a Markdown file.
-          </p>
-        )}
-        <div ref={documentRef}>
-          <div hidden={!formatted || previewing}>
-            {metadataPending && (
-              <section
-                className="revision-metadata-change"
-                data-testid="revision-metadata"
-                data-review-rail-anchor="document-metadata"
-              >
-                <h2>Document metadata</h2>
-                <p>YAML fields changed between these versions.</p>
-                <div className="revision-metadata-versions">
-                  <div>
-                    <strong>Before</strong>
-                    <pre>
-                      {[metadataOld.frontmatter, metadataOld.endmatter]
-                        .filter(Boolean)
-                        .join("\n") || "No metadata"}
-                    </pre>
-                  </div>
-                  <div>
-                    <strong>After</strong>
-                    <pre>
-                      {[metadataNew.frontmatter, metadataNew.endmatter]
-                        .filter(Boolean)
-                        .join("\n") || "No metadata"}
-                    </pre>
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  <Button
-                    data-testid="revision-metadata-accept"
-                    disabled={decisionsDisabled}
-                    onClick={() => deciding("document-metadata", true)}
-                  >
-                    Keep
-                  </Button>
-                  <Button
-                    variant="outline"
-                    data-testid="revision-metadata-reject"
-                    disabled={decisionsDisabled}
-                    onClick={() => deciding("document-metadata", false)}
-                  >
-                    Revert
-                  </Button>
-                </div>
-              </section>
-            )}
-            <RichTextEditorSurface
-              page={page}
-              activeDocumentPath={sourcePath ? pathLeaf(sourcePath) : null}
-              selected
-              layout="default"
-              focusRequestKey={null}
-              sourceMarkdown={source.markdown}
-              onMarkdownChange={changeMarkdown}
-              interactionMode={previewing ? "viewing" : interaction}
-              beforeNavigate={async () => {
-                try {
-                  currentDraft();
-                  return await flush();
-                } catch (error) {
-                  reportError(error);
-                  return false;
+              <span
+                className="revision-file-status"
+                data-testid="revision-file-status"
+                role="status"
+                aria-label={fileState}
+                title={
+                  saved
+                    ? destination
+                      ? `Saved to ${destination}`
+                      : "Review saved for the agent. No Markdown file writes."
+                    : fileState
                 }
-              }}
-              backend={backend}
-              onEditorReady={receiveEditor}
-              editableReview={reviewSurface}
-            />
-            {(commentHistory.current.past.length > 0 ||
-              commentHistory.current.future.length > 0) && (
-              <div
-                className="revision-comment-history"
-                role="group"
-                aria-label="Comment history"
               >
-                <MessageSquare
-                  aria-hidden="true"
-                  className="size-3.5 text-muted-foreground"
-                />
+                {saved ? <Check aria-hidden="true" /> : fileState}
+              </span>
+            </div>
+            <div className="revision-tools" ref={toolsRef}>
+              <Select<DocumentInteractionMode>
+                value={interaction}
+                onValueChange={(mode) => {
+                  if (
+                    mode !== "editing" &&
+                    mode !== "suggesting" &&
+                    mode !== "viewing"
+                  )
+                    return;
+                  currentDraft();
+                  setPreferences({ interaction: mode });
+                  setBlocked(false);
+                }}
+              >
+                <SelectTrigger
+                  data-toolbar-primary
+                  data-testid="revision-mode"
+                  aria-label="Editing mode"
+                  className="revision-mode-select"
+                  disabled={previewing}
+                  title={
+                    blocked
+                      ? "This edit could not be recorded as a suggestion. Try again, or use Edit."
+                      : "Read without editing, edit directly, or suggest changes for review."
+                  }
+                >
+                  <SelectValue>
+                    {interaction === "suggesting"
+                      ? "Suggest"
+                      : interaction === "viewing"
+                        ? "Read"
+                        : "Edit"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem
+                    value="viewing"
+                    label="Read"
+                    data-testid="revision-mode-read"
+                    className="min-h-11 text-sm"
+                  >
+                    <SelectItemText>Read</SelectItemText>
+                  </SelectItem>
+                  <SelectItem
+                    value="editing"
+                    label="Edit"
+                    data-testid="revision-mode-edit"
+                    className="min-h-11 text-sm"
+                  >
+                    <SelectItemText>Edit</SelectItemText>
+                  </SelectItem>
+                  <SelectItem
+                    value="suggesting"
+                    label="Suggest"
+                    data-testid="revision-mode-suggest"
+                    className="min-h-11 text-sm"
+                  >
+                    <SelectItemText>Suggest</SelectItemText>
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <Select<RevisionView>
+                value={view}
+                onValueChange={(next) => {
+                  if (
+                    next !== "changes" &&
+                    next !== "accepted" &&
+                    next !== "rejected"
+                  )
+                    return;
+                  setSourceReading(captures.current() ?? null);
+                  currentDraft();
+                  setPreferences({ view: next });
+                  setMoreOpen(false);
+                }}
+              >
+                <SelectTrigger
+                  data-toolbar-primary
+                  data-testid="revision-view"
+                  aria-label="Document view"
+                  className="revision-mode-select"
+                  title="Preview the original or final document without changing the review or file."
+                >
+                  <SelectValue>
+                    {view === "accepted"
+                      ? "Final"
+                      : view === "rejected"
+                        ? "Original"
+                        : "Changes"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem
+                    value="changes"
+                    data-testid="revision-view-changes"
+                    label="Changes"
+                    className="min-h-11 text-sm"
+                  >
+                    <SelectItemText>Changes</SelectItemText>
+                  </SelectItem>
+                  <SelectItem
+                    value="rejected"
+                    data-testid="revision-view-rejected"
+                    label="Original"
+                    className="min-h-11 text-sm"
+                  >
+                    <SelectItemText>Original</SelectItemText>
+                  </SelectItem>
+                  <SelectItem
+                    value="accepted"
+                    data-testid="revision-view-accepted"
+                    label="Final"
+                    className="min-h-11 text-sm"
+                  >
+                    <SelectItemText>Final</SelectItemText>
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <div
+                data-toolbar-primary
+                className="revision-tool-group"
+                aria-label="Document history"
+                role="group"
+              >
                 <TipButton
-                  tip="Undo comment change"
-                  aria-label="Undo comment change"
-                  data-testid="revision-comment-undo"
+                  tip="Undo document edit or review choice"
+                  aria-label="Undo"
+                  data-testid="revision-undo"
                   variant="ghost"
                   size="icon"
-                  disabled={!commentHistory.current.past.length}
-                  onClick={() => moveCommentHistory("past")}
+                  disabled={
+                    !editor ||
+                    previewing ||
+                    interaction === "viewing" ||
+                    busy ||
+                    copyLocked ||
+                    undoDepth(editor.state) === 0
+                  }
+                  onClick={() => editor?.commands.undo()}
                 >
                   <Undo2 />
                 </TipButton>
                 <TipButton
-                  tip="Redo comment change"
-                  aria-label="Redo comment change"
-                  data-testid="revision-comment-redo"
+                  tip="Redo document edit or review choice"
+                  aria-label="Redo"
+                  data-testid="revision-redo"
                   variant="ghost"
                   size="icon"
-                  disabled={!commentHistory.current.future.length}
-                  onClick={() => moveCommentHistory("future")}
+                  disabled={
+                    !editor ||
+                    previewing ||
+                    interaction === "viewing" ||
+                    busy ||
+                    copyLocked ||
+                    redoDepth(editor.state) === 0
+                  }
+                  onClick={() => editor?.commands.redo()}
                 >
                   <Redo2 />
                 </TipButton>
               </div>
-            )}
-          </div>
-          {previewing && (
-            <div data-testid="revision-preview">
-              <p className="revision-preview-label" role="status">
-                {view === "accepted" ? "Final" : "Original"} · Read-only preview
-              </p>
-              {preview?.error && <p role="alert">{preview.error}</p>}
-              {reviewed.some((change) => change.stale) && (
-                <p className="revision-preview-label">
-                  Some older decisions cannot be replayed because their passages
-                  changed.
-                </p>
+              <div
+                data-toolbar-primary
+                className="revision-tool-group revision-navigation"
+                aria-label="Change navigation"
+                role="group"
+                onKeyDown={(event) => {
+                  const decision = reviewShortcut(event.nativeEvent);
+                  const id = activeChange;
+                  if (
+                    !decision ||
+                    !id ||
+                    !navigation.includes(id) ||
+                    decisionsDisabled
+                  )
+                    return;
+                  event.preventDefault();
+                  if (event.repeat || deciding(id, decision === "accept"))
+                    return;
+                  editor?.view.dispatch(closeHistory(editor.state.tr));
+                  if (decision === "accept")
+                    editor?.commands.acceptCriticChange(id);
+                  else editor?.commands.rejectCriticChange(id);
+                  editor?.view.dispatch(closeHistory(editor.state.tr));
+                }}
+              >
+                <TipButton
+                  tip="Previous change"
+                  aria-label="Previous change"
+                  data-testid="revision-previous-change"
+                  variant="ghost"
+                  size="icon"
+                  disabled={!formatted || previewing || !count}
+                  onClick={() => navigate(-1)}
+                >
+                  <ArrowUp />
+                </TipButton>
+                <span
+                  className="tabular-nums text-xs text-muted-foreground"
+                  data-testid="revision-pending"
+                  title="Unreviewed changes and pending suggestions"
+                >
+                  {count || ""}
+                </span>
+                <TipButton
+                  tip="Next change"
+                  aria-label="Next change"
+                  data-testid="revision-next-change"
+                  variant="ghost"
+                  size="icon"
+                  disabled={!formatted || previewing || !count}
+                  onClick={() => navigate(1)}
+                >
+                  <ArrowDown />
+                </TipButton>
+                {formatted &&
+                  !previewing &&
+                  interaction !== "viewing" &&
+                  count > 0 && (
+                    <>
+                      <TipButton
+                        tip={`Accept pending changes. Current change: ${reviewShortcutLabel("accept")}`}
+                        variant="outline"
+                        size="sm"
+                        disabled={decisionsDisabled}
+                        data-testid="revision-accept-all"
+                        onClick={() => decideAll("accept")}
+                      >
+                        Accept all
+                      </TipButton>
+                      <TipButton
+                        tip={`Reject pending changes. Current change: ${reviewShortcutLabel("reject")}`}
+                        variant="outline"
+                        size="sm"
+                        disabled={decisionsDisabled}
+                        data-testid="revision-reject-all"
+                        onClick={() => decideAll("reject")}
+                      >
+                        Reject all
+                      </TipButton>
+                    </>
+                  )}
+              </div>
+              {secondaryTools()}
+              {compactTools && (
+                <Popover open={moreOpen} onOpenChange={setMoreOpen}>
+                  <PopoverTrigger
+                    render={
+                      <Button
+                        variant="outline"
+                        aria-label="More actions"
+                        data-testid="revision-more"
+                      />
+                    }
+                  >
+                    <MoreHorizontal />
+                    More
+                  </PopoverTrigger>
+                  <PopoverContent
+                    className="revision-more-actions"
+                    data-testid="revision-more-actions"
+                    aria-label="More actions"
+                  >
+                    {secondaryTools(false, true)}
+                  </PopoverContent>
+                </Popover>
               )}
-              {formatted && preview?.doc && (
-                <RichTextEditorSurface
-                  page={{ ...page, id: `${page.id}-preview` }}
-                  activeDocumentPath={
-                    previewPath ? pathLeaf(previewPath) : null
-                  }
-                  selected
-                  layout="default"
-                  focusRequestKey={null}
-                  sourceMarkdown={preview.markdown}
-                  onMarkdownChange={() => {}}
-                  interactionMode="viewing"
-                  backend={previewBackend}
-                  controlledReview={{
-                    doc: preview.doc,
-                    suggestions: [],
-                    comments: new Map(),
-                    blockHighlights: [],
-                    canDecide: false,
-                    disabled: true,
-                    acceptLabel: "Keep",
-                    rejectLabel: "Revert",
-                    onAccept: () => {},
-                    onReject: () => {},
-                    onCreateComment: () => null,
-                    onUpdateComment: () => {},
-                    onDeleteComment: () => {},
-                  }}
-                />
+            </div>
+            <div className="revision-toolbar-measure" aria-hidden="true" inert>
+              <div
+                className="revision-tools revision-measured-tools"
+                ref={measuredToolsRef}
+              >
+                <div className="revision-tool-group" />
+                {secondaryTools(true)}
+                <Button variant="outline" data-toolbar-overflow>
+                  <MoreHorizontal />
+                  More
+                </Button>
+              </div>
+            </div>
+          </div>
+        </header>
+        <main
+          className="revision-page comparison-page"
+          data-testid="revision-page"
+        >
+          {(recoveryError || (actionError && !sendOpen)) && (
+            <p
+              role="alert"
+              className="comparison-error"
+              data-testid="revision-error"
+            >
+              {actionError || recoveryError}
+            </p>
+          )}
+          {liveConflict && (
+            <RevisionConflictBanner
+              conflict={liveConflict}
+              local={draft}
+              disabled={copyLocked}
+              viewLabel={
+                previewing
+                  ? view === "accepted"
+                    ? "Final"
+                    : "Original"
+                  : undefined
+              }
+              onResolve={resolveConflict}
+              onSaveSeparately={() => setCopyOpen(true)}
+              onRetry={retrySync}
+              onReload={reloadFromFile}
+              onInspect={
+                destination
+                  ? () => void inspect().then(setDisk, reportError)
+                  : undefined
+              }
+            />
+          )}
+          {syncNotice && (
+            <div role="status" className="comparison-error">
+              {syncNotice}
+              {syncNotice.includes("Recovery copies") && (
+                <Button
+                  className="ml-2 min-h-11"
+                  variant="outline"
+                  onClick={() => setRecoveryOpen(true)}
+                >
+                  Recovery copies
+                </Button>
               )}
             </div>
           )}
-          {!formatted && (
-            <>
-              <div hidden={previewing}>
-                <div className="review-layout-grid">
-                  <div
-                    className="review-layout-main revision-markdown"
-                    data-comparison-anchor="unit-0"
-                  >
-                    <MarkdownCodeEditor
-                      key="working-source"
-                      sourceHistory={{
-                        undo: () => {
-                          if (
-                            !previewing &&
-                            interaction !== "viewing" &&
-                            !busy &&
-                            !writePaused &&
-                            !disk &&
-                            !sendOpen
-                          )
-                            editor?.commands.undo();
-                        },
-                        redo: () => {
-                          if (
-                            !previewing &&
-                            interaction !== "viewing" &&
-                            !busy &&
-                            !writePaused &&
-                            !disk &&
-                            !sendOpen
-                          )
-                            editor?.commands.redo();
-                        },
-                      }}
-                      readingPosition={previewing ? null : sourceReading}
-                      testId="revision-markdown"
-                      className="revision-source-text"
-                      value={draft.markdown}
-                      readOnly={previewing || interaction !== "editing"}
-                      onChange={(next) => {
-                        if (!previewing && interaction === "editing")
-                          sourceUpdateRef.current?.(next, readDraft().markdown);
-                      }}
-                    />
-                    {interaction === "suggesting" && (
-                      <p className="text-sm text-muted-foreground">
-                        Switch to Edit to change Markdown source. Suggest in the
-                        formatted document.
-                      </p>
-                    )}
+          {orphans.length > 0 && (
+            <section className="comparison-conflict">
+              <p>
+                This work may still be open in another tab. A quiet tab has
+                recoverable edits.
+              </p>
+              <Button
+                className="min-h-11"
+                variant="outline"
+                onClick={() => setRecoveryOpen(true)}
+              >
+                Inspect recoverable work
+              </Button>
+            </section>
+          )}
+          <div ref={documentRef}>
+            <div hidden={!formatted || previewing}>
+              {metadataPending && (
+                <section
+                  className="revision-metadata-change"
+                  data-testid="revision-metadata"
+                  data-review-rail-anchor="document-metadata"
+                >
+                  <h2>Document metadata</h2>
+                  <p>YAML fields changed between these versions.</p>
+                  <div className="revision-metadata-versions">
+                    <div>
+                      <strong>Before</strong>
+                      <pre>
+                        {[metadataOld.frontmatter, metadataOld.endmatter]
+                          .filter(Boolean)
+                          .join("\n") || "No metadata"}
+                      </pre>
+                    </div>
+                    <div>
+                      <strong>After</strong>
+                      <pre>
+                        {[metadataNew.frontmatter, metadataNew.endmatter]
+                          .filter(Boolean)
+                          .join("\n") || "No metadata"}
+                      </pre>
+                    </div>
                   </div>
-                </div>
-              </div>
-              {previewing && (
-                <div className="review-layout-grid">
-                  <div
-                    className="review-layout-main revision-markdown"
-                    data-comparison-anchor="unit-0"
-                  >
-                    <MarkdownCodeEditor
-                      key="outcome-source"
-                      readingPosition={sourceReading}
-                      testId="revision-preview-markdown"
-                      className="revision-source-text"
-                      value={preview?.markdown ?? ""}
-                      readOnly
-                      onChange={() => {}}
-                    />
+                  <div className="flex gap-2">
+                    <Button
+                      data-testid="revision-metadata-accept"
+                      disabled={decisionsDisabled}
+                      onClick={() => deciding("document-metadata", true)}
+                    >
+                      Keep
+                    </Button>
+                    <Button
+                      variant="outline"
+                      data-testid="revision-metadata-reject"
+                      disabled={decisionsDisabled}
+                      onClick={() => deciding("document-metadata", false)}
+                    >
+                      Revert
+                    </Button>
                   </div>
+                </section>
+              )}
+              <RichTextEditorSurface
+                page={page}
+                activeDocumentPath={sourcePath ? pathLeaf(sourcePath) : null}
+                selected
+                layout="default"
+                focusRequestKey={null}
+                sourceMarkdown={source.markdown}
+                onMarkdownChange={changeMarkdown}
+                interactionMode={previewing ? "viewing" : interaction}
+                beforeNavigate={async () => {
+                  try {
+                    currentDraft();
+                    return await flush();
+                  } catch (error) {
+                    reportError(error);
+                    return false;
+                  }
+                }}
+                backend={backend}
+                onEditorReady={receiveEditor}
+                editableReview={reviewSurface}
+              />
+              {(commentHistory.current.past.length > 0 ||
+                commentHistory.current.future.length > 0) && (
+                <div
+                  className="revision-comment-history"
+                  role="group"
+                  aria-label="Comment history"
+                >
+                  <MessageSquare
+                    aria-hidden="true"
+                    className="size-3.5 text-muted-foreground"
+                  />
+                  <TipButton
+                    tip="Undo comment change"
+                    aria-label="Undo comment change"
+                    data-testid="revision-comment-undo"
+                    variant="ghost"
+                    size="icon"
+                    disabled={!commentHistory.current.past.length}
+                    onClick={() => moveCommentHistory("past")}
+                  >
+                    <Undo2 />
+                  </TipButton>
+                  <TipButton
+                    tip="Redo comment change"
+                    aria-label="Redo comment change"
+                    data-testid="revision-comment-redo"
+                    variant="ghost"
+                    size="icon"
+                    disabled={!commentHistory.current.future.length}
+                    onClick={() => moveCommentHistory("future")}
+                  >
+                    <Redo2 />
+                  </TipButton>
                 </div>
               )}
-            </>
-          )}
-        </div>
-      </main>
-      <Dialog
-        open={historyOpen}
-        onOpenChange={setHistoryOpen}
-        onOpenChangeComplete={(open) => {
-          if (!open) revealReopenedPassage();
-        }}
-      >
-        <DialogContent
-          className="max-w-2xl"
-          data-testid="revision-reviewed-dialog"
-        >
-          <DialogTitle>History</DialogTitle>
-          <DialogDescription>
-            Inspect previous decisions. Reopen a change to review it again;
-            unrelated edits stay in place.
-          </DialogDescription>
-          <div className="revision-reviewed-list">
-            {reviewed.map((change) => (
-              <section key={change.id} className="revision-reviewed-item">
-                <strong>
-                  {change.decision === "accept" ? "Accepted" : "Rejected"}
-                </strong>
-                {change.oldText && (
-                  <p>
-                    <span className="text-muted-foreground">Before: </span>
-                    {change.oldText}
+            </div>
+            {previewing && (
+              <div data-testid="revision-preview">
+                <p className="revision-preview-label" role="status">
+                  {view === "accepted" ? "Final" : "Original"} · Read-only
+                  preview
+                </p>
+                {preview?.error && <p role="alert">{preview.error}</p>}
+                {reviewed.some((change) => change.stale) && (
+                  <p className="revision-preview-label">
+                    Some older decisions cannot be replayed because their
+                    passages changed.
                   </p>
                 )}
-                {change.newText && (
-                  <p>
-                    <span className="text-muted-foreground">After: </span>
-                    {change.newText}
-                  </p>
-                )}
-                {change.stale && (
-                  <p className="text-sm text-muted-foreground">
-                    This passage was edited after the decision. Reopening would
-                    overwrite those edits.
-                  </p>
-                )}
-                <Button
-                  variant="outline"
-                  disabled={change.stale || decisionsDisabled}
-                  data-testid="revision-reopen-change"
-                  onClick={() => {
-                    if (!editor) return;
-                    const transaction = reopenReviewedChange(
-                      editor.state,
-                      change.id,
-                    );
-                    if (!transaction) {
-                      setActionError(
-                        "This passage changed. Your newer edits have been preserved.",
-                      );
-                      return;
+                {formatted && preview?.doc && (
+                  <RichTextEditorSurface
+                    page={{ ...page, id: `${page.id}-preview` }}
+                    activeDocumentPath={
+                      previewPath ? pathLeaf(previewPath) : null
                     }
-                    reopenedPassage.current = {
-                      position: transaction.mapping.map(change.guard.from, -1),
-                      metadata: Boolean(change.metadata),
-                    };
-                    editor.view.dispatch(
-                      closeHistory(transaction)
-                        .setMeta(referenceDecision, true)
-                        .setMeta(explicitReviewEdit, true),
-                    );
-                    editor.view.dispatch(closeHistory(editor.state.tr));
-                    setHistoryOpen(false);
-                  }}
-                >
-                  Reopen change
-                </Button>
-              </section>
-            ))}
+                    selected
+                    layout="default"
+                    focusRequestKey={null}
+                    sourceMarkdown={preview.markdown}
+                    onMarkdownChange={() => {}}
+                    interactionMode="viewing"
+                    backend={previewBackend}
+                    controlledReview={{
+                      doc: preview.doc,
+                      suggestions: [],
+                      comments: new Map(),
+                      blockHighlights: [],
+                      canDecide: false,
+                      disabled: true,
+                      acceptLabel: "Keep",
+                      rejectLabel: "Revert",
+                      onAccept: () => {},
+                      onReject: () => {},
+                      onCreateComment: () => null,
+                      onUpdateComment: () => {},
+                      onDeleteComment: () => {},
+                    }}
+                  />
+                )}
+              </div>
+            )}
+            {!formatted && (
+              <>
+                <div hidden={previewing}>
+                  <div className="review-layout-grid">
+                    <div
+                      className="review-layout-main revision-markdown"
+                      data-comparison-anchor="unit-0"
+                    >
+                      <MarkdownCodeEditor
+                        key="working-source"
+                        sourceHistory={{
+                          undo: () => {
+                            if (
+                              !previewing &&
+                              interaction !== "viewing" &&
+                              !busy &&
+                              !disk &&
+                              !sendOpen
+                            )
+                              editor?.commands.undo();
+                          },
+                          redo: () => {
+                            if (
+                              !previewing &&
+                              interaction !== "viewing" &&
+                              !busy &&
+                              !disk &&
+                              !sendOpen
+                            )
+                              editor?.commands.redo();
+                          },
+                        }}
+                        readingPosition={previewing ? null : sourceReading}
+                        testId="revision-markdown"
+                        className="revision-source-text"
+                        value={draft.markdown}
+                        readOnly={
+                          previewing || interaction !== "editing" || copyLocked
+                        }
+                        onChange={(next) => {
+                          if (!previewing && interaction === "editing")
+                            sourceUpdateRef.current?.(
+                              next,
+                              readDraft().markdown,
+                            );
+                        }}
+                      />
+                      {interaction === "suggesting" && (
+                        <p className="text-sm text-muted-foreground">
+                          Switch to Edit to change Markdown source. Suggest in
+                          the formatted document.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                {previewing && (
+                  <div className="review-layout-grid">
+                    <div
+                      className="review-layout-main revision-markdown"
+                      data-comparison-anchor="unit-0"
+                    >
+                      <MarkdownCodeEditor
+                        key="outcome-source"
+                        readingPosition={sourceReading}
+                        testId="revision-preview-markdown"
+                        className="revision-source-text"
+                        value={preview?.markdown ?? ""}
+                        readOnly
+                        onChange={() => {}}
+                      />
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
           </div>
-        </DialogContent>
-      </Dialog>
-      <Dialog
-        open={disk !== null}
-        onOpenChange={(open) => {
-          if (!open) setDisk(null);
-        }}
-      >
-        <DialogContent className="max-w-2xl">
-          <DialogTitle>{disk?.path}</DialogTitle>
-          <DialogDescription className="sr-only">
-            The current Markdown on disk.
-          </DialogDescription>
-          <pre
-            data-testid="revision-disk-version"
-            className="max-h-[55vh] overflow-auto whitespace-pre-wrap rounded border p-3"
+          <RevisionOutdatedFeedback draft={draft} />
+        </main>
+        <Dialog
+          open={historyOpen}
+          onOpenChange={setHistoryOpen}
+          onOpenChangeComplete={(open) => {
+            if (!open) revealReopenedPassage();
+          }}
+        >
+          <DialogContent
+            className="max-w-2xl"
+            data-testid="revision-reviewed-dialog"
           >
-            {disk?.markdown ?? "This file is missing."}
-          </pre>
-        </DialogContent>
-      </Dialog>
-      <Dialog
-        open={buttonHandoff && sendOpen}
-        onOpenChange={(open) => {
-          if (!busy) setSendOpen(open);
-        }}
-      >
-        <DialogContent>
-          <DialogTitle>Send feedback</DialogTitle>
-          <DialogDescription className="sr-only">
-            Send the current review without writing to disk.
-          </DialogDescription>
-          <Textarea
-            data-testid="revision-feedback"
-            aria-label="Overall comment"
-            placeholder="Add an overall comment (optional)"
-            value={comment}
-            onChange={(event) => setComment(event.target.value)}
-          />
-          {actionError && (
-            <p role="alert" className="text-destructive">
-              {actionError}
-            </p>
-          )}
-          <DialogFooter>
-            <Button
-              data-testid="revision-send-confirm"
-              title="Send the current snapshot without writing the file"
-              disabled={busy}
-              onClick={() => void send()}
+            <DialogTitle>History</DialogTitle>
+            <DialogDescription>
+              Inspect previous decisions. Reopen a change to review it again;
+              unrelated edits stay in place.
+            </DialogDescription>
+            <div className="revision-reviewed-list">
+              {reviewed.map((change) => (
+                <section
+                  key={change.id}
+                  className="revision-reviewed-item"
+                  data-testid="revision-reviewed-entry"
+                >
+                  <strong>
+                    {change.decision === "accept" ? "Accepted" : "Rejected"}
+                  </strong>
+                  {change.oldText && (
+                    <p>
+                      <span className="text-muted-foreground">Before: </span>
+                      {change.oldText}
+                    </p>
+                  )}
+                  {change.newText && (
+                    <p>
+                      <span className="text-muted-foreground">After: </span>
+                      {change.newText}
+                    </p>
+                  )}
+                  {change.stale && (
+                    <p className="text-sm text-muted-foreground">
+                      This passage was edited after the decision. Reopening
+                      would overwrite those edits.
+                    </p>
+                  )}
+                  <Button
+                    variant="outline"
+                    disabled={change.stale || decisionsDisabled}
+                    data-testid="revision-reopen-change"
+                    onClick={() => {
+                      if (!editor) return;
+                      const transaction = reopenReviewedChange(
+                        editor.state,
+                        change.id,
+                      );
+                      if (!transaction) {
+                        setActionError(
+                          "This passage changed. Your newer edits have been preserved.",
+                        );
+                        return;
+                      }
+                      reopenedPassage.current = {
+                        position: transaction.mapping.map(
+                          change.guard.from,
+                          -1,
+                        ),
+                        metadata: Boolean(change.metadata),
+                      };
+                      editor.view.dispatch(
+                        closeHistory(transaction)
+                          .setMeta(referenceDecision, true)
+                          .setMeta(explicitReviewEdit, true),
+                      );
+                      editor.view.dispatch(closeHistory(editor.state.tr));
+                      setHistoryOpen(false);
+                    }}
+                  >
+                    Reopen change
+                  </Button>
+                </section>
+              ))}
+            </div>
+          </DialogContent>
+        </Dialog>
+        <Dialog
+          open={disk !== null}
+          onOpenChange={(open) => {
+            if (!open) setDisk(null);
+          }}
+        >
+          <DialogContent className="max-w-2xl">
+            <DialogTitle>{disk?.path}</DialogTitle>
+            <DialogDescription className="sr-only">
+              The current Markdown on disk.
+            </DialogDescription>
+            <pre
+              data-testid="revision-disk-version"
+              className="max-h-[55vh] overflow-auto whitespace-pre-wrap rounded border p-3"
             >
-              Send snapshot
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-      <div className="sr-only" role="status">
-        {copied ? "Markdown copied." : session.feedback ? "Feedback sent." : ""}
-      </div>
-    </TooltipProvider>
+              {disk?.markdown ?? "This file is missing."}
+            </pre>
+          </DialogContent>
+        </Dialog>
+        <Dialog
+          open={buttonHandoff && sendOpen}
+          onOpenChange={(open) => {
+            if (!busy) setSendOpen(open);
+          }}
+        >
+          <DialogContent>
+            <DialogTitle>Send feedback</DialogTitle>
+            <DialogDescription className="sr-only">
+              Send the current review without writing to disk.
+            </DialogDescription>
+            <Textarea
+              data-testid="revision-feedback"
+              aria-label="Overall comment"
+              placeholder="Add an overall comment (optional)"
+              value={comment}
+              onChange={(event) => setComment(event.target.value)}
+            />
+            {actionError && (
+              <p role="alert" className="text-destructive">
+                {actionError}
+              </p>
+            )}
+            <DialogFooter>
+              <Button
+                data-testid="revision-send-confirm"
+                title="Send the current snapshot without writing the file"
+                disabled={busy}
+                onClick={() => void send()}
+              >
+                Send snapshot
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+        <div className="sr-only" role="status">
+          {copied
+            ? "Markdown copied."
+            : session.feedback
+              ? "Feedback sent."
+              : ""}
+        </div>
+        <RevisionSaveCopyDialog
+          open={copyOpen}
+          onOpenChange={setCopyOpen}
+          inspect={inspectCopy}
+          save={saveCopy}
+          unlock={() => setCopyLocked(false)}
+          checkStatus={checkCopyStatus}
+          onSavedResultShown={acknowledgeCopyResult}
+          viewLabel={
+            previewing
+              ? view === "accepted"
+                ? "Final"
+                : "Original"
+              : undefined
+          }
+        />
+        <RevisionRecoveryDialog
+          open={recoveryOpen}
+          onOpenChange={setRecoveryOpen}
+          copies={session.recoveryCheckpoints ?? []}
+          orphans={orphans}
+          onInspect={inspectRecovery}
+          onInspectOrphan={inspectOrphan}
+          onRestore={restoreRecoveryUi}
+        />
+      </TooltipProvider>
+    </RevisionUiDraftContext.Provider>
   );
 }
