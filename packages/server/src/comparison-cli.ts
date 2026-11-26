@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { CliDependencies } from "./cli.js";
-import { logServerEvent } from "./diagnostics.js";
 import {
   comparisonBrowserUrl,
   comparisonEndpoint,
@@ -10,6 +9,7 @@ import {
   comparisonServerUrl,
   verifyComparisonUrl,
 } from "./comparison-connection.js";
+import { logServerEvent } from "./diagnostics.js";
 
 export const COMPARISON_COMMANDS = [
   "edit",
@@ -51,6 +51,7 @@ interface ComparisonOptions {
   afterLabel?: string;
   autosave?: string;
   autosaveBase?: string;
+  copyDirectory?: string;
   port?: string;
   server?: string;
   stateDir?: string;
@@ -111,6 +112,9 @@ export function printComparisonHelp(
     log(
       "  --autosave-base old|new  Seed a new destination from this version (default new)",
     );
+    log(
+      "  --copy-directory PATH  Suggested folder on the server for Save separately",
+    );
     log("edit FILE defaults autosave to FILE; other reviews default to none.");
   }
   log("  --watch               Wait for the user to press Send feedback");
@@ -154,6 +158,7 @@ function parseOptions(args: string[]): ComparisonOptions {
     ["--after-label", "afterLabel"],
     ["--autosave", "autosave"],
     ["--autosave-base", "autosaveBase"],
+    ["--copy-directory", "copyDirectory"],
     ["--port", "port"],
     ["--server", "server"],
     ["--state-dir", "stateDir"],
@@ -310,6 +315,8 @@ function validateUsage(
     throw new Error("Use either --read or --watch, not both.");
   if (options.autosaveBase && !["old", "new"].includes(options.autosaveBase))
     throw new Error("--autosave-base must be old or new.");
+  if (options.copyDirectory !== undefined && !options.copyDirectory.trim())
+    throw new Error("--copy-directory must name a folder on the server.");
   if (
     (command === "snapshot" || command === "comparison") &&
     [
@@ -318,6 +325,7 @@ function validateUsage(
       options.afterLabel,
       options.autosave,
       options.autosaveBase,
+      options.copyDirectory,
     ].some((value) => value !== undefined)
   )
     throw new Error(
@@ -451,6 +459,9 @@ export async function runComparisonCommand(
         ...(options.autosaveBase === undefined
           ? {}
           : { autosaveBase: options.autosaveBase }),
+        ...(options.copyDirectory === undefined
+          ? {}
+          : { copyDirectory: options.copyDirectory }),
       });
     }
     logServerEvent("comparison-cli", "review.request", {
