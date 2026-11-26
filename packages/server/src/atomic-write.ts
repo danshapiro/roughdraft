@@ -9,6 +9,13 @@ export class FileChangedError extends Error {
   }
 }
 
+export interface PreparedFileIdentity {
+  device: number;
+  inode: number;
+  inPlace: boolean;
+  stagedPath: string;
+}
+
 function existingFile(filename: string) {
   try {
     const resolved = fs.realpathSync(filename);
@@ -65,6 +72,7 @@ export function atomicWrite(
     mode?: number;
     beforePublish?: () => void;
     allowBusyFallback?: boolean;
+    onPrepared?: (identity: PreparedFileIdentity) => void;
   } = {},
 ): void {
   const requested = path.resolve(filename);
@@ -95,6 +103,13 @@ export function atomicWrite(
       fs.closeSync(descriptor);
     }
 
+    const staged = fs.statSync(temporary);
+    options.onPrepared?.({
+      device: staged.dev,
+      inode: staged.ino,
+      inPlace: false,
+      stagedPath: temporary,
+    });
     options.beforePublish?.();
     assertUnchanged();
     try {
@@ -117,6 +132,12 @@ export function atomicWrite(
         const opened = fs.fstatSync(descriptor);
         if (opened.dev !== original.device || opened.ino !== original.inode)
           throw new FileChangedError();
+        options.onPrepared?.({
+          device: opened.dev,
+          inode: opened.ino,
+          inPlace: true,
+          stagedPath: destination,
+        });
         console.warn(
           JSON.stringify({
             timestamp: new Date().toISOString(),

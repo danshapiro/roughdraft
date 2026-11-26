@@ -32,6 +32,21 @@ describe("file comparison reviews", () => {
         afterText: after,
         ...extra,
       });
+  const explicitlyRecover = async (route: string) => {
+    const recovered = await request(api()).post(`${route}/recover`).send({});
+    expect(recovered.status).toBe(200);
+    return request(api()).get(route);
+  };
+  const checkpointDraft = async (route: string) => {
+    const state = await request(api()).get(`${route}/state`);
+    const checkpoint = state.body.review.recoveryCheckpoints[0];
+    expect(checkpoint).toBeDefined();
+    const read = await request(api()).get(
+      `${route}/checkpoints/${checkpoint.id}`,
+    );
+    expect(read.status).toBe(200);
+    return read.body.workingDraft;
+  };
   const chooseOriginal = async () => {
     const review = (await create("proposal", { editor: "unified" })).body;
     const selected = await request(api())
@@ -334,10 +349,15 @@ describe("file comparison reviews", () => {
       });
       expect((await createBase(revision)).status).toBe(500);
       expect(fs.existsSync(output)).toBe(false);
-      const recovered = await request(api()).get(route);
+      const recovered = await explicitlyRecover(route);
       expect(recovered.body).toMatchObject({
         destinationPath: null,
-        draft: { markdown: proposed, cleanMarkdown: "" },
+        draft: null,
+        reviewComments: [],
+      });
+      expect(await checkpointDraft(route)).toMatchObject({
+        markdown: proposed,
+        cleanMarkdown: "",
         reviewComments: [comment],
       });
       revision = recovered.body.revision;
@@ -652,8 +672,9 @@ describe("file comparison reviews", () => {
         targetChanged: true,
       });
     } else {
-      expect(reopened.body.id).not.toBe(source.body.id);
+      expect(reopened.body.id).toBe(source.body.id);
       expect(reopened.body).toMatchObject({
+        draft: { markdown: "external revision" },
         savedText: "external revision",
         targetChanged: false,
       });
@@ -760,6 +781,7 @@ describe("file comparison reviews", () => {
     expect(saved.status).toBe(500);
     vi.restoreAllMocks();
     const inode = fs.statSync(copy).ino;
+    await explicitlyRecover(route);
     const recovered = await open(copy);
     expect(recovered.body).toMatchObject({
       id: source.body.id,
@@ -799,11 +821,15 @@ describe("file comparison reviews", () => {
     });
     expect(saved.status).toBe(500);
     vi.restoreAllMocks();
+    await explicitlyRecover(route);
     expect((await open(copy)).body.id).toBe(previous.body.id);
     expect((await open(target)).body).toMatchObject({
       id: source.body.id,
       destinationPath: target,
-      draft: { markdown: "my changed draft" },
+      draft: null,
+    });
+    expect(await checkpointDraft(route)).toMatchObject({
+      markdown: "my changed draft",
     });
     expect(fs.readFileSync(copy, "utf8")).toBe(after);
   });
@@ -829,7 +855,7 @@ describe("file comparison reviews", () => {
     ).toBe(500);
     expect(fs.readFileSync(target, "utf8")).toBe(after);
     vi.restoreAllMocks();
-    const recovered = await request(api()).get(route);
+    const recovered = await explicitlyRecover(route);
     expect(recovered.body).toMatchObject({
       status: "open",
       savedText: after,
@@ -843,7 +869,7 @@ describe("file comparison reviews", () => {
     expect(fs.readFileSync(target, "utf8")).toBe("newer text");
   });
 
-  it("saves the draft on interrupted Save recovery without overwriting the externally changed file", async () => {
+  it("preserves the complete draft in recovery without overwriting the externally changed file", async () => {
     const review = await chooseOriginal();
     const route = `/api/comparisons/${review.id}`;
     const rename = fs.renameSync.bind(fs);
@@ -863,13 +889,14 @@ describe("file comparison reviews", () => {
     ).toBe(500);
     vi.restoreAllMocks();
     fs.writeFileSync(target, "newer text");
-    const recovered = await request(api()).get(route);
+    const recovered = await explicitlyRecover(route);
     expect(recovered.body).toMatchObject({
       status: "open",
       savedText: before,
-      draft: { markdown: after },
+      draft: { markdown: before },
       targetChanged: true,
     });
+    expect(await checkpointDraft(route)).toMatchObject({ markdown: after });
     expect(fs.readFileSync(target, "utf8")).toBe("newer text");
   });
 
@@ -1199,7 +1226,7 @@ describe("file comparison reviews", () => {
     expect(interrupted.status).toBe(500);
     expect(fs.readFileSync(target, "utf8")).toBe(after);
     vi.restoreAllMocks();
-    const recovered = await request(api()).get(`/api/comparisons/${review.id}`);
+    const recovered = await explicitlyRecover(`/api/comparisons/${review.id}`);
     expect(recovered.status).toBe(200);
     expect(recovered.body).toMatchObject({
       status: "applied",

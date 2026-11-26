@@ -1,12 +1,12 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import fs from "node:fs";
 import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createApp } from "./index.js";
 import type { Comparison, ComparisonCompletion } from "./comparisons.js";
+import { createApp } from "./index.js";
 
 interface CliEvent {
   event: string;
@@ -179,6 +179,46 @@ describe("comparison CLI actual subprocess and filesystem", () => {
       result.events.at(-1).completion,
     );
   }, 15000);
+
+  it("the actual command selects the agent's separate-save folder without writing a file", async () => {
+    const target = path.join(directory, "working.md");
+    const folder = path.join(directory, "agent-copies");
+    fs.mkdirSync(folder);
+    fs.writeFileSync(
+      target,
+      "# Working document\n\nLeave this source unchanged.\n",
+    );
+    const result = await command([
+      "edit",
+      target,
+      "--copy-directory",
+      folder,
+      "--autosave",
+      "none",
+    ]);
+    expect(result.code, result.errors).toBe(0);
+    const opened = result.events.find(
+      (event) => event.event === "comparison.opened",
+    );
+    if (!opened)
+      throw new Error("The actual CLI did not open its saved review.");
+    const response = await fetch(
+      `http://127.0.0.1:${port}/api/comparisons/${opened.comparisonId}/copy-destination`,
+    );
+    expect(response.ok).toBe(true);
+    const suggestion = (await response.json()) as {
+      path: string;
+      allowed: boolean;
+      exists: boolean;
+    };
+    expect(suggestion.allowed).toBe(true);
+    expect(suggestion.exists).toBe(false);
+    expect(path.dirname(suggestion.path)).toBe(folder);
+    expect(fs.readdirSync(folder)).toEqual([]);
+    expect(fs.readFileSync(target, "utf8")).toBe(
+      "# Working document\n\nLeave this source unchanged.\n",
+    );
+  });
 
   it("keeps the target unchanged until a base is selected and a change is reverted", async () => {
     const target = path.join(directory, "AGENTS.md");

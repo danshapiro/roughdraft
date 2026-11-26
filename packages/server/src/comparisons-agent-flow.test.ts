@@ -146,7 +146,9 @@ describe("agent-configured review sessions", () => {
     expect(fs.readFileSync(newFile, "utf8")).toBe(after);
     expect(
       fs.existsSync(path.join(root, "comparisons"))
-        ? fs.readdirSync(path.join(root, "comparisons"))
+        ? fs
+            .readdirSync(path.join(root, "comparisons"))
+            .filter((name) => /^[a-f0-9-]{36}\.json$/.test(name))
         : [],
     ).toEqual([]);
   });
