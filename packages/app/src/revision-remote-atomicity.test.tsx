@@ -822,16 +822,25 @@ test.each([
   );
   const restoredParsed = criticMarkdownToEditorState(source);
   await act(async () => {
-    remote.current?.({
-      markdown: source,
-      decisions: {},
-      reviewComments: [...restoredParsed.comments.values()].map((comment) => ({...comment,changeId:"document"})),
-    }, {forceCleanProjection:true});
+    remote.current?.(
+      {
+        markdown: source,
+        decisions: {},
+        reviewComments: [...restoredParsed.comments.values()].map(
+          (comment) => ({ ...comment, changeId: "document" }),
+        ),
+      },
+      { forceCleanProjection: true },
+    );
   });
   if (scenario === "unchanged" || scenario === "moved") {
     let quote = "";
-    (editor as Editor | null)?.state.doc.descendants((node)=>{
-      if(node.isText&&node.marks.some((mark)=>mark.attrs.commentIds?.includes(privateId)))quote+=node.text;
+    (editor as Editor | null)?.state.doc.descendants((node) => {
+      if (
+        node.isText &&
+        node.marks.some((mark) => mark.attrs.commentIds?.includes(privateId))
+      )
+        quote += node.text;
     });
     expect(quote).toBe("unique anchor");
   }
