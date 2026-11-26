@@ -150,6 +150,7 @@ async function awaitSignal(
   }
 }
 function installMeasurements() {
+  type ProfileEntry = { stage: string; at: number; duration: number };
   const scope = window as Window & {
     liveInputDelays: number[];
     liveInputEvents: { at: number; data: string | null }[];
@@ -163,8 +164,9 @@ function installMeasurements() {
     }[];
     liveMergeMetrics: { workers: number; jobs: number; replies: number };
     liveApiEvents: Record<string, unknown>[];
+    liveProfileOverflow: ProfileEntry[];
     roughdraftProfile: {
-      entries: { stage: string; at: number; duration: number }[];
+      entries: ProfileEntry[];
     };
   };
   scope.liveInputDelays = [];
@@ -174,6 +176,22 @@ function installMeasurements() {
   scope.liveApiEvents = [];
   scope.liveMergeMetrics = { workers: 0, jobs: 0, replies: 0 };
   scope.roughdraftProfile = { entries: [] };
+  scope.liveProfileOverflow = [];
+  // Preserve early timings when the app trims its ordinary 256-entry buffer.
+  // This remains test-only, bounded, and does not change product diagnostics.
+  const entries = scope.roughdraftProfile.entries;
+  const splice = entries.splice.bind(entries);
+  Object.defineProperty(entries, "splice", {
+    value: (start: number, deleteCount?: number, ...items: ProfileEntry[]) => {
+      const removed =
+        deleteCount === undefined
+          ? splice(start)
+          : splice(start, deleteCount, ...items);
+      const room = 4096 - scope.liveProfileOverflow.length;
+      if (room > 0) scope.liveProfileOverflow.push(...removed.slice(0, room));
+      return removed;
+    },
+  });
   const nativeFetch = window.fetch.bind(window);
   let apiSequence = 0;
   window.fetch = async (input, init) => {
@@ -186,7 +204,7 @@ function installMeasurements() {
     if (!url.includes("/api/comparisons/")) return nativeFetch(input, init);
     const id = ++apiSequence;
     const record = (stage: string, detail: Record<string, unknown> = {}) => {
-      if (scope.liveApiEvents.length < 256)
+      if (scope.liveApiEvents.length < 1024)
         scope.liveApiEvents.push({ at: Date.now(), id, stage, url, ...detail });
     };
     record("fetch-start");
@@ -221,7 +239,7 @@ function installMeasurements() {
   });
   new PerformanceObserver((list) => {
     for (const entry of list.getEntries())
-      if (scope.liveLongTasks.length < 100)
+      if (scope.liveLongTasks.length < 512)
         scope.liveLongTasks.push({
           at: performance.timeOrigin + entry.startTime,
           duration: entry.duration,
@@ -239,7 +257,7 @@ function installMeasurements() {
             result?: { status?: string; reason?: string };
             timing?: { startedAt: number; durationMs: number };
           };
-          if (scope.liveMergeEvents.length < 100)
+          if (scope.liveMergeEvents.length < 256)
             scope.liveMergeEvents.push({
               at: Date.now(),
               direction: "reply",
@@ -266,7 +284,7 @@ function installMeasurements() {
           scope.liveMergeMetrics.workers++;
         }
         scope.liveMergeMetrics.jobs++;
-        if (scope.liveMergeEvents.length < 100)
+        if (scope.liveMergeEvents.length < 256)
           scope.liveMergeEvents.push({ at: Date.now(), direction: "job" });
       }
       if (Array.isArray(options)) super.postMessage(message, options);
@@ -350,6 +368,9 @@ async function failureViews(
           ?.getAttribute("aria-label"),
         banner: document.querySelector('[data-testid="revision-conflict"]')
           ?.textContent,
+        editorOwners: [...document.querySelectorAll(".ProseMirror p")]
+          .map((paragraph) => paragraph.textContent ?? "")
+          .filter((text) => /^Live owner [AB]:/.test(text)),
         recovery: Object.fromEntries(
           Object.entries(localStorage).filter(([key]) =>
             /roughdraft|revision/i.test(key),
@@ -364,6 +385,7 @@ async function failureViews(
             "liveMergeMetrics",
             "liveApiEvents",
             "roughdraftProfile",
+            "liveProfileOverflow",
           ].map((key) => [key, Reflect.get(window, key)]),
         ),
       })),
@@ -380,7 +402,9 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
   browser,
   request,
 }, testInfo) => {
-  test.setTimeout(45_000);
+  // Keep the two-second progress and input/frame limits strict while allowing
+  // slow keyboard delivery and all integrity assertions to finish diagnosing.
+  test.setTimeout(120_000);
   const project = createMarkdownProject("live-progress");
   const other = await browser.newContext();
   const second = await other.newPage();
@@ -401,7 +425,7 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
   let closing = false;
   const timeline: Record<string, unknown>[] = [];
   const recordTime = (entry: Record<string, unknown>) => {
-    if (timeline.length >= 200) return;
+    if (timeline.length >= 1024) return;
     const value = {
       at: Date.now(),
       elapsed: started ? Date.now() - started : -1,
@@ -445,6 +469,7 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
           startedAt: performance.timeOrigin,
           completedAt: Date.now(),
           profile: Reflect.get(window, "roughdraftProfile"),
+          profileOverflow: Reflect.get(window, "liveProfileOverflow"),
           longTasks: Reflect.get(window, "liveLongTasks"),
           api: Reflect.get(window, "liveApiEvents"),
         })),
