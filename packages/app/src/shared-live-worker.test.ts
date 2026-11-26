@@ -21,6 +21,7 @@ class Source extends EventTarget {
   onopen: (() => void) | null = null;
   onerror: (() => void) | null = null;
   closed = false;
+  readyState = 0;
   constructor(readonly url: string) {
     super();
   }
@@ -37,7 +38,7 @@ class Source extends EventTarget {
   }
 }
 const disposers: (() => void)[] = [];
-function setup() {
+function setup(failures = 0) {
   const sources: Source[] = [];
   const scope = {
     location: { origin: "https://review.example" },
@@ -45,6 +46,7 @@ function setup() {
     close: vi.fn(),
   };
   const worker = installSharedLiveWorker(scope, (url) => {
+    if (failures-- > 0) throw new Error("Temporary stream startup failure");
     const source = new Source(url);
     sources.push(source);
     return source as unknown as EventSource;
@@ -199,6 +201,72 @@ describe("shared live worker", () => {
     for (const tab of tabs) tab.receive({ type: "unsubscribe" });
     await vi.advanceTimersByTimeAsync(50);
     expect(sources.every((source) => source.closed)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("replaces a closed stream once for eight live tabs after a transient error", async () => {
+    const { sources, connect } = setup();
+    const tabs = Array.from({ length: 8 }, () => connect(["one"]));
+    await vi.advanceTimersByTimeAsync(50);
+    const failed = sources[0];
+    failed.readyState = 2;
+    failed.onerror?.();
+    expect(failed.closed).toBe(true);
+    for (const tab of tabs) {
+      expect(tab.closed).toBe(false);
+      expect(tab.messages.at(-1)).toMatchObject({
+        type: "fallback",
+        recoverable: true,
+      });
+    }
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(sources).toHaveLength(2);
+    expect(sources.filter((source) => !source.closed)).toHaveLength(1);
+    failed.onopen?.();
+    failed.onerror?.();
+    expect(tabs[0].messages.at(-1)?.type).toBe("fallback");
+    expect(sources).toHaveLength(2);
+    sources[1].readyState = 1;
+    sources[1].onopen?.();
+    for (const tab of tabs)
+      expect(tab.messages.at(-1)).toMatchObject({
+        type: "notice",
+        reason: "reconnected",
+      });
+    for (const tab of tabs) tab.receive({ type: "unsubscribe" });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("retries a temporary stream constructor failure without creating parallel streams", async () => {
+    const { sources, connect } = setup(1);
+    const tab = connect(["one"]);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(sources).toHaveLength(0);
+    expect(tab.messages.at(-1)).toMatchObject({
+      type: "fallback",
+      recoverable: true,
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(sources).toHaveLength(1);
+    expect(sources.filter((source) => !source.closed)).toHaveLength(1);
+  });
+
+  it("bounds repeated startup failures and releases every retry when the last tab closes", async () => {
+    const { sources, connect } = setup(Number.POSITIVE_INFINITY);
+    const tab = connect(["one"]);
+    for (let second = 0; second < 40; second += 2) {
+      tab.receive({ type: "heartbeat" });
+      await vi.advanceTimersByTimeAsync(2000);
+    }
+    expect(sources).toHaveLength(0);
+    const attempts = tab.messages.filter(
+      (message) => message.type === "fallback",
+    );
+    expect(attempts.length).toBeGreaterThan(1);
+    expect(attempts.length).toBeLessThan(8);
+    tab.receive({ type: "unsubscribe" });
+    await vi.advanceTimersByTimeAsync(50);
     expect(vi.getTimerCount()).toBe(0);
   });
 });

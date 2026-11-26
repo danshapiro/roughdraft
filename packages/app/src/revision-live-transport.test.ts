@@ -363,4 +363,58 @@ describe("review change transport", () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
+
+  it("returns from temporary stream polling without disconnecting the healthy shared worker", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(state())));
+    vi.stubGlobal("fetch", fetcher);
+    const callback = vi.fn();
+    const stop = subscribe("review-1", callback);
+    const worker = FakeWorker.instances[0];
+    worker.port.receive({
+      type: "fallback",
+      reason: "stream-unavailable",
+      recoverable: true,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(worker.port.closed).toBe(false);
+
+    worker.port.receive({ type: "notice", reason: "reconnected" });
+    const polls = fetcher.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(fetcher).toHaveBeenCalledTimes(polls);
+    worker.port.receive({
+      type: "notice",
+      reason: "changed",
+      hint: { reviewId: "review-1", revision: 2 },
+    });
+    expect(callback).toHaveBeenCalledWith(
+      expect.objectContaining({ hint: { reviewId: "review-1", revision: 2 } }),
+    );
+    expect(FakeWorker.instances).toHaveLength(1);
+    stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("retries a transient worker failure and stops polling after stream recovery", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(state())));
+    vi.stubGlobal("fetch", fetcher);
+    const stop = subscribe();
+    const failed = FakeWorker.instances[0];
+    failed.onerror?.();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(failed.port.closed).toBe(true);
+    expect(FakeWorker.instances).toHaveLength(2);
+    const recovered = FakeWorker.instances[1];
+    recovered.port.receive({ type: "notice", reason: "reconnected" });
+    const polls = fetcher.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(fetcher).toHaveBeenCalledTimes(polls);
+    stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });

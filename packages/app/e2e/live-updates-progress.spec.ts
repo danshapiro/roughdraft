@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   type APIRequestContext,
+  type CDPSession,
   expect,
   type Page,
   type TestInfo,
@@ -399,6 +400,92 @@ async function failureViews(
   );
 }
 
+async function startMainThreadCpuCapture(pages: Page[], testInfo: TestInfo) {
+  if (process.env.ROUGHDRAFT_PROGRESS_CPU_PROFILE !== "1")
+    return async () => {};
+  const captures: Array<{
+    page: string;
+    session: CDPSession;
+    startedAt: number;
+    stopRequestedAt?: number;
+    stoppedAt?: number;
+    clock?: { before: number; after: number; timestamp?: number };
+    profile?: unknown;
+    error?: string;
+    stopping?: Promise<void>;
+  }> = [];
+  const stop = (capture: (typeof captures)[number]) => {
+    capture.stopping ??= (async () => {
+      capture.stopRequestedAt = Date.now();
+      try {
+        const result = await capture.session.send("Profiler.stop");
+        capture.profile = result.profile;
+      } catch (error) {
+        capture.error = String(error);
+      } finally {
+        capture.stoppedAt = Date.now();
+      }
+    })();
+    return capture.stopping;
+  };
+  try {
+    for (const [index, page] of pages.entries()) {
+      const capture: (typeof captures)[number] = {
+        page: index === 0 ? "A" : "B",
+        session: await page.context().newCDPSession(page),
+        startedAt: 0,
+      };
+      captures.push(capture);
+      await capture.session.send("Profiler.enable");
+      await capture.session.send("Profiler.setSamplingInterval", {
+        interval: 1000,
+      });
+      await capture.session.send("Performance.enable");
+      const before = Date.now();
+      const { metrics } = await capture.session.send("Performance.getMetrics");
+      capture.clock = {
+        before,
+        after: Date.now(),
+        timestamp: metrics.find((metric) => metric.name === "Timestamp")?.value,
+      };
+      await capture.session.send("Profiler.start");
+      capture.startedAt = Date.now();
+    }
+  } catch (error) {
+    await Promise.all(captures.map(stop));
+    await Promise.all(captures.map((capture) => capture.session.detach()));
+    throw error;
+  }
+  // Capture the first save/merge cycles; leave full input and integrity checks intact.
+  // Keep results in memory until typing ends to avoid report I/O during measurement.
+  const timer = setTimeout(() => {
+    for (const capture of captures) void stop(capture);
+  }, 8000);
+  let finishing: Promise<void> | undefined;
+  return () => {
+    finishing ??= (async () => {
+      clearTimeout(timer);
+      await Promise.all(captures.map(stop));
+      for (const capture of captures) {
+        const { session, profile, stopping: _stopping, ...metadata } = capture;
+        if (profile) {
+          const filename = `main-thread-${capture.page}.cpuprofile`;
+          fs.writeFileSync(
+            testInfo.outputPath(filename),
+            JSON.stringify(profile),
+          );
+        }
+        fs.writeFileSync(
+          testInfo.outputPath(`main-thread-${capture.page}-capture.json`),
+          JSON.stringify(metadata, null, 2),
+        );
+        await session.detach();
+      }
+    })();
+    return finishing;
+  };
+}
+
 test("both pages keep committing during continuous typing in the complex 100 KiB review", async ({
   page,
   browser,
@@ -440,6 +527,7 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
     );
   };
   let completed = false;
+  let finishCpuCapture: (() => Promise<void>) | undefined;
   let id: string | undefined;
   const source = reviewFixture();
   const targetPath = writeFixture(project, source);
@@ -578,6 +666,10 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
     }
     const a = ` LocalA-${"abcdefghij".repeat(14)}`,
       b = ` LocalB-${"klmnopqrst".repeat(14)}`;
+    finishCpuCapture = await startMainThreadCpuCapture(
+      [page, second],
+      testInfo,
+    );
     started = Date.now();
     recordTime({ kind: "typing-started" });
     const typing = Promise.all([
@@ -617,6 +709,7 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
     }
     await typing;
     const typingEnded = Date.now() - started;
+    await finishCpuCapture();
     const samples = await Promise.all(
       [page, second].map((view) =>
         view.evaluate(() => {
@@ -718,6 +811,7 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
     verify(comparisonWorkers.size).toBeGreaterThan(0);
     completed = testInfo.errors.length === 0;
   } finally {
+    await finishCpuCapture?.();
     gate.resolve();
     firstCommits.resolve();
     await testInfo.attach("live-update-progress.json", {

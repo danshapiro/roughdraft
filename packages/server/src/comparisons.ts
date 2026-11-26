@@ -38,6 +38,7 @@ import {
 } from "./comparison-sync-cache.js";
 import { logServerEvent } from "./diagnostics.js";
 import { DocumentWatcherRegistry } from "./document-watchers.js";
+import { transferSyncResponse } from "./comparison-sync-transfer.js";
 
 export type ComparisonMode = "proposal" | "applied" | "compare" | "document";
 export type ComparisonDecision = "pending" | "before" | "after";
@@ -149,13 +150,17 @@ export interface Comparison {
   liveSourcePath?: string | null;
   liveSourceVersion?: string | null;
   liveSourceChanged?: boolean;
+  fileObservationWarning?: string;
+  recoveryStoragePressure?: boolean;
+  referenceVersion?: string;
   outdatedSuggestions?: OutdatedSuggestion[];
   copyDirectory?: string;
   recoveryCheckpoints?: Array<{
     id: string;
     generation: number;
     reason: string;
-    kind?: "copy-feedback";
+    kind?: "copy-feedback" | "automatic";
+    bytes?: number;
     uiDrafts?: Record<string, unknown>;
     entryUiDrafts?: Record<string, unknown>;
     createdAt: string;
@@ -224,6 +229,17 @@ class ComparisonError extends Error {
 }
 function hash(text: string): string {
   return crypto.createHash("sha256").update(text).digest("hex");
+}
+function preparedVersion(
+  identity: PreparedFileIdentity,
+  text: string,
+): string | undefined {
+  // In-place writes have no immutable staged version to identify later echoes.
+  if (identity.inPlace) return undefined;
+  const stat = fs.statSync(identity.stagedPath);
+  if (stat.dev !== identity.device || stat.ino !== identity.inode)
+    throw new FileChangedError();
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${hash(text)}`;
 }
 function log(event: string, fields: Record<string, unknown> = {}): void {
   const severity =
@@ -714,7 +730,7 @@ export class ComparisonStore {
   >();
   private ownRecords = new Map<
     string,
-    { observedAt: number; review: StoredComparison }
+    { observedAt: number; review: StoredComparison; version?: string }
   >();
 
   constructor(
@@ -918,11 +934,20 @@ export class ComparisonStore {
         ? (review.destinationPath ?? review.liveSourcePath)
         : review.targetPath;
     if (!filename) return null;
+    const snapshot = this.watchers.get(filename);
+    const observation =
+      snapshot.availability === "unobservable"
+        ? {
+            observation: "unobservable" as const,
+            message: snapshot.error,
+          }
+        : {};
     if (fresh) {
       try {
         const inspected = this.inspectDestination(filename);
         const current = inspected.current;
         return {
+          ...observation,
           path: inspected.path,
           version: current?.version ?? null,
           hash: current ? hash(current.text) : null,
@@ -945,9 +970,9 @@ export class ComparisonStore {
         };
       }
     }
-    const snapshot = this.watchers.get(filename);
     const own = this.ownDisk.get(filename);
-    if (own && snapshot.observedAt <= own.observedAt) return own.disk;
+    if (own && snapshot.observedAt <= own.observedAt)
+      return { ...own.disk, ...observation };
     if (own) this.ownDisk.delete(filename);
     return {
       path: snapshot.resolvedPath ?? filename,
@@ -957,7 +982,10 @@ export class ComparisonStore {
       availability:
         snapshot.resolvedPath && snapshot.resolvedPath !== filename
           ? "retargeted"
-          : snapshot.availability,
+          : snapshot.availability === "unobservable"
+            ? "available"
+            : snapshot.availability,
+      ...observation,
       ...(snapshot.error ? { message: snapshot.error } : {}),
     };
   }
@@ -973,6 +1001,30 @@ export class ComparisonStore {
       this.checkpointIndex(id),
       review.destinationPath ?? review.liveSourcePath,
     ].filter((value): value is string => Boolean(value));
+  }
+  private canRecreateFile(
+    review: StoredComparison,
+    disk: SyncDisk | null,
+  ): boolean {
+    const destination = review.destinationPath;
+    if (
+      !destination ||
+      review.autosave === "none" ||
+      disk?.availability !== "missing" ||
+      disk.path !== destination ||
+      disk.version !== null
+    )
+      return false;
+    try {
+      const parent = fs.realpathSync(path.dirname(destination));
+      if (path.join(parent, path.basename(destination)) !== destination)
+        return false;
+      enforceDocumentRoot(this.options.documentRoot, destination);
+      fs.accessSync(parent, fs.constants.W_OK | fs.constants.X_OK);
+      return !fs.lstatSync(destination, { throwIfNoEntry: false });
+    } catch {
+      return false;
+    }
   }
   context() {
     return this.operations.context();
@@ -992,6 +1044,13 @@ export class ComparisonStore {
     }
     return review;
   }
+  private registryGeneration(
+    review: StoredComparison,
+    disk: SyncDisk | null,
+    checkpoints: Comparison["recoveryCheckpoints"] = [],
+  ): string {
+    return `${review.revision}:${disk?.version ?? "none"}:${review.pendingPublication?.operation.operationId ?? ""}:${review.lastOperation?.id ?? ""}:${hash(JSON.stringify(checkpoints))}`;
+  }
   state(
     id: string,
     current?: StoredComparison,
@@ -999,8 +1058,17 @@ export class ComparisonStore {
   ): SyncState<Comparison> {
     const review = current ?? this.stateReview(id);
     const draft = this.syncDraft(review);
-    const disk =
+    let disk =
       diskOverride === undefined ? this.currentDisk(review) : diskOverride;
+    if (disk && !disk.observation) {
+      const observed = this.watchers.get(disk.path);
+      if (observed.availability === "unobservable")
+        disk = {
+          ...disk,
+          observation: "unobservable",
+          message: observed.error,
+        };
+    }
     const publicReview = this.view(review, false, true);
     publicReview.targetChanged = Boolean(
       disk &&
@@ -1012,7 +1080,16 @@ export class ComparisonStore {
     );
     publicReview.liveSourceChanged =
       !review.destinationPath && publicReview.targetChanged;
+    if (disk?.observation === "unobservable")
+      publicReview.fileObservationWarning = disk.message;
     publicReview.recoveryCheckpoints = this.checkpoints(id);
+    publicReview.recoveryStoragePressure =
+      publicReview.recoveryCheckpoints.length > 20 ||
+      publicReview.recoveryCheckpoints.reduce(
+        (total, entry) => total + (entry.bytes ?? 0),
+        0,
+      ) >
+        20 * 1024 * 1024;
     const state: SyncState<Comparison> = {
       review: publicReview,
       draft,
@@ -1020,7 +1097,12 @@ export class ComparisonStore {
       signature: reviewDraftSignature(draft),
       disk,
       operationContext: this.operations.context(),
-      registryGeneration: `${review.revision}:${disk?.version ?? "none"}:${review.pendingPublication?.operation.operationId ?? ""}:${review.lastOperation?.id ?? ""}`,
+      baseReferences: true,
+      registryGeneration: this.registryGeneration(
+        review,
+        disk,
+        publicReview.recoveryCheckpoints,
+      ),
     };
     if (review.pendingPublication)
       state.publishing = {
@@ -1034,6 +1116,17 @@ export class ComparisonStore {
         owner: "legacy",
         startedAt: fs.statSync(this.filename(id)).mtimeMs,
       };
+    if (state.publishing) {
+      const remaining = Math.max(
+        0,
+        Math.ceil(
+          30_000 - (this.operations.now() - state.publishing.startedAt),
+        ),
+      );
+      state.publishing.recoverable = remaining === 0;
+      state.publishing.retryAfter = Math.min(30_000, remaining);
+    }
+    if (this.canRecreateFile(review, disk)) state.canRecreateFile = true;
     this.bases.remember(id, review.revision, draft, state.signature);
     state.originDrafts = this.bases.origins(
       id,
@@ -1152,6 +1245,19 @@ export class ComparisonStore {
     record: OperationRecord<Comparison>,
   ): SyncResult<Comparison> {
     result.operationId = operation.operationId;
+    review.lastOperation = {
+      id: operation.operationId,
+      pageInstanceId: operation.pageInstanceId,
+      reason,
+    };
+    if (result.state?.review.id === review.id) {
+      result.state.review.lastOperation = { ...review.lastOperation };
+      result.state.registryGeneration = this.registryGeneration(
+        review,
+        result.state.disk,
+        result.state.review.recoveryCheckpoints,
+      );
+    }
     this.operations.prepare(record, result);
     review.operationOutcomes ??= {};
     review.operationOutcomes[operation.pageInstanceId] = {
@@ -1165,11 +1271,6 @@ export class ComparisonStore {
     for (const [page, marker] of Object.entries(review.operationOutcomes))
       if ((operation.acknowledgedOperationIds ?? []).includes(marker.id))
         delete review.operationOutcomes[page];
-    review.lastOperation = {
-      id: operation.operationId,
-      pageInstanceId: operation.pageInstanceId,
-      reason,
-    };
     this.save(review);
     this.watchers.invalidate(this.filename(review.id));
     this.reservations.release(review.id, operation.pageInstanceId);
@@ -1178,6 +1279,13 @@ export class ComparisonStore {
   operationStatus(id: string): SyncResult<Comparison> {
     try {
       const record = this.operations.read(id);
+      if (record?.resultUnavailable)
+        return {
+          status: "indeterminate",
+          operationId: id,
+          message:
+            "The retained save result is unavailable. Preserve your recovery copy before retrying.",
+        };
       if (!record)
         return {
           status: "indeterminate",
@@ -1244,6 +1352,13 @@ export class ComparisonStore {
       () => {
         const existing = this.operations.read(id);
         if (existing) {
+          if (existing.resultUnavailable)
+            return {
+              status: "indeterminate",
+              operationId: id,
+              message:
+                "The retained save result is unavailable. Preserve your recovery copy before retrying.",
+            };
           let ownerReview: StoredComparison | null = null;
           try {
             ownerReview = this.readReview(existing.reviewId);
@@ -1419,6 +1534,19 @@ export class ComparisonStore {
           message: "Another publication is finishing.",
         });
       const request = body as unknown as ReconcileRequest;
+      const resolutionCheckpoints = new Map<string, number>();
+      if (Array.isArray(request.resolution?.checkpointIds))
+        for (const checkpointId of request.resolution.checkpointIds) {
+          if (typeof checkpointId !== "string") continue;
+          const generation =
+            request.resolution.checkpointGenerations?.[checkpointId];
+          resolutionCheckpoints.set(
+            checkpointId,
+            Number.isSafeInteger(generation)
+              ? (generation as number)
+              : request.localGeneration,
+          );
+        }
       if (
         this.reservations.blocked(
           id,
@@ -1435,9 +1563,17 @@ export class ComparisonStore {
       }
       let submitted: SyncDraft;
       let base: SyncDraft;
+      const latest = this.syncDraft(review);
+      const baseInput =
+        body.base ??
+        (request.baseRevision === review.revision
+          ? latest
+          : this.bases.get(id, request.baseRevision));
+      if (!baseInput)
+        return reject(this.fallback(review, operation, "base-unavailable"));
       try {
         submitted = this.parseSyncDraft(body.draft, review);
-        base = this.parseSyncDraft(body.base, {
+        base = this.parseSyncDraft(baseInput, {
           ...review,
           reviewComments: [],
           draft: null,
@@ -1461,7 +1597,6 @@ export class ComparisonStore {
             "The supplied base signature did not match.",
           ),
         );
-      const latest = this.syncDraft(review);
       const freshDisk = this.currentDisk(review, true);
       const expected = request.expectedDisk;
       const bound = review.destinationPath ?? review.liveSourcePath ?? null;
@@ -1470,7 +1605,28 @@ export class ComparisonStore {
           status: "binding-changed",
           state: this.state(id, review, freshDisk),
         });
-      if (freshDisk && freshDisk.availability !== "available")
+      const recreate = request.reason === "recreate";
+      if (
+        recreate &&
+        (!review.destinationPath ||
+          review.autosave === "none" ||
+          request.writeFile !== true ||
+          expected?.version !== null)
+      )
+        return reject({
+          status: "rejected",
+          state: this.state(id, review, freshDisk),
+          message:
+            "Only an explicitly confirmed missing autosave file can be recreated.",
+        });
+      if (recreate && !this.canRecreateFile(review, freshDisk))
+        return reject({
+          status: "incoming-changed",
+          state: this.state(id, review, freshDisk),
+          message:
+            "The file appeared or its destination is no longer available for recreation.",
+        });
+      if (freshDisk && freshDisk.availability !== "available" && !recreate)
         return reject({
           status: "incoming-changed",
           state: this.state(id, review, freshDisk),
@@ -1485,6 +1641,7 @@ export class ComparisonStore {
       const acceptsDisk =
         request.reason === "adopt" ||
         request.reason === "resolve" ||
+        recreate ||
         (request.reason === "send" && body.adoptDisk === true);
       const observedCurrentDisk =
         !freshDisk || expected?.version === freshDisk.version;
@@ -1544,20 +1701,28 @@ export class ComparisonStore {
                 state: this.state(id, review, freshDisk),
                 merge,
               });
-            this.checkpoint(id, {
+            const localCheckpoint = this.checkpoint(id, {
               pageInstanceId: operation.pageInstanceId,
               generation: request.localGeneration,
               conflictId: merge.signature,
               workingDraft: submitted,
               reason: "Before resolving overlapping changes",
             });
-            this.checkpoint(id, {
+            resolutionCheckpoints.set(
+              localCheckpoint.checkpointId,
+              request.localGeneration,
+            );
+            const incomingCheckpoint = this.checkpoint(id, {
               pageInstanceId: "incoming",
               generation: review.revision,
               conflictId: merge.signature,
               workingDraft: latest,
               reason: "Incoming state before conflict resolution",
             });
+            resolutionCheckpoints.set(
+              incomingCheckpoint.checkpointId,
+              review.revision,
+            );
             merge = mergeReviewDrafts(base, submitted, latest, {
               server: true,
               budgetMs: 16,
@@ -1649,6 +1814,7 @@ export class ComparisonStore {
         this.statePaths(id),
         operation.operationId,
       );
+      const publishedVersions: Record<string, string | null> = {};
       try {
         if (
           writeFile &&
@@ -1674,20 +1840,37 @@ export class ComparisonStore {
             if (
               !current ||
               current.path !== freshDisk.path ||
+              current.availability !== freshDisk.availability ||
               current.version !== freshDisk.version
             )
               throw new FileChangedError();
           };
-          atomicWrite(
-            freshDisk.path,
-            candidate.cleanMarkdown ?? candidate.markdown,
-            {
-              beforePublish: verify,
-              allowBusyFallback: this.options.allowFileBindMountWrites,
-              onPrepared: (identity) =>
-                this.preparedPublication(review, identity, record),
-            },
-          );
+          const prepared = (identity: PreparedFileIdentity) => {
+            this.preparedPublication(review, identity, record);
+            const version = preparedVersion(
+              identity,
+              candidate.cleanMarkdown ?? candidate.markdown,
+            );
+            if (version) publishedVersions[freshDisk.path] = version;
+            else delete publishedVersions[freshDisk.path];
+          };
+          if (recreate)
+            createFile(
+              freshDisk.path,
+              candidate.cleanMarkdown ?? candidate.markdown,
+              verify,
+              prepared,
+            );
+          else
+            atomicWrite(
+              freshDisk.path,
+              candidate.cleanMarkdown ?? candidate.markdown,
+              {
+                beforePublish: verify,
+                allowBusyFallback: this.options.allowFileBindMountWrites,
+                onPrepared: prepared,
+              },
+            );
         }
         const finalDisk = this.currentDisk(review, true);
         const candidateClean = candidate.cleanMarkdown ?? candidate.markdown;
@@ -1790,6 +1973,23 @@ export class ComparisonStore {
           result,
           record,
         );
+        if (request.reason === "resolve") {
+          if (overwriteNotice)
+            resolutionCheckpoints.set(
+              overwriteNotice.checkpointId,
+              review.revision,
+            );
+          for (const [checkpointId, generation] of resolutionCheckpoints)
+            try {
+              this.resolveCheckpoint(id, checkpointId, generation);
+            } catch (error) {
+              log("checkpoint-resolution-deferred", {
+                id,
+                checkpointId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+        }
         log("sync-committed", {
           id,
           operationId: operation.operationId,
@@ -1806,12 +2006,25 @@ export class ComparisonStore {
           });
         return completed;
       } catch (error) {
-        if (error instanceof FileChangedError) {
+        if (
+          error instanceof FileChangedError ||
+          (recreate && error instanceof ComparisonError && error.status === 409)
+        ) {
+          const checkpoint = recreate
+            ? this.checkpoint(id, {
+                pageInstanceId: operation.pageInstanceId,
+                conflictId: operation.operationId,
+                generation: request.localGeneration,
+                workingDraft: candidate,
+                reason: "The file appeared before recreation finished",
+              })
+            : undefined;
           delete review.pendingPublication;
           this.save(review);
           return reject({
             status: "incoming-changed",
             state: this.state(id, review, this.currentDisk(review, true)),
+            ...(checkpoint ? { checkpointId: checkpoint.checkpointId } : {}),
           });
         }
         // The durable intent remains discoverable after an I/O error; never
@@ -1825,7 +2038,9 @@ export class ComparisonStore {
           };
         throw error;
       } finally {
-        release();
+        const recordVersion = this.ownRecords.get(id)?.version;
+        if (recordVersion) publishedVersions[this.filename(id)] = recordVersion;
+        release(publishedVersions);
         if (bound) this.watchers.invalidate(bound);
       }
     });
@@ -1855,7 +2070,9 @@ export class ComparisonStore {
       const review = this.readReview(id);
       const draft = this.parseSyncDraft(body.workingDraft, review);
       const page = stringField(body, "pageInstanceId") ?? "recovery";
-      const conflict = stringField(body, "conflictId") ?? "working";
+      const recoveryId = stringField(body, "recoveryId");
+      const conflict =
+        recoveryId ?? stringField(body, "conflictId") ?? "working";
       const generation =
         typeof body.generation === "number" &&
         Number.isSafeInteger(body.generation)
@@ -1885,9 +2102,12 @@ export class ComparisonStore {
         conflictId: conflict,
         generation,
         reason: stringField(body, "reason") ?? "Unsaved conflict recovery",
-        ...(body.kind === "copy-feedback"
-          ? { kind: "copy-feedback" as const }
-          : {}),
+        kind:
+          body.kind === "copy-feedback"
+            ? ("copy-feedback" as const)
+            : recoveryId
+              ? ("automatic" as const)
+              : undefined,
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
         entryDraft: previous?.entryDraft ?? draft,
@@ -1900,7 +2120,8 @@ export class ComparisonStore {
         uiDrafts: body.uiDrafts ?? {},
         baseVersions: body.baseVersions ?? null,
       };
-      atomicWrite(filename, JSON.stringify(snapshot));
+      const serialized = JSON.stringify(snapshot);
+      atomicWrite(filename, serialized);
       let list = this.checkpoints(id).filter(
         (item) => item.id !== checkpointId,
       );
@@ -1909,15 +2130,10 @@ export class ComparisonStore {
         generation,
         reason: snapshot.reason,
         ...(snapshot.kind ? { kind: snapshot.kind } : {}),
+        bytes: Buffer.byteLength(serialized),
         createdAt: String(snapshot.createdAt),
       });
-      const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-      list = list.filter((item) => {
-        if (!item.resolvedAt || Date.parse(item.resolvedAt) >= cutoff)
-          return true;
-        fs.rmSync(path.join(directory, `${item.id}.json`), { force: true });
-        return false;
-      });
+      list = this.pruneCheckpoints(id, list);
       atomicWrite(this.checkpointIndex(id), JSON.stringify(list));
       this.checkpointLists.set(id, {
         observedAt: Date.now(),
@@ -1925,7 +2141,6 @@ export class ComparisonStore {
       });
       this.watchers.invalidate(this.checkpointIndex(id));
       log("checkpoint-saved", { id, checkpointId, generation });
-      const resolved = list.filter((item) => item.resolvedAt);
       let totalBytes = 0;
       for (const item of list) {
         try {
@@ -1939,11 +2154,38 @@ export class ComparisonStore {
       return {
         checkpointId,
         generation,
-        ...(resolved.length > 20 || totalBytes > 20 * 1024 * 1024
+        ...(list.length > 20 || totalBytes > 20 * 1024 * 1024
           ? { storagePressure: true }
           : {}),
       };
     });
+  }
+  private pruneCheckpoints(
+    id: string,
+    entries: NonNullable<Comparison["recoveryCheckpoints"]>,
+  ): NonNullable<Comparison["recoveryCheckpoints"]> {
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const unresolved = entries.filter((entry) => !entry.resolvedAt);
+    const recent = entries
+      .filter(
+        (entry) => entry.resolvedAt && Date.parse(entry.resolvedAt) >= cutoff,
+      )
+      .sort(
+        (a, b) =>
+          Date.parse(b.resolvedAt ?? b.createdAt) -
+          Date.parse(a.resolvedAt ?? a.createdAt),
+      )
+      .slice(0, Math.max(0, 20 - unresolved.length));
+    const retained = new Set(
+      [...unresolved, ...recent].map((entry) => entry.id),
+    );
+    for (const entry of entries)
+      if (!retained.has(entry.id))
+        fs.rmSync(
+          path.join(this.directory, "checkpoints", id, `${entry.id}.json`),
+          { force: true },
+        );
+    return entries.filter((entry) => retained.has(entry.id));
   }
   readCheckpoint(id: string, checkpointId: string): unknown {
     this.readReview(id);
@@ -1966,18 +2208,36 @@ export class ComparisonStore {
     id: string,
     checkpointId: string | undefined,
     generation: number,
-    copyId: string,
+    copyId?: string,
   ): void {
     if (!checkpointId) return;
     const list = this.checkpoints(id);
     const entry = list.find((item) => item.id === checkpointId);
     if (!entry || entry.generation > generation) return;
+    if (!copyId) {
+      const snapshot = this.readCheckpoint(id, checkpointId) as {
+        uiDrafts?: Record<string, unknown>;
+        entryUiDrafts?: Record<string, unknown>;
+      };
+      const hasUnsubmitted = (drafts: Record<string, unknown> | undefined) =>
+        Object.values(drafts ?? {}).some((value) =>
+          value && typeof value === "object"
+            ? Object.keys(value).length > 0
+            : Boolean(value),
+        );
+      if (
+        hasUnsubmitted(snapshot.uiDrafts) ||
+        hasUnsubmitted(snapshot.entryUiDrafts)
+      )
+        return;
+    }
     entry.resolvedAt = new Date().toISOString();
     entry.savedCopyId = copyId;
-    atomicWrite(this.checkpointIndex(id), JSON.stringify(list));
+    const retained = this.pruneCheckpoints(id, list);
+    atomicWrite(this.checkpointIndex(id), JSON.stringify(retained));
     this.checkpointLists.set(id, {
       observedAt: Date.now(),
-      entries: structuredClone(list),
+      entries: structuredClone(retained),
     });
     this.watchers.invalidate(this.checkpointIndex(id));
   }
@@ -2064,15 +2324,49 @@ export class ComparisonStore {
       workingDraft === undefined
         ? this.syncDraft(review)
         : this.parseSyncDraft(workingDraft, review);
+    const installationName = this.options.displayName ?? "this server";
     let filename = requested ? this.requestedCopyPath(requested) : "";
     if (!filename) {
-      const directory =
-        review.copyDirectory ??
-        (current
-          ? path.dirname(current)
-          : (this.options.documentRoot ??
-            this.options.projectDir ??
-            process.cwd()));
+      const candidates = [
+        review.copyDirectory,
+        review.destinationPath
+          ? path.dirname(review.destinationPath)
+          : undefined,
+        ...[
+          review.liveSourcePath,
+          review.savedPath,
+          review.afterPath,
+          review.beforePath,
+          review.targetPath,
+        ]
+          .filter((value): value is string => Boolean(value))
+          .map((value) => path.dirname(value)),
+        this.options.documentRoot ?? this.options.projectDir ?? process.cwd(),
+      ];
+      let directory: string | undefined;
+      for (const candidate of new Set(candidates)) {
+        if (!candidate) continue;
+        try {
+          const canonical = fs.realpathSync(candidate);
+          enforceDocumentRoot(this.options.documentRoot, canonical);
+          if (!fs.statSync(canonical).isDirectory()) continue;
+          fs.accessSync(canonical, fs.constants.W_OK | fs.constants.X_OK);
+          directory = canonical;
+          break;
+        } catch {
+          /* Try the next allowed, existing folder. */
+        }
+      }
+      if (!directory)
+        return {
+          path: "",
+          displayPath: "",
+          installationName,
+          exists: false,
+          allowed: false,
+          message: "No writable folder is available for a separate copy.",
+          relativeLinks: [],
+        };
       const stem = current
         ? path.basename(current, path.extname(current))
         : "Untitled";
@@ -2091,10 +2385,12 @@ export class ComparisonStore {
         }
       }
     }
-    const installationName = this.options.displayName ?? "this server";
     try {
       const selected = this.inspectDestination(filename);
-      fs.accessSync(path.dirname(selected.path), fs.constants.W_OK);
+      fs.accessSync(
+        path.dirname(selected.path),
+        fs.constants.W_OK | fs.constants.X_OK,
+      );
       const aliases = [
         review.destinationPath,
         review.liveSourcePath,
@@ -2244,6 +2540,7 @@ export class ComparisonStore {
         [destination.path, this.filename(copy.id)],
         operation.operationId,
       );
+      const publishedVersions: Record<string, string | null> = {};
       try {
         createFile(
           destination.path,
@@ -2252,7 +2549,14 @@ export class ComparisonStore {
             if (this.inspectDestination(destination.path).current)
               throw new FileChangedError();
           },
-          (identity) => this.preparedPublication(copy, identity, record),
+          (identity) => {
+            this.preparedPublication(copy, identity, record);
+            const version = preparedVersion(
+              identity,
+              draft.cleanMarkdown ?? draft.markdown,
+            );
+            if (version) publishedVersions[destination.path] = version;
+          },
         );
         const current = this.sourceSnapshot(destination.path);
         if (
@@ -2325,7 +2629,10 @@ export class ComparisonStore {
           message: error instanceof Error ? error.message : String(error),
         };
       } finally {
-        release();
+        const recordVersion = this.ownRecords.get(copy.id)?.version;
+        if (recordVersion)
+          publishedVersions[this.filename(copy.id)] = recordVersion;
+        release(publishedVersions);
         this.watchers.invalidate(destination.path);
       }
     });
@@ -2471,16 +2778,31 @@ export class ComparisonStore {
   recover(id: string): SyncResult<Comparison> {
     return this.mutation(id, {}, () => {
       let review = this.readReview(id);
-      if (review.pendingPublication) return this.recoverPublication(review);
-      if (review.pendingSave || review.pendingApply) {
+      const kind = review.pendingPublication
+        ? "publication"
+        : review.pendingSave
+          ? "legacy-save"
+          : review.pendingApply
+            ? "legacy-apply"
+            : "none";
+      let result: SyncResult<Comparison>;
+      if (review.pendingPublication) result = this.recoverPublication(review);
+      else if (review.pendingSave || review.pendingApply) {
         // Explicit legacy recovery retains its existing no-file-replay contract.
         review = this.load(id);
-        return {
+        result = {
           status: "committed",
           state: this.state(id, review, this.currentDisk(review, true)),
         };
-      }
-      return { status: "committed", state: this.state(id, review) };
+      } else result = { status: "committed", state: this.state(id, review) };
+      log("publication-recovery", {
+        id,
+        kind,
+        status: result.status,
+        checkpointId: result.checkpointId,
+        replayedFileWrite: false,
+      });
+      return result;
     });
   }
   binding(id: string, body: Record<string, unknown>): SyncResult<Comparison> {
@@ -2563,7 +2885,11 @@ export class ComparisonStore {
           message: error instanceof Error ? error.message : String(error),
         });
       }
-      if (body.expectedVersion !== (selected.current?.version ?? null))
+      const expectedVersion =
+        body.expectedVersion === undefined && !selected.current
+          ? null
+          : body.expectedVersion;
+      if (expectedVersion !== (selected.current?.version ?? null))
         return reject({
           status: "incoming-changed",
           state: this.state(id, review),
@@ -2706,10 +3032,17 @@ export class ComparisonStore {
         if (directory === existingParent) break;
       }
     }
-    atomicWrite(this.filename(review.id), `${JSON.stringify(review)}\n`);
+    const serialized = `${JSON.stringify(review)}\n`;
+    let version: string | undefined;
+    atomicWrite(this.filename(review.id), serialized, {
+      onPrepared: (identity) => {
+        version = preparedVersion(identity, serialized);
+      },
+    });
     this.ownRecords.set(review.id, {
       observedAt: Date.now(),
       review: structuredClone(review),
+      version,
     });
     if (this.ownRecords.size > 128) {
       const oldest = this.ownRecords.keys().next().value;
@@ -2820,17 +3153,26 @@ export class ComparisonStore {
       ...result
     } = review;
     let targetChanged = false;
+    let fileObservationWarning: string | undefined;
     const filename =
-      review.editor === "unified" ? review.destinationPath : review.targetPath;
+      review.editor === "unified"
+        ? (review.destinationPath ?? review.liveSourcePath)
+        : review.targetPath;
     if (filename && (review.editor === "unified" || review.status === "open")) {
       try {
         const current = this.currentDisk(review, !cachedDisk);
+        if (current?.observation === "unobservable")
+          fileObservationWarning = current.message;
         targetChanged =
           !current ||
           current.availability !== "available" ||
           current.path !== filename ||
           current.version !==
-            (review.editor === "unified" ? destinationVersion : targetVersion);
+            (review.editor === "unified"
+              ? review.destinationPath
+                ? destinationVersion
+                : review.liveSourceVersion
+              : targetVersion);
       } catch {
         targetChanged = true;
       }
@@ -2862,6 +3204,13 @@ export class ComparisonStore {
     return {
       ...result,
       targetChanged,
+      referenceVersion: hash(
+        JSON.stringify([review.beforeText, review.afterText, review.segments]),
+      ),
+      ...(fileObservationWarning ? { fileObservationWarning } : {}),
+      ...(review.editor === "unified" && review.liveSourcePath
+        ? { liveSourceChanged: !review.destinationPath && targetChanged }
+        : {}),
       ...(includeRecoveryFeedback
         ? {
             recoveryCheckpoints: this.checkpoints(review.id).map((entry) => {
@@ -3776,6 +4125,13 @@ export class ComparisonStore {
       [resolved, this.filename(review.id)],
       operation.operationId,
     );
+    const publishedVersions: Record<string, string | null> = {};
+    const prepared = (identity: PreparedFileIdentity) => {
+      this.preparedPublication(review, identity, record);
+      const version = preparedVersion(identity, text);
+      if (version) publishedVersions[resolved] = version;
+      else delete publishedVersions[resolved];
+    };
     try {
       if (current?.text === text) verify();
       else {
@@ -3806,13 +4162,9 @@ export class ComparisonStore {
             mode: current.mode,
             beforePublish: verify,
             allowBusyFallback: this.options.allowFileBindMountWrites,
-            onPrepared: (identity) =>
-              this.preparedPublication(review, identity, record),
+            onPrepared: prepared,
           });
-        else
-          createFile(resolved, text, verify, (identity) =>
-            this.preparedPublication(review, identity, record),
-          );
+        else createFile(resolved, text, verify, prepared);
       }
       const saved = this.sourceSnapshot(resolved);
       if (saved.path !== resolved || saved.text !== text)
@@ -3871,7 +4223,10 @@ export class ComparisonStore {
       // are resolved under the same publication lock, never by a GET.
       throw error;
     } finally {
-      release();
+      const recordVersion = this.ownRecords.get(review.id)?.version;
+      if (recordVersion)
+        publishedVersions[this.filename(review.id)] = recordVersion;
+      release(publishedVersions);
       this.watchers.invalidate(resolved);
     }
   }
@@ -4154,6 +4509,22 @@ export function comparisonRouter(
         .status(500)
         .json({ error: "The review store could not be initialized" });
     }
+  });
+  router.use((req, res, next) => {
+    if (req.get("X-Roughdraft-Sync") === "compact-v1") {
+      const send = res.json.bind(res);
+      res.json = (value) =>
+        send(
+          transferSyncResponse(
+            value,
+            typeof req.params.id === "string"
+              ? req.params.id
+              : String(req.body?.reviewId ?? ""),
+            req.get("X-Roughdraft-Reference"),
+          ),
+        );
+    }
+    next();
   });
   const handle =
     (action: (request: Request, response: Response) => void) =>

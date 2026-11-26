@@ -51,6 +51,8 @@ Roughdraft starts its local server if needed, checks that the complete review li
 
 An agent's file edits and another tab's saved feedback appear in the open review without refreshing. Your selection, reading position and unfinished typing stay in place. Saved comments remain available when their quoted passage changes; a suggestion that no longer fits stays as feedback for the agent. A direct `edit FILE --autosave none` can follow the source without writing to it. Comparisons keep their original version references.
 
+For `edit FILE --autosave none`, `comparison "FULL_REVIEW_URL" --read --json` reports `targetChanged` and `liveSourceChanged` when the source has changed since the saved review. The returned draft is the saved feedback; read the current source file too before making further edits. A file mounted individually may not reveal changes made by its host. Roughdraft shows that limitation while allowing saves with the usual file checks.
+
 If both sides changed the same passage or review item, saving pauses while you keep editing. **Compare changes** shows your version and the latest version before you choose:
 
 1. **Discard my changes** uses the latest version of the overlapping parts. Unrelated edits and feedback from both sides stay.
@@ -60,6 +62,12 @@ If both sides changed the same passage or review item, saving pauses while you k
 These actions use the working draft even while **Original** or **Final** is displayed. Save separately is also available when the file is unavailable, an outside update cannot be applied safely, or a previous save's result cannot be recovered. Changing the copy's folder can affect relative links; the dialog explains the affected links before saving. Paths refer to the server running Roughdraft, with a named Documents folder on installations that restrict file access.
 
 Save separately also preserves unfinished comment and reply drafts. Open **Recovery copies** in Review details to inspect them or restore them to their editors. Changed comment passages stay in the recovery copy for inspection.
+
+**Review update** stays in the header when an update needs attention, including near the end of a long document. It opens the waiting update and its recovery actions in any document view.
+
+If your autosave file was deleted, **Recreate file** asks you to confirm its exact path before creating it from the working draft. Your review feedback stays intact. If a file appears there first, Roughdraft stops without replacing it. Reviews with autosave `none` do not offer this action.
+
+Recovery copies also offers work left by quiet browser tabs. Inspect it, then choose **Restore browser work** to bring its document and unfinished feedback into the editor. Your current unsaved work is preserved first. **Dismiss this copy** asks for confirmation and removes only that browser recovery copy; it does not change the open review or saved file. If a publication did not finish, **Recover** restores the saved review without repeating the file write.
 
 While a connection is unavailable, your work stays in the open tab as Roughdraft reconnects. An uncertain save is checked before retrying so it cannot create duplicate suggestions or files. A mounted file that cannot expose outside changes shows that limitation explicitly.
 

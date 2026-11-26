@@ -5,6 +5,10 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { ComparisonReviewData } from "./comparison-types";
 import { RevisionEditor } from "./RevisionEditor";
 
+const liveSession = vi.hoisted(() => ({
+  overrides: {} as Record<string, unknown>,
+}));
+
 vi.mock("./comparison-reading-position", () => ({
   useComparisonReadingPosition: () => () => {},
 }));
@@ -32,6 +36,7 @@ vi.mock("./revision-session", () => ({
     conflict: null,
     orphans: [],
     restoreOrphan: vi.fn(),
+    ...liveSession.overrides,
   }),
 }));
 vi.mock("./PageCard", () => ({
@@ -44,6 +49,7 @@ let container: HTMLDivElement;
 let root: ReturnType<typeof createRoot>;
 
 beforeEach(() => {
+  liveSession.overrides = {};
   Object.defineProperty(Range.prototype, "getClientRects", {
     configurable: true,
     value: () => [],
@@ -241,4 +247,248 @@ test("the Markdown icon exposes its action and active state", async () => {
   const source = EditorView.findFromDOM(host);
   expect(source?.state.doc.toString()).toBe("Revised text\n");
   expect(source?.state.readOnly).toBe(false);
+});
+
+test("the sticky header opens reachable conflict actions and identifies a review update without guessing a file changed", async () => {
+  liveSession.overrides = {
+    writePaused: true,
+    recoveryPending: true,
+    conflict: {
+      kind: "conflict",
+      message:
+        "A newer saved review is available. Some unsaved changes overlap.",
+      state: null,
+      conflicts: [
+        {
+          id: "body",
+          kind: "text",
+          base: "Old",
+          local: "Mine",
+          incoming: "Theirs",
+          label: "Document",
+        },
+      ],
+      signature: "overlap",
+      checkpointSaved: true,
+    },
+  };
+  await render();
+  expect(byId("revision-file-status")?.getAttribute("aria-label")).toBe(
+    "Review update",
+  );
+  const attention = byId("revision-update-attention");
+  expect(attention?.closest("header")).not.toBeNull();
+  await act(async () => attention?.click());
+  const dialog = byId("revision-update-dialog");
+  expect(dialog).not.toBeNull();
+  for (const action of [
+    "revision-discard",
+    "revision-overwrite",
+    "revision-save-separately",
+  ])
+    expect(dialog?.querySelector(`[data-testid="${action}"]`)).not.toBeNull();
+});
+
+test("an observation limitation stays visible while a writable file remains saved", async () => {
+  const warning =
+    "Outside changes to this mounted file cannot be observed automatically.";
+  await render({ fileObservationWarning: warning });
+  expect(byId("revision-file-observation-warning")?.textContent).toBe(warning);
+  expect(byId("revision-file-status")?.getAttribute("aria-label")).toBe(
+    "Saved to file",
+  );
+  expect(byId("revision-update-attention")).toBeNull();
+});
+
+test.each([
+  false,
+  true,
+])("publication recovery is offered only when the server marks it recoverable: %s", async (recoverable) => {
+  const recover = vi.fn(async () => true);
+  liveSession.overrides = {
+    recoverPublication: recover,
+    writePaused: true,
+    recoveryPending: true,
+    conflict: {
+      kind: "waiting",
+      signature: "publication",
+      conflicts: [],
+      message: "Publication did not finish.",
+      state: {
+        publishing: { recoverable },
+        review: { title: "Release plan" },
+        draft: { markdown: "Saved body." },
+      },
+    },
+  };
+  await render();
+  const button = byId("revision-publication-recover");
+  expect(Boolean(button)).toBe(recoverable);
+  expect(recover).not.toHaveBeenCalled();
+  if (recoverable) {
+    await act(async () => button?.click());
+    expect(recover).toHaveBeenCalledOnce();
+  }
+});
+
+test("Compare latest shows the waiting disk text while retaining the complete local annotated review", async () => {
+  const local =
+    "My {==annotated passage==}{>>Keep this saved feedback.<<}{#c1} and {++pending proposal++}{#s1}.\n";
+  const disk = "The actual waiting document written on disk.\n";
+  const changeDraft = vi.fn();
+  const run = vi.fn();
+  liveSession.overrides = {
+    writePaused: true,
+    recoveryPending: true,
+    updateDraft: changeDraft,
+    run,
+    conflict: {
+      kind: "waiting",
+      signature: "disk-v2",
+      conflicts: [],
+      message:
+        "The file changed on disk. This update is waiting for safe mapping.",
+      state: {
+        draft: { markdown: "The older saved review text.\n" },
+        disk: {
+          path: "/practice/release.md",
+          availability: "available",
+          text: disk,
+        },
+        review: {
+          title: "Release plan",
+          destinationPath: "/practice/release.md",
+        },
+      },
+    },
+  };
+  await render({ afterText: local });
+  await act(async () => byId("revision-compare-changes")?.click());
+  const comparison = byId("revision-compare-dialog");
+  expect(comparison).not.toBeNull();
+  const versions = [
+    ...(comparison?.querySelectorAll(
+      '[data-testid="revision-compare-source"]',
+    ) ?? []),
+  ].map((node) => node.textContent);
+  expect(versions).toEqual([local, disk]);
+  expect(changeDraft).not.toHaveBeenCalled();
+  expect(run).not.toHaveBeenCalled();
+});
+
+test("recreating a missing autosave file requires confirmation of its exact bound path", async () => {
+  const recreate = vi.fn(async () => true);
+  liveSession.overrides = {
+    recreateFile: recreate,
+    writePaused: true,
+    recoveryPending: true,
+    conflict: {
+      kind: "file",
+      message: "The autosave file is missing.",
+      conflicts: [],
+      signature: "missing-v1",
+      state: {
+        canRecreateFile: true,
+        disk: { availability: "missing", path: "/practice/release.md" },
+        review: {
+          title: "Release plan",
+          destinationPath: "/practice/release.md",
+        },
+        draft: { markdown: "My working draft." },
+      },
+    },
+  };
+  await render();
+  const action = byId("revision-recreate-file");
+  expect(action).not.toBeNull();
+  await act(async () => action?.click());
+  const confirmation = byId("revision-recreate-dialog");
+  expect(confirmation?.textContent).toContain("/practice/release.md");
+  expect(confirmation?.textContent).toContain("If the file appears first");
+  expect(recreate).not.toHaveBeenCalled();
+  await act(async () => byId("revision-recreate-confirm")?.click());
+  expect(recreate).toHaveBeenCalledExactlyOnceWith("/practice/release.md");
+});
+
+test("an arriving file disables an already-open recreation confirmation", async () => {
+  const recreate = vi.fn(async () => true);
+  const missing = {
+    kind: "file",
+    message: "The autosave file is missing.",
+    conflicts: [],
+    signature: "missing-v1",
+    state: {
+      canRecreateFile: true,
+      disk: { availability: "missing", path: "/practice/release.md" },
+      review: {
+        title: "Release plan",
+        destinationPath: "/practice/release.md",
+      },
+      draft: { markdown: "My draft." },
+    },
+  };
+  liveSession.overrides = {
+    recreateFile: recreate,
+    writePaused: true,
+    recoveryPending: true,
+    conflict: missing,
+  };
+  await render();
+  await act(async () => byId("revision-recreate-file")?.click());
+  liveSession.overrides.conflict = {
+    ...missing,
+    signature: "arrived-v2",
+    state: {
+      ...missing.state,
+      canRecreateFile: false,
+      disk: { ...missing.state.disk, availability: "available" },
+    },
+  };
+  await render();
+  expect(byId("revision-recreate-dialog")?.textContent).toContain("changed");
+  expect(
+    (byId("revision-recreate-confirm") as HTMLButtonElement | null)?.disabled,
+  ).toBe(true);
+  await act(async () => byId("revision-recreate-confirm")?.click());
+  expect(recreate).not.toHaveBeenCalled();
+});
+
+test.each([
+  "review-only",
+  "missing source",
+  "unsupported",
+  "appeared",
+] as const)("Recreate file is unavailable for %s", async (scenario) => {
+  const bound = scenario !== "review-only" && scenario !== "missing source";
+  liveSession.overrides = {
+    recreateFile: vi.fn(),
+    writePaused: true,
+    recoveryPending: true,
+    conflict: {
+      kind: "file",
+      message: "File unavailable.",
+      conflicts: [],
+      signature: "missing-v1",
+      state: {
+        canRecreateFile: scenario !== "unsupported",
+        disk:
+          scenario === "review-only"
+            ? null
+            : {
+                availability: scenario === "appeared" ? "available" : "missing",
+                path: "/practice/source.md",
+              },
+        review: {
+          title: "Review",
+          destinationPath: bound ? "/practice/source.md" : null,
+          autosave: bound ? "/practice/source.md" : "none",
+          liveSourcePath:
+            scenario === "missing source" ? "/practice/source.md" : null,
+        },
+        draft: { markdown: "Working draft." },
+      },
+    },
+  };
+  await render();
+  expect(byId("revision-recreate-file")).toBeNull();
 });

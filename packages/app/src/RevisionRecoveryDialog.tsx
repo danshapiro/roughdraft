@@ -24,6 +24,8 @@ export function RevisionRecoveryDialog({
   onInspect,
   onInspectOrphan,
   onRestore,
+  onClaimOrphan,
+  onDismissOrphan,
 }: {
   open: boolean;
   onOpenChange(open: boolean): void;
@@ -31,6 +33,8 @@ export function RevisionRecoveryDialog({
   orphans: Array<{ key: string; aliveAt: number }>;
   onInspect(id: string): Promise<RecoverySnapshot>;
   onInspectOrphan(key: string): RecoverySnapshot;
+  onClaimOrphan?(key: string): Promise<void>;
+  onDismissOrphan?(key: string): Promise<void>;
   onRestore?(
     snapshot: RecoverySnapshot,
   ): Promise<{ restored: number; skipped: number }>;
@@ -40,6 +44,8 @@ export function RevisionRecoveryDialog({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const [selectedOrphan, setSelectedOrphan] = useState<string | null>(null);
+  const [dismiss, setDismiss] = useState(false);
   const unfinished = latest ? snapshot?.uiDrafts : snapshot?.entryUiDrafts;
   const hasUnfinished = Boolean(
     unfinished &&
@@ -96,6 +102,8 @@ export function RevisionRecoveryDialog({
                   .then(
                     (value) => {
                       setSnapshot(value);
+                      setSelectedOrphan(null);
+                      setDismiss(false);
                       setLatest(true);
                     },
                     (caught) =>
@@ -122,6 +130,8 @@ export function RevisionRecoveryDialog({
                 setNotice("");
                 try {
                   setSnapshot(onInspectOrphan(orphan.key));
+                  setSelectedOrphan(orphan.key);
+                  setDismiss(false);
                   setLatest(true);
                 } catch (caught) {
                   setError(
@@ -229,6 +239,104 @@ export function RevisionRecoveryDialog({
             >
               Download complete recovery
             </Button>
+            {selectedOrphan && (
+              <div className="space-y-3">
+                <p className="text-sm">
+                  Restore this browser work to the editor, including unfinished
+                  feedback. Your current unsaved work is preserved first.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {onClaimOrphan && (
+                    <Button
+                      className="min-h-11"
+                      data-testid="revision-recovery-claim"
+                      disabled={busy}
+                      onClick={() => {
+                        setBusy(true);
+                        setError("");
+                        setNotice("");
+                        void onClaimOrphan(selectedOrphan)
+                          .then(
+                            () => {
+                              setSelectedOrphan(null);
+                              setNotice(
+                                "Browser work restored. Review any waiting outside changes before saving.",
+                              );
+                            },
+                            (caught) =>
+                              setError(
+                                caught instanceof Error
+                                  ? caught.message
+                                  : String(caught),
+                              ),
+                          )
+                          .finally(() => setBusy(false));
+                      }}
+                    >
+                      Restore browser work
+                    </Button>
+                  )}
+                  {onDismissOrphan && (
+                    <Button
+                      className="min-h-11"
+                      variant="outline"
+                      data-testid="revision-recovery-dismiss"
+                      disabled={busy}
+                      onClick={() => setDismiss(true)}
+                    >
+                      Dismiss this copy
+                    </Button>
+                  )}
+                </div>
+                {dismiss && onDismissOrphan && (
+                  <section className="space-y-3 rounded border p-3">
+                    <p>
+                      This removes only this browser recovery copy. The open
+                      review and saved file stay as they are. Download the
+                      complete recovery first if you may need it.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        className="min-h-11"
+                        variant="outline"
+                        disabled={busy}
+                        onClick={() => setDismiss(false)}
+                      >
+                        Cancel
+                      </Button>
+                      <Button
+                        className="min-h-11"
+                        data-testid="revision-recovery-dismiss-confirm"
+                        disabled={busy}
+                        onClick={() => {
+                          setBusy(true);
+                          setError("");
+                          setNotice("");
+                          void onDismissOrphan(selectedOrphan)
+                            .then(
+                              () => {
+                                setSelectedOrphan(null);
+                                setSnapshot(null);
+                                setDismiss(false);
+                                setNotice("Browser recovery copy dismissed.");
+                              },
+                              (caught) =>
+                                setError(
+                                  caught instanceof Error
+                                    ? caught.message
+                                    : String(caught),
+                                ),
+                            )
+                            .finally(() => setBusy(false));
+                        }}
+                      >
+                        Dismiss browser recovery copy
+                      </Button>
+                    </div>
+                  </section>
+                )}
+              </div>
+            )}
           </section>
         )}
         {error && <p role="alert">{error}</p>}

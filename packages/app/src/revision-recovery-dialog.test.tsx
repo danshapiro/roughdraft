@@ -179,3 +179,42 @@ test("restoring the initial copy uses its own feedback and attachment context", 
     uiDrafts: snapshot.entryUiDrafts,
   });
 });
+
+test("an inspected orphan can be restored explicitly or dismissed only after confirmation", async () => {
+  const restore = vi.fn(async () => {});
+  const dismiss = vi.fn(async () => {});
+  await act(async () =>
+    root.render(
+      <RevisionRecoveryDialog
+        open
+        onOpenChange={() => {}}
+        copies={[]}
+        orphans={[{ key: "closed-tab", aliveAt: 1 }]}
+        onInspect={async () => {
+          throw new Error("Unused");
+        }}
+        onInspectOrphan={() => ({
+          entryDraft: draft("Earlier."),
+          workingDraft: draft("Recover this body."),
+        })}
+        onClaimOrphan={restore}
+        onDismissOrphan={dismiss}
+      />,
+    ),
+  );
+  await act(async () => button("revision-recovery-orphan-closed-tab")?.click());
+  expect(restore).not.toHaveBeenCalled();
+  expect(dismiss).not.toHaveBeenCalled();
+  expect(button("revision-recovery-claim")).not.toBeNull();
+  await act(async () => button("revision-recovery-claim")?.click());
+  expect(restore).toHaveBeenCalledWith("closed-tab");
+
+  await act(async () => button("revision-recovery-orphan-closed-tab")?.click());
+  await act(async () => button("revision-recovery-dismiss")?.click());
+  expect(dismiss).not.toHaveBeenCalled();
+  expect(document.body.textContent).toContain(
+    "This removes only this browser recovery copy",
+  );
+  await act(async () => button("revision-recovery-dismiss-confirm")?.click());
+  expect(dismiss).toHaveBeenCalledWith("closed-tab");
+});

@@ -190,6 +190,7 @@ test("paragraph suggestions still work after keeping an earlier change", () => {
   editor.commands.splitBlock();
   expect(onBlocked).not.toHaveBeenCalled();
   expect(suggestionPositions(editor.state.doc).size).toBe(1);
+  expect([...suggestionPositions(editor.state.doc).keys()]).not.toContain("s1");
   expect(
     projectAcceptedDocument(editor.state.doc).doc.content.eq(accepted.content),
   ).toBe(true);

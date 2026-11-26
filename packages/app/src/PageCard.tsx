@@ -99,6 +99,7 @@ import {
 } from "./revision-private-anchors";
 import { publicRevisionNode } from "./revision-private-comments";
 import { suggestionPositions } from "./revision-projection";
+import { documentProposalIdentities } from "./revision-proposal-identities";
 import { rebaseRemoteMetadata } from "./revision-remote-metadata";
 import {
   parseRemoteRevision,
@@ -555,20 +556,7 @@ function addCommentIdsToAnchor(
 function getDocumentCriticChanges(
   editor: Editor,
 ): Array<Pick<CriticChangeAttrs, "changeId">> {
-  const changes = new Map<string, Pick<CriticChangeAttrs, "changeId">>();
-
-  editor.state.doc.descendants((node) => {
-    if (!node.isText) return;
-
-    for (const mark of node.marks) {
-      if (mark.type.name !== "criticChange") continue;
-      if (typeof mark.attrs.changeId !== "string") continue;
-
-      changes.set(mark.attrs.changeId, { changeId: mark.attrs.changeId });
-    }
-  });
-
-  return [...changes.values()];
+  return documentProposalIdentities(editor.state.doc);
 }
 
 function suggestionText(
@@ -1089,27 +1077,9 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
             ),
       );
       currentMarkdownRef.current = nextMarkdown;
-      if (
-        isEditableReview &&
-        currentEditor &&
-        sourceMetadata &&
-        sourceMetadata.markdown !== nextMarkdown
-      ) {
-        resolvingSuggestionRef.current = true;
-        try {
-          currentEditor.view.dispatch(
-            currentEditor.state.tr
-              .setDocAttribute("sourceMetadata", {
-                ...sourceMetadata,
-                markdown: nextMarkdown,
-              })
-              .setStoredMarks(currentEditor.state.storedMarks)
-              .setMeta("addToHistory", false),
-          );
-        } finally {
-          resolvingSuggestionRef.current = false;
-        }
-      }
+      // Serializing a native edit does not change the editor document. Keep
+      // its snapshot here; an actual source edit installs the exact baseline
+      // in sourceUpdateRef so source Undo still restores the original spelling.
       if (currentEditor) {
         sourceDocSnapshots.current.set(
           nextMarkdown,
@@ -1127,7 +1097,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       }
       onMarkdownChange(nextMarkdown);
     },
-    [onMarkdownChange, isEditableReview],
+    [onMarkdownChange],
   );
 
   const compositionFinished = useCallback(

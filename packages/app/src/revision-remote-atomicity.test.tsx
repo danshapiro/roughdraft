@@ -127,6 +127,91 @@ test("continuous rich-text typing emits its first coalesced snapshot within 225 
   expect(changed.mock.calls[1][0]).toContain("paragraph.ABCDE");
 });
 
+test("serializing native typing leaves the DOM caret alone and source Undo restores its exact native baseline", async () => {
+  const markdown =
+    "# Release\n\n* Keep this list spelling.\n\nNative paragraph.\n";
+  const changed = vi.fn();
+  const flush = { current: null as (() => void) | null };
+  const source = {
+    current: null as ((markdown: string, previous?: string) => void) | null,
+  };
+  let editor: Editor | null = null;
+  await act(async () =>
+    root.render(
+      <TooltipProvider>
+        <RichTextEditorSurface
+          page={{
+            id: "native-source-baseline",
+            title: "Keep exact source while typing",
+            content: markdown,
+          }}
+          activeDocumentPath="practice.md"
+          selected
+          layout="default"
+          focusRequestKey={null}
+          sourceMarkdown={markdown}
+          onMarkdownChange={changed}
+          interactionMode="editing"
+          backend={
+            new ApiBackend({
+              kind: "local-files",
+              label: "Files",
+              detail: "/practice.md",
+              projectPath: "/",
+            })
+          }
+          onEditorReady={(value) => {
+            editor = value;
+          }}
+          editableReview={{
+            suggestions: [],
+            decisions: [],
+            comments: new Map(),
+            onCommentsChange: () => {},
+            onAccept: () => true,
+            onReject: () => true,
+            onBlockedSuggestionEdit: () => {},
+            markdownFlushRef: flush,
+            sourceUpdateRef: source,
+          }}
+        />
+      </TooltipProvider>,
+    ),
+  );
+  if (!editor) throw new Error("Expected the actual editor");
+  const live = editor as Editor;
+  await act(async () => {
+    live.commands.setTextSelection(live.state.doc.content.size - 1);
+    live.view.focus();
+    live.view.dispatch(live.state.tr.insertText(" Typed."));
+  });
+  const nativeSelection = live.state.selection.toJSON();
+  const selection = window.getSelection();
+  if (!selection) throw new Error("Expected the actual DOM selection");
+  const collapse = vi.spyOn(selection, "collapse");
+  changed.mockClear();
+  await act(async () => flush.current?.());
+  expect(changed).toHaveBeenCalledOnce();
+  expect(changed.mock.calls[0][0]).toContain("Native paragraph. Typed.");
+  expect(live.state.selection.toJSON()).toEqual(nativeSelection);
+  expect(collapse).not.toHaveBeenCalled();
+  collapse.mockRestore();
+
+  const nativeSpelling = markdown.replace(
+    "Native paragraph.",
+    "Native paragraph. Typed.",
+  );
+  const sourceEdit = nativeSpelling.replace("Release", "Launch release");
+  await act(async () => source.current?.(sourceEdit, nativeSpelling));
+  expect(live.state.doc.textContent).toContain("Launch release");
+  await act(async () => {
+    expect(undo(live.state, live.view.dispatch)).toBe(true);
+  });
+  expect(changed.mock.calls.at(-1)?.[0]).toBe(nativeSpelling);
+  expect(changed.mock.calls.at(-1)?.[1]).toBe("source");
+  expect(live.state.doc.textContent).toContain("Native paragraph. Typed.");
+});
+
 test("renumbering a proposal preserves its excluded private reply while adopting the peer proposal", async () => {
   const original =
     '# Release\n\nAlpha owner: ready.\n\nBeta owner: ready.\n\nAn existing {++proposal++}{#s1}.\n\nKeep {==context==}{>>Saved feedback<<}{#c1}.\n\n---\ncomments:\n  c1:\n    by: AI\n    at: "2026-11-22T12:00:00.000Z"\nsuggestions:\n  s1:\n    by: AI\n    at: "2026-11-22T12:00:00.000Z"\n';

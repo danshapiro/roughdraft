@@ -2,22 +2,26 @@ import type { Node } from "@tiptap/pm/model";
 import { EditorState, type Transaction } from "@tiptap/pm/state";
 import { ReplaceStep } from "@tiptap/pm/transform";
 import type { ReviewedChange } from "./comparison-types";
+import { criticMarkdownToEditorState } from "./critic-markup";
 import {
   applySuggestionDecisions,
   type ReviewDecision,
 } from "./review-decisions";
-import { mapReviewedChanges, reviewedChanges } from "./revision-history";
+import {
+  createReviewedChangeId,
+  mapReviewedChanges,
+  reviewedChanges,
+} from "./revision-history";
 import {
   documentMetadata,
   sameMetadata,
   withDocumentMetadata,
 } from "./revision-metadata";
-import { criticMarkdownToEditorState } from "./critic-markup";
 import { suggestionPositions } from "./revision-projection";
 import {
   type BaseSide,
-  referenceChanges,
   referenceChangeIds,
+  referenceChanges,
   revertReferenceChange,
 } from "./revision-reference";
 
@@ -78,7 +82,7 @@ export function decideReviewChanges(
     })),
     ...natives.map((id) => ({
       ...suggestionDetail(state.doc, id),
-      keptIds: [] as string[],
+      keptIds: [id],
     })),
   ].sort((a, b) => a.from - b.from || a.to - b.to);
   const append = (next: Transaction) => {
@@ -164,11 +168,6 @@ export function decideReviewChanges(
     else groups.push([passage]);
   }
   const previous = mapReviewedChanges(reviewedChanges(state.doc), tr);
-  let sequence = previous.reduce(
-    (max, item) =>
-      Math.max(max, Number(/^decision-(\d+)$/.exec(item.id)?.[1] ?? 0)),
-    0,
-  );
   const reviewed: ReviewedChange[] = groups.map((group) => {
     const start = Math.min(...group.map((item) => item.from));
     const end = Math.max(...group.map((item) => item.to));
@@ -177,7 +176,7 @@ export function decideReviewChanges(
     const restore = state.doc.slice(start, end);
     const current = tr.doc.slice(from, to);
     return {
-      id: `decision-${++sequence}`,
+      id: createReviewedChangeId(),
       decision,
       oldText: group
         .map((item) => item.oldText)
@@ -196,7 +195,7 @@ export function decideReviewChanges(
   });
   if (metadataPending)
     reviewed.push({
-      id: `decision-${++sequence}`,
+      id: createReviewedChangeId(),
       decision,
       oldText:
         [

@@ -6,7 +6,10 @@ import {
   roughdraftAttachmentContexts,
   scanRoughdraftReview,
 } from "./index.js";
-import { renumberReviewDraft } from "./review-identities.js";
+import {
+  renumberReviewDraft,
+  reviewHistoryProposalIds,
+} from "./review-identities.js";
 import type {
   SyncConflict,
   SyncDraft,
@@ -45,6 +48,56 @@ const same = (a: unknown, b: unknown) =>
     : canonicalValue(a) === canonicalValue(b);
 const object = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
+function historyMeaning(entry: SyncHistory | undefined) {
+  if (!entry) return undefined;
+  const {
+    inverse: _inverse,
+    guard: _guard,
+    stale: _stale,
+    staleReason: _staleReason,
+    unmappedSince: _unmappedSince,
+    originSignature: _originSignature,
+    ...meaning
+  } = entry;
+  return meaning;
+}
+
+function inverseProposalOwners(draft: SyncDraft) {
+  const owners = new Map<string, Set<string>>();
+  for (const entry of draft.reviewed ?? [])
+    for (const id of reviewHistoryProposalIds([entry])) {
+      const events = owners.get(id) ?? new Set<string>();
+      events.add(entry.id);
+      owners.set(id, events);
+    }
+  return owners;
+}
+
+function historyAction(entry: SyncHistory, sharedSources: ReadonlySet<string>) {
+  const detail = historyMeaning(entry);
+  if (!detail) return undefined;
+  const { id: _id, keptId, keptIds, ...meaning } = detail;
+  const sources = [
+    ...new Set(
+      [keptId, ...(keptIds ?? [])].filter(
+        (id): id is string => typeof id === "string" && id.length > 0,
+      ),
+    ),
+  ].sort();
+  // Native IDs must identify a pending item in the common base. Newly allocated
+  // IDs can collide after a proposal is immediately decided in two passages.
+  // Reference IDs encode the fixed comparison passage; metadata is document-wide.
+  return sources.length &&
+    sources.every(
+      (id) =>
+        sharedSources.has(id) ||
+        id.startsWith("reference-") ||
+        id === "document-metadata",
+    )
+    ? canonicalValue([sources, meaning])
+    : undefined;
+}
 
 function identityItems(
   draft: SyncDraft,
@@ -470,11 +523,40 @@ export function mergeReviewDrafts(
     const indexes = [base, local, incoming].map((draft, index) =>
       identityItems(draft, parsed[index]),
     );
-    const used = new Set(indexes.flatMap((items) => [...items.keys()]));
+    const inverseOwners = [base, local, incoming].map(inverseProposalOwners);
+    const inverseIds = inverseOwners.map((owners) => new Set(owners.keys()));
+    const incomingHistory = new Map(
+      (incoming.reviewed ?? []).map((entry) => [entry.id, entry]),
+    );
+    const sharedEvents = new Set(
+      (local.reviewed ?? [])
+        .filter(
+          (entry) =>
+            // UUID and timestamp/random events have a separator after the
+            // prefix. Legacy decision-1 IDs can still collide across pages.
+            entry.id.startsWith("decision-") &&
+            entry.id.slice("decision-".length).includes("-") &&
+            same(
+              historyMeaning(entry),
+              historyMeaning(incomingHistory.get(entry.id)),
+            ),
+        )
+        .map((entry) => entry.id),
+    );
+    const used = new Set([
+      ...indexes.flatMap((items) => [...items.keys()]),
+      ...inverseIds.flatMap((ids) => [...ids]),
+    ]);
     const mapping: Record<string, string> = {};
     let attachments: Map<string, unknown>[] | undefined;
     for (const id of indexes[1].keys()) {
-      if (indexes[0].has(id) || !indexes[2].has(id)) continue;
+      if (
+        indexes[0].has(id) ||
+        inverseIds[0].has(id) ||
+        !indexes[2].has(id) ||
+        sharedEvents.has(id)
+      )
+        continue;
       // Only simultaneous new IDs need attachment comparison. Existing review
       // IDs retain their identity when nearby pending markup changes spelling.
       attachments ??= [local, incoming].map((draft, index) =>
@@ -489,6 +571,38 @@ export function mergeReviewDrafts(
         mapping[id] = replacement;
         used.add(replacement);
       }
+    }
+    for (const id of new Set([...indexes[1].keys(), ...inverseIds[1]])) {
+      if (
+        mapping[id] ||
+        indexes[0].has(id) ||
+        inverseIds[0].has(id) ||
+        (!inverseIds[1].has(id) && !inverseIds[2].has(id)) ||
+        (!indexes[2].has(id) && !inverseIds[2].has(id))
+      )
+        continue;
+      const localOwners = inverseOwners[1].get(id);
+      const incomingOwners = inverseOwners[2].get(id);
+      if (
+        !indexes[1].has(id) &&
+        !indexes[2].has(id) &&
+        localOwners &&
+        incomingOwners &&
+        localOwners.size === incomingOwners.size &&
+        [...localOwners].every(
+          (owner) => sharedEvents.has(owner) && incomingOwners.has(owner),
+        )
+      )
+        continue;
+      // Resolving a proposal removes its inline ID, but its inverse still owns
+      // that identity. Only the browser may rename its new local references.
+      if (options.server)
+        throw new UnsupportedReviewMerge(
+          "Resolved proposal IDs collide; the browser must renumber its own items.",
+        );
+      const replacement = nextIdentity(id, used);
+      mapping[id] = replacement;
+      used.add(replacement);
     }
     if (Object.keys(mapping).length) {
       local = renumberReviewDraft(local, mapping);
@@ -575,19 +689,78 @@ export function mergeReviewDrafts(
     }
     check();
     const markdown = frontmatter + body + endmatter;
-    const reviewed = collection(
-      base.reviewed,
-      local.reviewed,
-      incoming.reviewed,
-      "history",
+    const historyOrigins = new Map<string, SyncDraft>();
+    const sharedHistorySources = new Set(parsed[0].map((item) => item.id));
+    const previousHistory = new Set(
+      (base.reviewed ?? []).map((entry) => entry.id),
     );
+    const newIncoming = new Map<string, SyncHistory[]>();
+    for (const entry of incoming.reviewed ?? []) {
+      const action = historyAction(entry, sharedHistorySources);
+      if (previousHistory.has(entry.id) || action === undefined) continue;
+      const entries = newIncoming.get(action) ?? [];
+      entries.push(entry);
+      newIncoming.set(action, entries);
+    }
+    const coalescedHistory = new Map<string, SyncHistory>();
+    const localHistory = (local.reviewed ?? []).filter((entry) => {
+      if (previousHistory.has(entry.id)) return true;
+      const action = historyAction(entry, sharedHistorySources);
+      const peer =
+        action === undefined ? undefined : newIncoming.get(action)?.shift();
+      if (!peer || peer.id === entry.id) return true;
+      // Two new actions on one real source are idempotent. Never coalesce by
+      // wording alone, or remove a prior event already present in the base.
+      coalescedHistory.set(peer.id, entry);
+      return false;
+    });
+    const histories = [base.reviewed, localHistory, incoming.reviewed].map(
+      (entries) => new Map((entries ?? []).map((entry) => [entry.id, entry])),
+    );
+    const reviewed: SyncHistory[] = [];
+    for (const id of new Set(histories.flatMap((items) => [...items.keys()]))) {
+      const entries = histories.map((items) => items.get(id));
+      const meaning = value(
+        historyMeaning(entries[0]),
+        historyMeaning(entries[1]),
+        historyMeaning(entries[2]),
+        "history",
+        `history:${id}`,
+      );
+      if (meaning === undefined) continue;
+      // Reuse one known coordinate system, preferably the common origin.
+      // Its positions are mapped by the editor after the merged text arrives.
+      const origins = [0, 2, 1].flatMap((index) =>
+        entries[index]
+          ? [{ entry: entries[index], source: [base, local, incoming][index] }]
+          : [],
+      );
+      const matching = origins.filter((origin) =>
+        same(historyMeaning(origin.entry), meaning),
+      );
+      const basis = matching[0] ?? origins[0];
+      const entry = { ...basis.entry, ...(meaning as object) } as SyncHistory;
+      const twin = coalescedHistory.get(id);
+      const permanent =
+        matching.find(
+          (origin) =>
+            origin.entry.stale && origin.entry.staleReason !== "needs-remap",
+        )?.entry ??
+        (twin?.stale && twin.staleReason !== "needs-remap" ? twin : undefined);
+      if (permanent) {
+        entry.stale = true;
+        entry.staleReason = permanent.staleReason;
+      } else if (!matching.length) {
+        // Combined semantic edits have no inverse known to restore that meaning.
+        entry.stale = true;
+        entry.staleReason = "changed-decision";
+      }
+      reviewed.push(entry);
+      historyOrigins.set(id, basis.source);
+    }
     const origin = reviewDraftSignature(base);
     const mapped = reviewed.map((item): SyncHistory => {
-      const from = base.reviewed?.some((entry) => same(entry, item))
-        ? base
-        : incoming.reviewed?.some((entry) => same(entry, item))
-          ? incoming
-          : local;
+      const from = historyOrigins.get(item.id) ?? local;
       if (from.markdown === markdown) return item;
       return {
         ...item,

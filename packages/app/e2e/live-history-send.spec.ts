@@ -36,10 +36,16 @@ function deferred() {
   });
   return { promise, resolve };
 }
-function withOwners(source: string) {
+function withOwners(source: string, beforeHistory = false) {
   const endmatter = source.lastIndexOf("\n---\n");
   expect(endmatter).toBeGreaterThan(0);
-  return `${source.slice(0, endmatter)}\n\nLive owner A: unchanged.\n\nLive owner B: unchanged.\n${source.slice(endmatter)}`;
+  const owners = "Live owner A: unchanged.\n\nLive owner B: unchanged.";
+  if (beforeHistory) {
+    const heading = source.search(/^# /m);
+    expect(heading).toBeGreaterThanOrEqual(0);
+    return `${source.slice(0, heading)}${owners}\n\n${source.slice(heading)}`;
+  }
+  return `${source.slice(0, endmatter)}\n\n${owners}\n${source.slice(endmatter)}`;
 }
 async function readReview(
   request: APIRequestContext,
@@ -111,7 +117,7 @@ function comments(markdown: string) {
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
-test("a stale two-page merge reopens the actual History passages when identical text exists nearby", async ({
+test("two pages editing above History reopen the actual passages when identical text exists nearby", async ({
   page,
   browser,
   request,
@@ -132,6 +138,7 @@ test("a stale two-page merge reopens the actual History passages when identical 
         "History Revert example:",
         `${revertDecoy}\n\nHistory Revert example:`,
       ),
+    true,
   );
   try {
     const { id, target } = await createReview(request, project, source);
@@ -228,6 +235,142 @@ test("a stale two-page merge reopens the actual History passages when identical 
     removeMarkdownProject(project);
   }
 });
+
+for (const sameProposal of [false, true]) {
+  test(
+    sameProposal
+      ? "two pages making the same proposal decision keep one reopenable History event"
+      : "two pages keep independent new decisions and can reopen both History entries",
+    async ({ page, browser, request }, testInfo) => {
+      test.setTimeout(45_000);
+      const project = createMarkdownProject("live-independent-history");
+      const peerContext = await browser.newContext();
+      const peer = await peerContext.newPage();
+      const held = deferred();
+      let captured = false;
+      let ownCommitted = false;
+      try {
+        const { id, target } = await createReview(request, project, original);
+        const url = new URL(`/?comparison=${id}`, testInfo.project.use.baseURL)
+          .href;
+        await Promise.all([page.goto(url), peer.goto(url)]);
+        await Promise.all([ready(page), ready(peer)]);
+        page.on("response", async (response) => {
+          if (!response.url().endsWith(`/${id}/reconcile`)) return;
+          try {
+            const result = await response.json();
+            if (
+              captured &&
+              result.status === "committed" &&
+              result.state?.draft.reviewed?.some(
+                (entry: { keptIds?: string[] }) =>
+                  entry.keptIds?.includes("s10"),
+              )
+            )
+              ownCommitted = true;
+          } catch {
+            // Fixture cleanup can cancel an already-observed response body.
+          }
+        });
+        await page.route(
+          `**/api/comparisons/${id}/reconcile`,
+          async (route) => {
+            const body = route.request().postDataJSON() as ReconcileRequest;
+            if (
+              !captured &&
+              body.draft.reviewed?.some((entry) => entry.decision === "accept")
+            ) {
+              captured = true;
+              await held.promise;
+            }
+            await route.continue();
+          },
+        );
+        await page.getByTestId("comment-rail-s10-action-accept").click();
+        await expect.poll(() => captured).toBe(true);
+        await peer
+          .getByTestId(
+            sameProposal
+              ? "comment-rail-s10-action-accept"
+              : "comment-rail-s11-action-reject",
+          )
+          .click();
+        await expect
+          .poll(
+            async () => (await readReview(request, id)).draft?.reviewed?.length,
+          )
+          .toBe(1);
+        held.resolve();
+        await expect.poll(() => ownCommitted).toBe(true);
+        await expect
+          .poll(
+            async () => (await readReview(request, id)).draft?.reviewed?.length,
+          )
+          .toBe(sameProposal ? 1 : 2);
+        const committed = await readReview(request, id);
+        expect(
+          new Set(committed.draft?.reviewed?.map((entry) => entry.id)).size,
+        ).toBe(sameProposal ? 1 : 2);
+        expect(
+          committed.draft?.reviewed?.map((entry) => entry.decision).sort(),
+        ).toEqual(sameProposal ? ["accept"] : ["accept", "reject"]);
+
+        for (const [view, other, id, phrase] of [
+          [page, peer, "s10", "deliberately clear"],
+          [peer, page, "s11", "keep the comment history"],
+        ] as const) {
+          if (sameProposal && id === "s11") continue;
+          const history = await openHistory(view);
+          const reopen = history
+            .getByTestId("revision-reviewed-entry")
+            .filter({ hasText: phrase })
+            .getByTestId("revision-reopen-change");
+          await expect(reopen).toBeEnabled();
+          await reopen.click();
+          await expect(
+            other.getByTestId(`comment-rail-${id}-action-accept`),
+          ).toBeVisible();
+        }
+        await expect
+          .poll(
+            async () => (await readReview(request, id)).draft?.reviewed?.length,
+          )
+          .toBe(0);
+        const final = await readReview(request, id);
+        expect(comments(final.draft?.markdown ?? "")).toEqual(
+          comments(original),
+        );
+        for (const view of [page, peer])
+          await expect(view.getByTestId("revision-conflict")).toHaveCount(0);
+        await expect
+          .poll(() => fs.readFileSync(target, "utf8"))
+          .toBe(final.draft?.cleanMarkdown);
+        fs.writeFileSync(
+          testInfo.outputPath("independent-history-decisions.json"),
+          JSON.stringify(
+            {
+              sameProposal,
+              committed: committed.draft?.reviewed?.map((entry) => ({
+                id: entry.id,
+                decision: entry.decision,
+                oldText: entry.oldText,
+                newText: entry.newText,
+              })),
+              finalHistory: final.draft?.reviewed,
+              comments: final.reviewComments.length,
+            },
+            null,
+            2,
+          ),
+        );
+      } finally {
+        held.resolve();
+        await peerContext.close();
+        removeMarkdownProject(project);
+      }
+    },
+  );
+}
 
 test("Send feedback commits within two seconds while the other page keeps typing", async ({
   page,

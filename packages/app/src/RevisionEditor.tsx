@@ -380,6 +380,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     run,
     inspect,
     recoveryError,
+    browserRecoveryWarning,
     recoveryPending,
     fileWritePending,
     writePaused,
@@ -400,7 +401,11 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     orphans,
     inspectRecovery,
     inspectOrphan,
+    restoreOrphan,
+    dismissOrphan,
     restoreRecoveryUi,
+    recoverPublication,
+    recreateFile,
   } = useRevisionSession(initial, seed);
   const markdownFlushRef = useRef<(() => void) | null>(null);
   const [markdownQueued, setMarkdownQueued] = useState(false);
@@ -433,6 +438,10 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const [copyOpen, setCopyOpen] = useState(false);
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [attentionOpen, setAttentionOpen] = useState(false);
+  useEffect(() => {
+    if (!liveConflict) setAttentionOpen(false);
+  }, [liveConflict]);
   const remoteUpdateRef = useRef<RevisionRemoteAdapter["apply"] | null>(null);
   const commentHistory = useRef<{
     past: CommentHistoryEntry[];
@@ -978,9 +987,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
             decision: keep ? "accept" : "reject",
             oldText: detail.oldText,
             newText: detail.newText,
-            ...(change && leaveAsIs
-              ? { keptIds: referenceChangeIds(change) }
-              : {}),
+            keptIds: change ? referenceChangeIds(change) : [changeId],
           },
           detail,
         );
@@ -1265,15 +1272,17 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     return () => document.removeEventListener("keydown", onSave);
   });
 
-  const fileState = saved
-    ? destination
-      ? "Saved to file"
-      : "Review saved"
-    : liveConflict?.kind === "conflict" || session.targetChanged
-      ? "File changed"
-      : writePaused
-        ? "Paused"
-        : "Saving…";
+  const fileState = liveConflict
+    ? "Review update"
+    : saved
+      ? destination
+        ? "Saved to file"
+        : "Review saved"
+      : session.targetChanged
+        ? "File changed"
+        : writePaused
+          ? "Paused"
+          : "Saving…";
   const secondaryTools = (measuring = false, overflow = false) => {
     const show = (index: number) =>
       measuring || (overflow ? index >= visibleTools : index < visibleTools);
@@ -1405,6 +1414,33 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       </>
     );
   };
+  const conflictBanner = liveConflict && (
+    <RevisionConflictBanner
+      conflict={liveConflict}
+      local={draft}
+      disabled={copyLocked}
+      viewLabel={
+        previewing ? (view === "accepted" ? "Final" : "Original") : undefined
+      }
+      onResolve={resolveConflict}
+      onSaveSeparately={() => {
+        setAttentionOpen(false);
+        setCopyOpen(true);
+      }}
+      onRetry={retrySync}
+      onReload={reloadFromFile}
+      onRecover={recoverPublication}
+      onRecreate={recreateFile}
+      onInspect={
+        destination
+          ? () => {
+              setAttentionOpen(false);
+              void inspect().then(setDisk, reportError);
+            }
+          : undefined
+      }
+    />
+  );
   return (
     <RevisionUiDraftContext.Provider value={uiDraftStore}>
       <TooltipProvider delay={300}>
@@ -1498,21 +1534,40 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                   </Button>
                 </PopoverContent>
               </Popover>
-              <span
-                className="revision-file-status"
-                data-testid="revision-file-status"
-                role="status"
-                aria-label={fileState}
-                title={
-                  saved
-                    ? destination
-                      ? `Saved to ${destination}`
-                      : "Review saved for the agent. No Markdown file writes."
-                    : fileState
-                }
-              >
-                {saved ? <Check aria-hidden="true" /> : fileState}
-              </span>
+              {liveConflict ? (
+                <Button
+                  className="min-h-11 shrink-0"
+                  variant="outline"
+                  data-testid="revision-update-attention"
+                  aria-haspopup="dialog"
+                  aria-expanded={attentionOpen}
+                  onClick={() => setAttentionOpen(true)}
+                >
+                  <span
+                    role="status"
+                    data-testid="revision-file-status"
+                    aria-label={fileState}
+                  >
+                    Review update
+                  </span>
+                </Button>
+              ) : (
+                <span
+                  className="revision-file-status"
+                  data-testid="revision-file-status"
+                  role="status"
+                  aria-label={fileState}
+                  title={
+                    saved
+                      ? destination
+                        ? `Saved to ${destination}`
+                        : "Review saved for the agent. No Markdown file writes."
+                      : fileState
+                  }
+                >
+                  {saved ? <Check aria-hidden="true" /> : fileState}
+                </span>
+              )}
             </div>
             <div className="revision-tools" ref={toolsRef}>
               <Select<DocumentInteractionMode>
@@ -1811,28 +1866,24 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               {actionError || recoveryError}
             </p>
           )}
-          {liveConflict && (
-            <RevisionConflictBanner
-              conflict={liveConflict}
-              local={draft}
-              disabled={copyLocked}
-              viewLabel={
-                previewing
-                  ? view === "accepted"
-                    ? "Final"
-                    : "Original"
-                  : undefined
-              }
-              onResolve={resolveConflict}
-              onSaveSeparately={() => setCopyOpen(true)}
-              onRetry={retrySync}
-              onReload={reloadFromFile}
-              onInspect={
-                destination
-                  ? () => void inspect().then(setDisk, reportError)
-                  : undefined
-              }
-            />
+          {browserRecoveryWarning && (
+            <p
+              role="status"
+              className="comparison-conflict text-sm"
+              data-testid="revision-browser-recovery-warning"
+            >
+              {browserRecoveryWarning}
+            </p>
+          )}
+          {!attentionOpen && conflictBanner}
+          {session.fileObservationWarning && (
+            <p
+              role="status"
+              className="comparison-conflict text-sm"
+              data-testid="revision-file-observation-warning"
+            >
+              {session.fileObservationWarning}
+            </p>
           )}
           {syncNotice && (
             <div role="status" className="comparison-error">
@@ -1858,6 +1909,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 className="min-h-11"
                 variant="outline"
                 onClick={() => setRecoveryOpen(true)}
+                data-testid="revision-browser-recovery-inspect"
               >
                 Inspect recoverable work
               </Button>
@@ -2252,6 +2304,22 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
               : undefined
           }
         />
+        <Dialog
+          open={Boolean(attentionOpen && liveConflict)}
+          onOpenChange={setAttentionOpen}
+        >
+          <DialogContent
+            data-testid="revision-update-dialog"
+            className="max-w-4xl"
+          >
+            <DialogTitle>Review update</DialogTitle>
+            <DialogDescription>
+              Inspect the waiting update and choose what to keep. Your working
+              draft and unfinished feedback stay here.
+            </DialogDescription>
+            {attentionOpen && conflictBanner}
+          </DialogContent>
+        </Dialog>
         <RevisionRecoveryDialog
           open={recoveryOpen}
           onOpenChange={setRecoveryOpen}
@@ -2259,6 +2327,8 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           orphans={orphans}
           onInspect={inspectRecovery}
           onInspectOrphan={inspectOrphan}
+          onClaimOrphan={restoreOrphan}
+          onDismissOrphan={dismissOrphan}
           onRestore={restoreRecoveryUi}
         />
       </TooltipProvider>

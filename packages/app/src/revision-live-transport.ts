@@ -82,6 +82,8 @@ class ReviewLiveHub {
   private suspended = false;
   private handshake: ReturnType<typeof setTimeout> | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
+  private workerRetry: ReturnType<typeof setTimeout> | null = null;
+  private workerRetryDelay = 1000;
   private lastPong = 0;
   private readonly baseURL: URL;
   private readonly namespace: string;
@@ -103,6 +105,7 @@ class ReviewLiveHub {
       return;
     }
     this.suspended = true;
+    this.clearWorkerRetry();
     this.disconnectWorker();
     for (const subscription of this.subscriptions.values())
       this.stopPolling(subscription);
@@ -173,7 +176,7 @@ class ReviewLiveHub {
   private connect() {
     if (this.disposed || this.suspended || this.worker) return;
     if (typeof SharedWorker === "undefined") {
-      this.startPollingFallback("worker-unavailable");
+      this.startPollingFallback("worker-unavailable", false, false);
       return;
     }
     try {
@@ -182,7 +185,7 @@ class ReviewLiveHub {
         new URL("./shared-live-worker.ts", import.meta.url),
         {
           type: "module",
-          name: `roughdraft-live-v${LIVE_TRANSPORT_PROTOCOL}-${namespaceHash(this.namespace)}`,
+          name: `roughdraft-live-v${LIVE_TRANSPORT_PROTOCOL}-${namespaceHash(`${this.namespace}|${import.meta.url}`)}`,
         },
       );
       this.worker = worker;
@@ -195,6 +198,8 @@ class ReviewLiveHub {
           protocol?: number;
           namespace?: string;
           reason?: ReviewChangeNotice["reason"];
+          recoverable?: boolean;
+          streaming?: boolean;
           hint?: ReviewVersionHint;
         };
         if (message.type === "ready") {
@@ -202,16 +207,22 @@ class ReviewLiveHub {
             message.protocol !== LIVE_TRANSPORT_PROTOCOL ||
             message.namespace !== this.namespace
           ) {
-            this.startPollingFallback("protocol-mismatch");
+            this.startPollingFallback("protocol-mismatch", false, false);
             return;
           }
           if (this.handshake) clearTimeout(this.handshake);
           this.handshake = null;
           this.lastPong = Date.now();
+          if (message.streaming) this.resumeStreaming();
         } else if (message.type === "pong") this.lastPong = Date.now();
         else if (message.type === "fallback")
-          this.startPollingFallback("worker-or-stream-unavailable");
+          this.startPollingFallback(
+            message.recoverable ? "stream-unavailable" : "worker-unavailable",
+            message.recoverable === true,
+            false,
+          );
         else if (message.type === "notice") {
+          if (message.reason === "reconnected") this.resumeStreaming();
           const hint = message.hint;
           const operationContext = contextFrom(hint?.operationContext);
           const notice: ReviewChangeNotice = {
@@ -243,7 +254,11 @@ class ReviewLiveHub {
           this.startPollingFallback("worker-heartbeat-timeout");
           return;
         }
-        this.worker.port.postMessage({ type: "heartbeat" });
+        try {
+          this.worker.port.postMessage({ type: "heartbeat" });
+        } catch {
+          this.startPollingFallback("worker-heartbeat-failed");
+        }
       }, 2000);
     } catch {
       this.startPollingFallback("worker-constructor-failed");
@@ -282,12 +297,53 @@ class ReviewLiveHub {
       worker.port.close();
     }
   }
-  private startPollingFallback(reason: string) {
-    if (this.disposed || this.fallback) return;
-    this.disconnectWorker();
+  private clearWorkerRetry() {
+    if (this.workerRetry) clearTimeout(this.workerRetry);
+    this.workerRetry = null;
+  }
+  private resumeStreaming() {
+    this.clearWorkerRetry();
+    this.workerRetryDelay = 1000;
+    this.fallback = false;
+    for (const subscription of this.subscriptions.values())
+      this.stopPolling(subscription);
+  }
+  private retryWorker() {
+    if (
+      this.workerRetry ||
+      this.worker ||
+      this.disposed ||
+      this.suspended ||
+      typeof SharedWorker === "undefined"
+    )
+      return;
+    this.workerRetry = setTimeout(() => {
+      this.workerRetry = null;
+      if (
+        this.disposed ||
+        this.suspended ||
+        document.visibilityState !== "visible"
+      )
+        return;
+      this.connect();
+      this.sendSubscriptions();
+    }, this.workerRetryDelay);
+    this.workerRetryDelay = Math.min(30_000, this.workerRetryDelay * 2);
+  }
+  private startPollingFallback(
+    reason: string,
+    keepWorker = false,
+    retryWorker = true,
+  ) {
+    if (this.disposed || this.suspended) return;
+    if (!keepWorker) this.disconnectWorker();
+    const first = !this.fallback;
     this.fallback = true;
-    report("fallback", reason);
-    for (const id of this.subscriptions.keys()) void this.poll(id);
+    if (first) {
+      report("fallback", reason);
+      for (const id of this.subscriptions.keys()) void this.poll(id);
+    }
+    if (!keepWorker && retryWorker) this.retryWorker();
   }
   private async poll(id: string) {
     const subscription = this.subscriptions.get(id);
@@ -419,12 +475,24 @@ class ReviewLiveHub {
   private foreground() {
     if (this.disposed) return;
     if (document.visibilityState !== "visible") {
+      this.clearWorkerRetry();
       for (const subscription of this.subscriptions.values())
         this.stopPolling(subscription);
       return;
     }
     this.all({ reason: "foreground" });
     if (this.fallback) {
+      if (!this.worker) {
+        this.clearWorkerRetry();
+        this.connect();
+        this.sendSubscriptions();
+      } else {
+        try {
+          this.worker.port.postMessage({ type: "reconnect" });
+        } catch {
+          this.startPollingFallback("worker-reconnect-failed");
+        }
+      }
       for (const id of this.subscriptions.keys()) void this.poll(id);
     } else {
       this.disconnectWorker();
@@ -435,6 +503,7 @@ class ReviewLiveHub {
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
+    this.clearWorkerRetry();
     this.disconnectWorker();
     for (const subscription of this.subscriptions.values())
       this.stopPolling(subscription);

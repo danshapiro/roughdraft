@@ -70,6 +70,8 @@ export interface SyncDisk {
     | "unreadable"
     | "retargeted"
     | "unobservable";
+  /** Observation limitations do not prevent guarded reads or writes. */
+  observation?: "unobservable";
   message?: string;
 }
 export interface SyncState<Review = unknown> {
@@ -80,8 +82,16 @@ export interface SyncState<Review = unknown> {
   disk: SyncDisk | null;
   operationContext: SyncContext;
   registryGeneration: string;
+  baseReferences?: boolean;
   originDrafts?: Record<string, SyncDraft>;
-  publishing?: { operationId: string; owner: string; startedAt: number };
+  canRecreateFile?: boolean;
+  publishing?: {
+    operationId: string;
+    owner: string;
+    startedAt: number;
+    recoverable?: boolean;
+    retryAfter?: number;
+  };
 }
 export interface SyncConflict {
   id: string;
@@ -108,7 +118,7 @@ export interface ReconcileRequest extends SyncOperation {
   expectedRevision: number;
   baseRevision: number;
   baseSignature: string;
-  base: SyncDraft;
+  base?: SyncDraft;
   draft: SyncDraft;
   expectedDisk: {
     path: string;
@@ -117,8 +127,13 @@ export interface ReconcileRequest extends SyncOperation {
   } | null;
   writeFile: boolean;
   localGeneration: number;
-  reason: "sync" | "adopt" | "resolve" | "send";
-  resolution?: { signature: string; choice: "local" | "incoming" };
+  reason: "sync" | "adopt" | "resolve" | "send" | "recreate";
+  resolution?: {
+    signature: string;
+    choice: "local" | "incoming";
+    checkpointIds?: string[];
+    checkpointGenerations?: Record<string, number>;
+  };
   reservationToken?: string;
   comment?: string;
 }

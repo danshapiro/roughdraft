@@ -17,9 +17,14 @@ import {
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { browserNavigationUrl, browserPath } from "./browser-base-path";
 import type { ComparisonReviewData, EditorDraft } from "./comparison-types";
+import {
+  decodeBrowserRecovery,
+  encodeBrowserRecovery,
+} from "./revision-browser-recovery";
 import type { RecoverySnapshot } from "./RevisionRecoveryDialog";
 import { subscribeReviewChanges } from "./revision-live-transport";
 import { measureRevision } from "./revision-performance";
+import { receiveSyncResponse } from "./revision-sync-transfer";
 import {
   disposeReviewMergeWorker,
   mergeReviewDraftsAsync,
@@ -69,9 +74,10 @@ export interface RevisionConflictState {
   signature: string;
   checkpointId?: string;
   checkpointSaved?: boolean;
+  storagePressure?: boolean;
   reloadAvailable?: boolean;
 }
-interface PendingOperation {
+export interface PendingOperation {
   operation: SyncOperation;
   reviewId: string;
   draft: RevisionDraft;
@@ -82,14 +88,16 @@ interface PendingOperation {
   /** The immutable candidate was published before its incoming delta was shown. */
   editorBase?: RevisionDraft;
 }
-interface BrowserRecovery {
+export interface BrowserRecovery {
   version: 2;
   pageInstanceId: string;
   aliveAt: number;
   revision: number;
+  generation?: number;
   draft: RevisionDraft;
   base: RevisionDraft;
   operation?: PendingOperation | null;
+  copyOperation?: PendingOperation | null;
   uiDrafts?: Record<string, unknown>;
   copyPath?: string;
   copyResult?: Pick<
@@ -101,6 +109,7 @@ interface SessionSnapshot {
   session: ComparisonReviewData;
   draft: RevisionDraft;
   recoveryError: string;
+  browserRecoveryWarning: string;
   recoveryPending: boolean;
   writePaused: boolean;
   reviewChanged: boolean;
@@ -134,6 +143,7 @@ async function request<T>(
   path: string,
   body?: object,
   etag?: string,
+  referenceVersion?: string,
 ): Promise<T | null> {
   const serialized =
     body === undefined
@@ -146,6 +156,10 @@ async function request<T>(
     const response = await fetch(browserPath(`/api/comparisons${path}`), {
       method: body === undefined ? "GET" : "POST",
       headers: {
+        "X-Roughdraft-Sync": "compact-v1",
+        ...(referenceVersion
+          ? { "X-Roughdraft-Reference": referenceVersion }
+          : {}),
         ...(serialized ? { "Content-Type": "application/json" } : {}),
         ...(etag ? { "If-None-Match": etag } : {}),
       },
@@ -191,16 +205,6 @@ function randomId() {
     `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
   );
 }
-function validRecovery(value: unknown): value is BrowserRecovery {
-  const record = value as BrowserRecovery | null;
-  return Boolean(
-    record?.version === 2 &&
-      typeof record.draft?.markdown === "string" &&
-      record.draft.decisions &&
-      Array.isArray(record.draft.reviewComments) &&
-      record.base?.decisions,
-  );
-}
 function hasUiDrafts(drafts: Record<string, unknown> | undefined) {
   return (
     Boolean(
@@ -211,6 +215,38 @@ function hasUiDrafts(drafts: Record<string, unknown> | undefined) {
   );
 }
 
+function readableState(
+  state: SyncState<ComparisonReviewData>,
+): SyncState<ComparisonReviewData> {
+  const disk = state.disk;
+  if (disk?.availability !== "unobservable" || disk.text === null) return state;
+  const changed = disk.text !== state.review.savedText;
+  return {
+    ...state,
+    disk: { ...disk, availability: "available", observation: "unobservable" },
+    review: {
+      ...state.review,
+      targetChanged: changed,
+      liveSourceChanged: !state.review.destinationPath && changed,
+      fileObservationWarning: disk.message,
+    },
+  };
+}
+
+function readableResponse<T>(value: T): T {
+  if (!value || typeof value !== "object") return value;
+  if ("disk" in value && "review" in value)
+    return readableState(
+      value as unknown as SyncState<ComparisonReviewData>,
+    ) as T;
+  if ("state" in value && value.state)
+    return {
+      ...value,
+      state: readableState(value.state as SyncState<ComparisonReviewData>),
+    };
+  return value;
+}
+
 /** One coalescing queue owns writes; notifications never replace newer local work. */
 export class RevisionSessionController {
   private snapshot: SessionSnapshot;
@@ -219,9 +255,12 @@ export class RevisionSessionController {
   private base: RevisionDraft;
   private state: SyncState<ComparisonReviewData> | null = null;
   private operation: PendingOperation | null = null;
+  private copyOperation: PendingOperation | null = null;
+  private activeOperations = new Set<string>();
   private adapter: RevisionRemoteAdapter | null = null;
   private applyingRemote = false;
   private projectionReady = false;
+  private exactCleanReady = false;
   private generation = 0;
   private sequence = 0;
   private baseRevision: number;
@@ -238,12 +277,31 @@ export class RevisionSessionController {
   private autosaveDueAt = 0;
   private retryNotBefore = 0;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
+  private publicationTimer: ReturnType<typeof setTimeout> | null = null;
   private unsubscribe: (() => void) | null = null;
   private unsubscribeUi: (() => void) | null = null;
   private stopped = false;
   private started = false;
   private refreshPromise: Promise<void> | null = null;
   private lastRecord: string | null = null;
+  private recoveryInputs: unknown[] = [];
+  private recoveryRecord: string | null = null;
+  private privateRecoveryKey: string | null = null;
+  private privateRecoveryRecord: string | null = null;
+  private pendingSharedRecovery: { key: string; record: string | null } | null =
+    null;
+  private sharedRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastSharedRecoveryAt = Number.NEGATIVE_INFINITY;
+  private lastRecoveryOperations: readonly string[] = [];
+  private lastRecoveryHeartbeatAt = Number.NEGATIVE_INFINITY;
+  private privateRecoveryFailed = false;
+  private sharedRecoveryFailed = false;
+  private claimedPredecessors = new Map<string, string>();
+  private orphanRecords = new Map<
+    string,
+    { raw: string; record: BrowserRecovery }
+  >();
+  private inspectedOrphans = new Map<string, string>();
   private pendingIncoming: SyncState<ComparisonReviewData> | null = null;
   private acknowledged: string[] = [];
   private recoveredUiDrafts: Record<string, unknown> | null = null;
@@ -255,6 +313,7 @@ export class RevisionSessionController {
   private checkpointGeneration = -1;
   private checkpointTimer: ReturnType<typeof setTimeout> | null = null;
   private checkpointEntryId: string | undefined;
+  private checkpointRecoveryId: string | undefined;
   private diskProjections = new Map<string, string>();
   private observedOverwriteId: string | undefined;
 
@@ -266,7 +325,13 @@ export class RevisionSessionController {
     this.baseRevision = initial.revision;
     this.observedOverwriteId = initial.lastOverwrite?.operationId;
     this.now = dependencies.now ?? Date.now;
-    this.api = dependencies.request ?? request;
+    this.api = async <T>(path: string, body?: object, etag?: string) => {
+      const previous = this.snapshot?.session ?? initial;
+      const value = dependencies.request
+        ? await dependencies.request<T>(path, body, etag)
+        : await request<T>(path, body, etag, previous.referenceVersion);
+      return readableResponse(receiveSyncResponse(value, previous));
+    };
     this.merge = dependencies.merge ?? mergeReviewDraftsAsync;
     this.pageId = dependencies.id?.() ?? randomId();
     try {
@@ -294,15 +359,28 @@ export class RevisionSessionController {
       this.current = recovered.draft;
       this.base = recovered.base;
       this.baseRevision = recovered.revision;
-      this.operation = recovered.operation ?? null;
-      this.copyPath = recovered.copyPath ?? this.operation?.copyPath;
+      this.operation =
+        recovered.operation?.kind === "copy"
+          ? null
+          : (recovered.operation ?? null);
+      this.copyOperation =
+        recovered.copyOperation ??
+        (recovered.operation?.kind === "copy" ? recovered.operation : null);
+      this.copyPath = recovered.copyPath ?? this.copyOperation?.copyPath;
       this.deferredCopy = recovered.copyResult ?? null;
       this.recoveredUiDrafts = recovered.uiDrafts ?? null;
     }
+    // Persisted and recovered drafts carry exact accepted Markdown spelling.
+    // Only a new seed needs projection; reprojecting a saved draft on opening
+    // can turn harmless editor normalization into an unintended file write.
+    this.exactCleanReady = Boolean(
+      (initial.draft || recovered) && this.current.cleanMarkdown !== undefined,
+    );
     this.snapshot = {
       session: initial,
       draft: this.current,
       recoveryError: "",
+      browserRecoveryWarning: "",
       recoveryPending: !sameReviewDraft(this.current, this.base),
       writePaused: false,
       reviewChanged: false,
@@ -345,69 +423,221 @@ export class RevisionSessionController {
       this.tabStorage?.setItem(pointer, this.pageId);
       if (!previous) return null;
       const key = `roughdraft-draft:${id}:${previous}`;
-      const raw = this.tabStorage?.getItem(key);
-      const record: unknown = raw ? JSON.parse(raw) : null;
-      if (!validRecovery(record)) return null;
+      const raw = this.tabStorage?.getItem(key) ?? this.storage?.getItem(key);
+      const record = decodeBrowserRecovery(raw ?? null);
+      if (!record) return null;
+      const sharedRaw = this.storage?.getItem(key) ?? null;
+      const shared = decodeBrowserRecovery(sharedRaw);
+      if (
+        sharedRaw &&
+        shared &&
+        shared.pageInstanceId === record.pageInstanceId &&
+        shared.revision <= record.revision &&
+        (sharedRaw === raw ||
+          shared.aliveAt < record.aliveAt ||
+          (shared.aliveAt === record.aliveAt &&
+            shared.generation !== undefined &&
+            record.generation !== undefined &&
+            shared.generation <= record.generation))
+      )
+        this.claimedPredecessors.set(key, sharedRaw);
       this.tabStorage?.removeItem(key); // Only this tab's private predecessor copy.
       return record;
     } catch {
       return null;
     }
   }
-  private persist(force = false) {
+  private recoveryAliveKey(key = this.key()) {
+    return key.replace(/^roughdraft-draft:/, "roughdraft-alive:");
+  }
+  private recoveryIsLive(key: string, fallback: number) {
+    const heartbeat = this.storage?.getItem(this.recoveryAliveKey(key));
+    const aliveAt =
+      heartbeat === null || heartbeat === undefined
+        ? fallback
+        : Number(heartbeat);
+    return this.now() - aliveAt <= 10_000;
+  }
+  private flushSharedRecovery() {
+    if (this.sharedRecoveryTimer) clearTimeout(this.sharedRecoveryTimer);
+    this.sharedRecoveryTimer = null;
+    const pending = this.pendingSharedRecovery;
+    if (!pending || !this.storage) return false;
+    try {
+      if (pending.record) {
+        this.storage.setItem(pending.key, pending.record);
+        this.lastRecord = pending.record;
+      } else if (this.storage.getItem(pending.key) === this.lastRecord) {
+        this.storage.removeItem(pending.key);
+        this.storage.removeItem(this.recoveryAliveKey(pending.key));
+        this.lastRecord = null;
+      }
+      this.pendingSharedRecovery = null;
+      this.lastSharedRecoveryAt = this.now();
+      this.sharedRecoveryFailed = false;
+      this.reportRecoveryStorage();
+      return true;
+    } catch {
+      // Keep the pending owned record for the next forced or scheduled retry.
+      this.sharedRecoveryFailed = true;
+      this.reportRecoveryStorage();
+      return false;
+    }
+  }
+  private reportRecoveryStorage() {
+    const warning = this.privateRecoveryFailed
+      ? this.sharedRecoveryFailed
+        ? "Browser recovery is unavailable. Keep this tab open or use Save separately to preserve your work."
+        : "Private browser recovery is unavailable. Recovery copies in other tabs remain available."
+      : this.sharedRecoveryFailed
+        ? "Your private browser recovery is available. Other tabs cannot recover it until browser storage is available."
+        : "";
+    if (this.snapshot.browserRecoveryWarning === warning) return;
+    if (warning)
+      console.warn(
+        JSON.stringify({
+          severity: "warn",
+          component: "revision-session",
+          event: "browser-recovery-storage-unavailable",
+          privateFailed: this.privateRecoveryFailed,
+          sharedFailed: this.sharedRecoveryFailed,
+        }),
+      );
+    this.emit({ browserRecoveryWarning: warning });
+  }
+  private clearClaimedPredecessors() {
+    for (const [key, raw] of this.claimedPredecessors) {
+      if (this.storage?.getItem(key) !== raw) {
+        this.claimedPredecessors.delete(key);
+        continue;
+      }
+      const record = decodeBrowserRecovery(raw);
+      if (record && !this.recoveryIsLive(key, record.aliveAt)) {
+        if (this.storage?.getItem(key) === raw) {
+          this.storage.removeItem(key);
+          this.storage.removeItem(this.recoveryAliveKey(key));
+        }
+        this.claimedPredecessors.delete(key);
+      }
+    }
+  }
+  private persist(force = false, immediate = force) {
     const key = this.key();
     const uiDrafts =
       this.adapter?.readUiDrafts() ?? this.recoveredUiDrafts ?? {};
-    const useful =
-      this.operation ||
-      this.copyPath ||
-      this.deferredCopy ||
-      !sameReviewDraft(this.current, this.base) ||
-      this.snapshot.conflict ||
-      hasUiDrafts(uiDrafts);
-    const record = useful
-      ? JSON.stringify({
-          version: 2,
-          pageInstanceId: this.pageId,
-          aliveAt: this.now(),
-          revision: this.state?.revision ?? this.snapshot.session.revision,
-          draft: this.current,
-          base: this.base,
-          operation: this.operation,
-          ...(this.copyPath !== undefined ? { copyPath: this.copyPath } : {}),
-          ...(this.deferredCopy?.status === "committed"
-            ? {
-                copyResult: {
-                  status: "committed" as const,
-                  operationId: this.deferredCopy.operationId,
-                  savedPath:
-                    this.deferredCopy.savedPath ??
-                    this.deferredCopy.state?.review.destinationPath ??
-                    this.copyPath,
-                  reviewUrl: this.deferredCopy.reviewUrl,
-                },
-              }
-            : {}),
-          uiDrafts,
-        } satisfies BrowserRecovery)
-      : null;
+    const revision = this.state?.revision ?? this.snapshot.session.revision;
+    const inputs = [
+      key,
+      this.current,
+      this.base,
+      this.operation,
+      this.copyOperation,
+      this.copyPath,
+      this.deferredCopy,
+      revision,
+      this.generation,
+      Boolean(this.snapshot.conflict),
+      uiDrafts.comments,
+      uiDrafts.suggestion,
+    ];
+    const changed = inputs.some(
+      (value, index) => value !== this.recoveryInputs[index],
+    );
+    if (changed) {
+      this.recoveryInputs = inputs;
+      const useful =
+        this.operation ||
+        this.copyOperation ||
+        this.copyPath ||
+        this.deferredCopy ||
+        !sameReviewDraft(this.current, this.base) ||
+        this.snapshot.conflict ||
+        hasUiDrafts(uiDrafts);
+      this.recoveryRecord = useful
+        ? encodeBrowserRecovery({
+            version: 2,
+            pageInstanceId: this.pageId,
+            aliveAt: this.now(),
+            revision,
+            generation: this.generation,
+            draft: this.current,
+            base: this.base,
+            operation: this.operation,
+            copyOperation: this.copyOperation,
+            ...(this.copyPath !== undefined ? { copyPath: this.copyPath } : {}),
+            ...(this.deferredCopy?.status === "committed"
+              ? {
+                  copyResult: {
+                    status: "committed" as const,
+                    operationId: this.deferredCopy.operationId,
+                    savedPath:
+                      this.deferredCopy.savedPath ??
+                      this.deferredCopy.state?.review.destinationPath ??
+                      this.copyPath,
+                    reviewUrl: this.deferredCopy.reviewUrl,
+                  },
+                }
+              : {}),
+            uiDrafts,
+          })
+        : null;
+    }
+    const record = this.recoveryRecord;
     let stored = false;
     try {
-      if (record) this.tabStorage?.setItem(key, record);
-      else this.tabStorage?.removeItem(key);
+      if (
+        this.privateRecoveryKey !== key ||
+        this.privateRecoveryRecord !== record
+      ) {
+        if (record) this.tabStorage?.setItem(key, record);
+        else this.tabStorage?.removeItem(key);
+        this.privateRecoveryKey = key;
+        this.privateRecoveryRecord = record;
+      }
       stored = Boolean(this.tabStorage);
+      this.privateRecoveryFailed = !stored;
     } catch {
       /* The durable server checkpoint remains available. */
+      this.privateRecoveryFailed = true;
+    }
+    const operations = [
+      this.operation?.operation.operationId ?? "",
+      this.copyOperation?.operation.operationId ?? "",
+    ];
+    immediate ||=
+      !stored ||
+      operations.some(
+        (id, index) => Boolean(id) && id !== this.lastRecoveryOperations[index],
+      );
+    this.lastRecoveryOperations = operations;
+    if (changed || immediate) {
+      this.pendingSharedRecovery = { key, record };
+      if (
+        immediate ||
+        !record ||
+        this.lastRecord === null ||
+        this.now() - this.lastSharedRecoveryAt >= 750
+      )
+        stored = this.flushSharedRecovery() || stored;
+      else if (!this.sharedRecoveryTimer)
+        this.sharedRecoveryTimer = setTimeout(
+          () => {
+            this.sharedRecoveryTimer = null;
+            this.flushSharedRecovery();
+          },
+          750 - (this.now() - this.lastSharedRecoveryAt),
+        );
     }
     try {
-      if (record) {
-        this.storage?.setItem(key, record);
-        this.lastRecord = record;
-        stored ||= Boolean(this.storage);
-      } else if (this.storage?.getItem(key) === this.lastRecord) {
-        this.storage?.removeItem(key);
-        this.lastRecord = null;
+      if (
+        record &&
+        !this.stopped &&
+        this.now() - this.lastRecoveryHeartbeatAt >= 3000
+      ) {
+        this.storage?.setItem(this.recoveryAliveKey(key), String(this.now()));
+        this.lastRecoveryHeartbeatAt = this.now();
       }
+      if (stored) this.clearClaimedPredecessors();
     } catch {
       /* Do not clear another page's work or pretend local recovery succeeded. */
     }
@@ -416,6 +646,7 @@ export class RevisionSessionController {
         recoveryError:
           "Browser recovery could not be saved. Your changes remain in this tab; retry storage before renumbering this suggestion.",
       });
+    this.reportRecoveryStorage();
     return stored;
   }
   private findOrphans() {
@@ -425,12 +656,28 @@ export class RevisionSessionController {
       for (let index = 0; index < (this.storage?.length ?? 0); index++) {
         const key = this.storage?.key(index);
         if (!key?.startsWith(prefix) || key === this.key()) continue;
-        const record: unknown = JSON.parse(
-          this.storage?.getItem(key) ?? "null",
-        );
-        if (validRecovery(record) && this.now() - record.aliveAt > 10_000) {
+        if (this.recoveryIsLive(key, Number.NEGATIVE_INFINITY)) continue;
+        const raw = this.storage?.getItem(key) ?? null;
+        if (raw && this.claimedPredecessors.get(key) === raw) continue;
+        const cached = this.orphanRecords.get(key);
+        const record =
+          cached?.raw === raw ? cached.record : decodeBrowserRecovery(raw);
+        if (record && raw && !this.recoveryIsLive(key, record.aliveAt)) {
+          this.orphanRecords.set(key, { raw, record });
+          while (
+            this.orphanRecords.size > 20 ||
+            [...this.orphanRecords.values()].reduce(
+              (bytes, entry) => bytes + entry.raw.length,
+              0,
+            ) >
+              8 * 1024 * 1024
+          )
+            this.orphanRecords.delete(
+              this.orphanRecords.keys().next().value as string,
+            );
           if (
             record.operation ||
+            record.copyOperation ||
             record.copyPath ||
             record.copyResult ||
             !sameReviewDraft(record.draft, this.base) ||
@@ -445,32 +692,122 @@ export class RevisionSessionController {
     }
     this.emit({ orphans });
   }
-  restoreOrphan = async (key: string) => {
-    const record: unknown = JSON.parse(this.storage?.getItem(key) ?? "null");
-    if (!validRecovery(record)) return;
-    await this.checkpoint();
-    this.current = record.draft;
-    this.base = record.base;
-    this.operation = record.operation ?? null;
-    this.copyPath = record.copyPath ?? this.operation?.copyPath;
-    this.deferredCopy = record.copyResult ?? null;
-    this.adapter?.restoreUiDrafts(record.uiDrafts ?? {});
-    this.emit({
-      draft: this.current,
-      recoveryPending: true,
-      notice: "Recovered work may still be open in another tab.",
-    });
-    this.persist();
-    await this.refresh(true);
+  private availableOrphan(key: string) {
+    if (
+      !key.startsWith(`roughdraft-draft:${this.snapshot.session.id}:`) ||
+      key === this.key()
+    )
+      throw new Error(
+        "That browser recovery copy does not belong to this review.",
+      );
+    const raw = this.storage?.getItem(key) ?? null;
+    const record = decodeBrowserRecovery(raw);
+    if (!record || !raw)
+      throw new Error("That browser recovery copy is no longer available.");
+    const inspected = this.inspectedOrphans.get(key);
+    if (inspected && inspected !== raw)
+      throw new Error(
+        "That recovery copy changed. Inspect its latest version before continuing.",
+      );
+    if (this.recoveryIsLive(key, record.aliveAt))
+      throw new Error("That tab is active again. Its work remains there.");
+    return { raw, record };
+  }
+  dismissOrphan = async (key: string) => {
+    const { raw } = this.availableOrphan(key);
+    if (this.storage?.getItem(key) !== raw)
+      throw new Error("That recovery copy changed. Inspect it again.");
+    this.storage?.removeItem(key);
+    this.storage?.removeItem(this.recoveryAliveKey(key));
+    this.inspectedOrphans.delete(key);
+    this.orphanRecords.delete(key);
+    this.findOrphans();
   };
+  restoreOrphan = async (key: string) =>
+    this.serialize(async () => {
+      const { raw, record } = this.availableOrphan(key);
+      if (!this.adapter)
+        throw new Error("The editor is not ready to restore this work.");
+      if (this.operation || this.copyOperation)
+        throw new Error(
+          "Check the current save status before restoring other browser work.",
+        );
+      const current = this.current;
+      const generation = this.generation;
+      const uiDrafts = this.adapter.readUiDrafts();
+      if (!sameReviewDraft(current, this.base) || hasUiDrafts(uiDrafts)) {
+        const checkpoint = await this.api<{ checkpointId: string }>(
+          `/${encodeURIComponent(this.snapshot.session.id)}/checkpoint`,
+          {
+            operationId: randomId(),
+            pageInstanceId: this.pageId,
+            conflictId: `before-browser-recovery:${randomId()}`,
+            generation: this.generation,
+            workingDraft: current,
+            uiDrafts,
+            reason: "Before restoring browser work",
+          },
+        );
+        if (!checkpoint)
+          throw new Error(
+            "Your current work must be preserved before restoring this copy. Retry when the server is available.",
+          );
+      }
+      if (
+        this.current !== current ||
+        this.generation !== generation ||
+        this.availableOrphan(key).raw !== raw
+      )
+        throw new Error(
+          "The working review or recovery copy changed. Inspect it again.",
+        );
+      const restored = this.adapter.apply(record.draft, { localBase: current });
+      if (!restored)
+        throw new Error(
+          "Finish your current edit before restoring this work. The recovery copy remains available.",
+        );
+      this.current = restored;
+      this.base = record.base;
+      this.baseRevision = record.revision;
+      this.operation =
+        record.operation?.kind === "copy" ? null : (record.operation ?? null);
+      this.copyOperation =
+        record.copyOperation ??
+        (record.operation?.kind === "copy" ? record.operation : null);
+      this.copyPath = record.copyPath ?? this.copyOperation?.copyPath;
+      this.deferredCopy = record.copyResult ?? null;
+      this.adapter?.restoreUiDrafts(record.uiDrafts ?? {});
+      this.emit({
+        draft: this.current,
+        recoveryPending: true,
+        notice: "Recovered work may still be open in another tab.",
+      });
+      if (!this.persist(true))
+        throw new Error(
+          "Browser recovery could not be preserved. This copy remains available.",
+        );
+      if (this.storage?.getItem(key) === raw) {
+        this.storage.removeItem(key);
+        this.storage.removeItem(this.recoveryAliveKey(key));
+      }
+      this.findOrphans();
+    }).then(() => this.refresh(true));
   inspectRecovery = (id: string) =>
     this.api<RecoverySnapshot>(
       `/${encodeURIComponent(this.snapshot.session.id)}/checkpoints/${encodeURIComponent(id)}`,
     ) as Promise<RecoverySnapshot>;
   inspectOrphan = (key: string): RecoverySnapshot => {
-    const record: unknown = JSON.parse(this.storage?.getItem(key) ?? "null");
-    if (!validRecovery(record))
+    const raw = this.storage?.getItem(key) ?? null;
+    const record = decodeBrowserRecovery(raw);
+    if (!record)
       throw new Error("That browser recovery copy is no longer available.");
+    if (raw) {
+      this.inspectedOrphans.set(key, raw);
+      while (this.inspectedOrphans.size > 20)
+        this.inspectedOrphans.delete(
+          this.inspectedOrphans.keys().next().value as string,
+        );
+    }
     return {
       entryDraft: record.base,
       workingDraft: record.draft,
@@ -676,9 +1013,16 @@ export class RevisionSessionController {
     if (this.timer) clearTimeout(this.timer);
     this.autosaveRequested = false;
     if (this.heartbeat) clearInterval(this.heartbeat);
+    if (this.publicationTimer) clearTimeout(this.publicationTimer);
+    this.publicationTimer = null;
     if (this.checkpointTimer) clearTimeout(this.checkpointTimer);
     this.checkpointTimer = null;
-    this.persist();
+    this.persist(false, true);
+    try {
+      this.storage?.setItem(this.recoveryAliveKey(), "0");
+    } catch {
+      /* Private recovery remains available. */
+    }
     disposeReviewMergeWorker();
   }
   setAdapter = (adapter: RevisionRemoteAdapter | null) => {
@@ -702,11 +1046,14 @@ export class RevisionSessionController {
     }
     if (adapter) {
       const normalized = adapter.apply(
-        { ...this.current, cleanMarkdown: undefined },
-        { forceCleanProjection: true },
+        this.exactCleanReady
+          ? this.current
+          : { ...this.current, cleanMarkdown: undefined },
+        { forceCleanProjection: !this.exactCleanReady },
       );
       if (normalized) {
         this.projectionReady = true;
+        this.exactCleanReady = true;
         this.current = normalized;
         if (
           this.state?.disk?.text === this.seed.markdown &&
@@ -792,6 +1139,14 @@ export class RevisionSessionController {
     if (!this.acknowledged.includes(id)) this.acknowledged.push(id);
     this.acknowledged = this.acknowledged.slice(-16);
   }
+  private async postOperation(path: string, body: SyncOperation) {
+    this.activeOperations.add(body.operationId);
+    try {
+      return await this.api<SyncResult<ComparisonReviewData>>(path, body);
+    } finally {
+      this.activeOperations.delete(body.operationId);
+    }
+  }
   private resumeIncoming() {
     const incoming = this.pendingIncoming;
     this.pendingIncoming = null;
@@ -800,24 +1155,13 @@ export class RevisionSessionController {
   private async resolvePending() {
     const pending = this.operation;
     if (!pending) return true;
+    if (this.activeOperations.has(pending.operation.operationId)) return false;
     const result = await this.api<SyncResult<ComparisonReviewData>>(
       `/operations/${encodeURIComponent(pending.operation.operationId)}/resolve`,
       { ...pending.operation, reviewId: pending.reviewId },
     );
     if (!result) return false;
     if (result.status === "committed" && result.state) {
-      if (pending.kind === "copy") {
-        this.deferredCopy = result;
-        this.operation = null;
-        this.acknowledge(pending.operation.operationId);
-        this.emit({
-          copyLocked: false,
-          notice:
-            "The separate copy was saved. Open Save separately to see its path.",
-        });
-        this.resumeIncoming();
-        return true;
-      }
       if (!(await this.applyAcknowledgment(result.state, pending)))
         return false;
       this.operation = null;
@@ -865,6 +1209,11 @@ export class RevisionSessionController {
           await this.serialize(async () => {
             if (await this.resolvePending()) this.schedule(0);
           });
+        if (
+          this.copyOperation &&
+          !this.activeOperations.has(this.copyOperation.operation.operationId)
+        )
+          await this.checkCopyStatus();
       } catch (error) {
         this.emit({
           recoveryError: `Updates are temporarily unavailable. Your work remains in this tab. ${errorMessage(error)}`,
@@ -884,6 +1233,12 @@ export class RevisionSessionController {
     state: SyncState<ComparisonReviewData> | null,
     merge?: SyncMerge,
   ) {
+    if (!this.snapshot.conflict) {
+      this.checkpointRecoveryId = randomId();
+      this.checkpointSignature = "";
+      this.checkpointGeneration = -1;
+      this.checkpointEntryId = undefined;
+    }
     const conflict: RevisionConflictState = {
       kind,
       message,
@@ -1101,7 +1456,40 @@ export class RevisionSessionController {
     if (adopted) this.rememberDiskProjection(state, adopted.cleanMarkdown);
     return adopted;
   }
+  private incomingUpdateCause(state: SyncState<ComparisonReviewData>) {
+    const disk = state.disk;
+    const fileChanged = Boolean(
+      disk &&
+        disk.text !== null &&
+        (disk.text !== state.review.savedText ||
+          state.review.liveSourceChanged ||
+          state.review.targetChanged),
+    );
+    const reviewChanged = state.revision > this.baseRevision;
+    return fileChanged
+      ? reviewChanged
+        ? "The file changed on disk and a newer saved review is available."
+        : "The file changed on disk."
+      : "A newer saved review is available.";
+  }
+  private schedulePublicationRefresh(reviewId: string, delay: number) {
+    this.publicationTimer = setTimeout(() => {
+      this.publicationTimer = null;
+      if (this.stopped || this.snapshot.session.id !== reviewId) return;
+      void this.refresh(true).finally(() => {
+        if (
+          !this.stopped &&
+          !this.publicationTimer &&
+          this.snapshot.session.id === reviewId &&
+          this.state?.publishing &&
+          !this.state.publishing.recoverable
+        )
+          this.schedulePublicationRefresh(reviewId, 1000);
+      });
+    }, delay);
+  }
   private async observe(state: SyncState<ComparisonReviewData>) {
+    state = readableState(state);
     if (state.review.id !== this.snapshot.session.id) return;
     const stale = () => {
       if (state.revision >= this.baseRevision) return false;
@@ -1111,11 +1499,23 @@ export class RevisionSessionController {
     };
     if (stale()) return;
     this.observeOverwrite(state.review);
+    if (this.publicationTimer) clearTimeout(this.publicationTimer);
+    this.publicationTimer = null;
     if (state.publishing) {
       this.state = state;
+      const recoverable = state.publishing.recoverable === true;
+      if (!recoverable) {
+        const wait = Math.max(
+          250,
+          Math.min(30_000, state.publishing.retryAfter ?? 30_000),
+        );
+        this.schedulePublicationRefresh(state.review.id, wait);
+      }
       this.wait(
         "waiting",
-        "A save is finishing. Your edits remain available.",
+        recoverable
+          ? "Publication did not finish. Recover the saved draft without rewriting the file."
+          : "A save is finishing. Your edits remain available.",
         state,
       );
       return;
@@ -1137,10 +1537,23 @@ export class RevisionSessionController {
       this.pendingIncoming = state;
       return;
     }
+    if (
+      this.copyOperation &&
+      this.activeOperations.has(this.copyOperation.operation.operationId)
+    ) {
+      this.pendingIncoming = state;
+      return;
+    }
     await this.serialize(async () => {
+      if (state.review.id !== this.snapshot.session.id) return;
       if (stale()) return;
       const previousState = this.state;
       this.state = state;
+      if (
+        this.snapshot.conflict?.kind === "waiting" &&
+        this.snapshot.conflict.state?.publishing
+      )
+        this.emit({ conflict: null, writePaused: false, recoveryError: "" });
       const disk = state.disk;
       if (disk && disk.availability !== "available") {
         this.emit({ session: state.review });
@@ -1167,7 +1580,7 @@ export class RevisionSessionController {
         }
         this.wait(
           "waiting",
-          "The outside file update could not be mapped safely. Your feedback is preserved.",
+          `${this.incomingUpdateCause(state)} It could not be mapped safely. Your feedback is preserved.`,
           state,
         );
         return;
@@ -1202,8 +1615,7 @@ export class RevisionSessionController {
       if (merged.status !== "merged") {
         this.wait(
           merged.status === "conflict" ? "conflict" : "waiting",
-          merged.reason ??
-            "The file or saved review overlaps your unsaved changes.",
+          `${this.incomingUpdateCause(state)} ${merged.status === "conflict" ? "Some of your unsaved changes overlap." : (merged.reason ?? "Your edits remain here while the update is mapped.")}`,
           state,
           merged,
         );
@@ -1293,28 +1705,31 @@ export class RevisionSessionController {
     }
     const workingDraft = this.current;
     const uiDrafts = this.adapter?.readUiDrafts() ?? {};
+    this.checkpointRecoveryId ??= randomId();
+    const recoveryId = this.checkpointRecoveryId;
     this.emit({
       conflict: { ...this.snapshot.conflict, checkpointSaved: false },
     });
     let succeeded = false;
     this.checkpointPromise = (async () => {
       try {
-        const result = await this.api<{ checkpointId: string }>(
-          `/${encodeURIComponent(this.snapshot.session.id)}/checkpoint`,
-          {
-            operationId: randomId(),
-            pageInstanceId: this.pageId,
-            conflictId: this.snapshot.conflict?.signature,
-            generation,
-            workingDraft,
-            uiDrafts,
-            baseVersions: {
-              revision: this.state?.revision,
-              disk: this.state?.disk,
-            },
+        const result = await this.api<{
+          checkpointId: string;
+          storagePressure?: boolean;
+        }>(`/${encodeURIComponent(this.snapshot.session.id)}/checkpoint`, {
+          operationId: randomId(),
+          pageInstanceId: this.pageId,
+          conflictId: this.snapshot.conflict?.signature,
+          recoveryId,
+          generation,
+          workingDraft,
+          uiDrafts,
+          baseVersions: {
+            revision: this.state?.revision,
+            disk: this.state?.disk,
           },
-        );
-        if (result) {
+        });
+        if (result && this.checkpointRecoveryId === recoveryId) {
           succeeded = true;
           this.checkpointSignature = signature;
           this.checkpointGeneration = generation;
@@ -1329,6 +1744,7 @@ export class RevisionSessionController {
               conflict: {
                 ...this.snapshot.conflict,
                 checkpointId: result.checkpointId,
+                storagePressure: Boolean(result.storagePressure),
                 checkpointSaved:
                   signature === this.checkpointContentSignature() &&
                   generation === this.generation,
@@ -1358,6 +1774,7 @@ export class RevisionSessionController {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     if (includeEditor) this.adapter?.flush?.();
+    if (includeEditor) this.persist(false, true);
     // Initial and recovered drafts must observe/rebase the authoritative state
     // before entering the write queue. A raw read inside that queue bypasses
     // conflict detection and can publish recovered text over an outside edit.
@@ -1405,6 +1822,7 @@ export class RevisionSessionController {
     resolution?: ReconcileRequest["resolution"],
     comment?: string,
   ) {
+    let includeBase = false;
     for (let attempt = 0; attempt < 3; attempt++) {
       const state = this.state;
       if (!state) return false;
@@ -1435,7 +1853,7 @@ export class RevisionSessionController {
         expectedRevision: state.revision,
         baseRevision: this.baseRevision,
         baseSignature: reviewDraftSignature(this.base),
-        base: this.base,
+        ...(state.baseReferences && !includeBase ? {} : { base: this.base }),
         draft: snapshot,
         expectedDisk: state.disk
           ? {
@@ -1446,15 +1864,15 @@ export class RevisionSessionController {
           : null,
         writeFile:
           reason !== "send" &&
-          (!adoptedDisk || reason === "resolve") &&
-          this.needsFileWrite(state, snapshot),
+          (!adoptedDisk || reason === "resolve" || reason === "recreate") &&
+          (reason === "recreate" || this.needsFileWrite(state, snapshot)),
         localGeneration: this.generation,
         reason: requestReason,
         resolution,
         comment,
       };
       try {
-        const result = await this.api<SyncResult<ComparisonReviewData>>(
+        const result = await this.postOperation(
           `/${encodeURIComponent(state.review.id)}/${reason === "send" ? "send" : "reconcile"}`,
           body,
         );
@@ -1492,6 +1910,19 @@ export class RevisionSessionController {
         this.operation = null;
         this.persist();
         if (result.state) this.state = result.state;
+        if (
+          reason === "recreate" &&
+          (result.status === "incoming-changed" ||
+            result.status === "binding-changed")
+        ) {
+          this.wait(
+            "file",
+            result.message ??
+              "The file changed before it could be recreated. Inspect the latest version before trying again.",
+            result.state ?? state,
+          );
+          return false;
+        }
         if (result.status === "conflict") {
           this.wait(
             "conflict",
@@ -1513,6 +1944,7 @@ export class RevisionSessionController {
           ].includes(result.status) &&
           result.state
         ) {
+          if (result.status === "base-unavailable") includeBase = true;
           const incoming = this.incomingFor(result.state);
           const disk = result.state.disk;
           if (!incoming) {
@@ -1591,7 +2023,9 @@ export class RevisionSessionController {
               expectedRevision: result.reservation.revision,
               baseRevision: result.state.revision,
               baseSignature: reviewDraftSignature(incomingBase),
-              base: incomingBase,
+              ...(result.state.baseReferences
+                ? { base: undefined }
+                : { base: incomingBase }),
               draft: candidate,
               reservationToken: result.reservation.token,
               expectedDisk: result.state.disk
@@ -1605,11 +2039,14 @@ export class RevisionSessionController {
               writeFile:
                 reason !== "send" &&
                 (reason === "resolve" ||
+                  reason === "recreate" ||
                   !disk ||
                   disk.text === result.state.review.savedText) &&
-                this.needsFileWrite(result.state, candidate),
+                (reason === "recreate" ||
+                  this.needsFileWrite(result.state, candidate)),
               reason:
                 reason !== "resolve" &&
+                reason !== "recreate" &&
                 disk &&
                 disk.text !== result.state.review.savedText
                   ? "adopt"
@@ -1626,7 +2063,7 @@ export class RevisionSessionController {
             };
             this.operation = submitted;
             this.persist();
-            const committed = await this.api<SyncResult<ComparisonReviewData>>(
+            const committed = await this.postOperation(
               `/${encodeURIComponent(state.review.id)}/${reason === "send" ? "send" : "reconcile"}`,
               reserved,
             );
@@ -1665,6 +2102,19 @@ export class RevisionSessionController {
             }
             this.acknowledge(reservedIdentity.operationId);
             this.operation = null;
+            if (
+              reason === "recreate" &&
+              (committed.status === "incoming-changed" ||
+                committed.status === "binding-changed")
+            ) {
+              this.wait(
+                "file",
+                committed.message ??
+                  "The file changed before it could be recreated. Inspect the latest version before trying again.",
+                committed.state ?? result.state,
+              );
+              return false;
+            }
             if (committed.status === "conflict") {
               this.wait(
                 "conflict",
@@ -1675,7 +2125,11 @@ export class RevisionSessionController {
               return false;
             }
             if (committed.status === "retry-later") {
-              if (reason === "send")
+              if (
+                reason === "send" ||
+                reason === "resolve" ||
+                reason === "recreate"
+              )
                 await new Promise((resolve) =>
                   setTimeout(
                     resolve,
@@ -1691,7 +2145,11 @@ export class RevisionSessionController {
           continue;
         }
         if (result.status === "retry-later") {
-          if (reason === "send") {
+          if (
+            reason === "send" ||
+            reason === "resolve" ||
+            reason === "recreate"
+          ) {
             await new Promise((resolve) =>
               setTimeout(
                 resolve,
@@ -1782,6 +2240,7 @@ export class RevisionSessionController {
           operationId: randomId(),
           pageInstanceId: this.pageId,
           conflictId: `${inspectedSignature}:incoming`,
+          recoveryId: `${this.checkpointRecoveryId ?? randomId()}:incoming`,
           generation: fresh.revision,
           workingDraft: incoming,
           reason: "Incoming version before conflict resolution",
@@ -1805,6 +2264,16 @@ export class RevisionSessionController {
       const result = await this.commit("resolve", {
         signature: inspectedSignature,
         choice,
+        checkpointIds: [
+          this.checkpointEntryId,
+          incomingCheckpoint.checkpointId,
+        ].filter((id): id is string => Boolean(id)),
+        checkpointGenerations: {
+          ...(this.checkpointEntryId
+            ? { [this.checkpointEntryId]: this.checkpointGeneration }
+            : {}),
+          [incomingCheckpoint.checkpointId]: fresh.revision,
+        },
       });
       if (!result) this.emit({ writePaused: true });
       return result;
@@ -1843,6 +2312,85 @@ export class RevisionSessionController {
       });
       return this.commit("adopt");
     });
+  recreateFile = (expectedPath: string) =>
+    this.serialize(async () => {
+      this.adapter?.flush?.();
+      if (this.operation && !(await this.resolvePending())) return false;
+      const fresh = await this.api<SyncState<ComparisonReviewData>>(
+        `/${encodeURIComponent(this.snapshot.session.id)}/state`,
+      );
+      if (!fresh)
+        throw new Error(
+          "The latest file state is unavailable. Your work remains here.",
+        );
+      if (
+        !fresh.canRecreateFile ||
+        fresh.review.destinationPath !== expectedPath ||
+        fresh.review.autosave === "none" ||
+        fresh.disk?.path !== expectedPath ||
+        fresh.disk.availability !== "missing" ||
+        fresh.disk.version !== null
+      ) {
+        this.state = fresh;
+        this.wait(
+          "file",
+          "This file can no longer be recreated at the confirmed path. Inspect its current state or save separately.",
+          fresh,
+        );
+        return false;
+      }
+      await this.checkpoint(true);
+      if (!this.snapshot.conflict?.checkpointSaved)
+        throw new Error(
+          "Recovery must finish before recreating the file. Your document and unfinished feedback remain here.",
+        );
+      this.state = fresh;
+      const result = await this.commit("recreate");
+      if (!result) this.emit({ writePaused: true });
+      return result;
+    });
+  recoverPublication = async () => {
+    const result = await this.serialize(async () => {
+      this.adapter?.flush?.();
+      const result = await this.api<SyncResult<ComparisonReviewData>>(
+        `/${encodeURIComponent(this.snapshot.session.id)}/recover`,
+        {},
+      );
+      if (!result?.state)
+        throw new Error(
+          "The recovery result is unavailable. Your work remains here.",
+        );
+      const pending = this.operation;
+      if (
+        pending &&
+        result.operationId === pending.operation.operationId &&
+        (result.status === "committed" || result.status === "rejected")
+      ) {
+        if (
+          result.status === "committed" &&
+          !(await this.applyAcknowledgment(result.state, pending))
+        )
+          return result;
+        this.operation = null;
+        this.acknowledge(pending.operation.operationId);
+        this.persist();
+      }
+      return result;
+    });
+    const recoveredState = result.state;
+    if (!recoveredState)
+      throw new Error(
+        "The recovery result is unavailable. Your work remains here.",
+      );
+    await this.observe(recoveredState);
+    if (!recoveredState.publishing)
+      this.emit({
+        notice:
+          result.message ??
+          "Recovered the unfinished save without rewriting the file.",
+      });
+    return !recoveredState.publishing;
+  };
   retry = async () => {
     this.emit({ recoveryError: "" });
     if (this.operation && !(await this.resolvePending())) return false;
@@ -1855,7 +2403,7 @@ export class RevisionSessionController {
       `/${encodeURIComponent(this.snapshot.session.id)}/destination${filename ? `?${new URLSearchParams({ path: filename })}` : ""}`,
     ) as Promise<InspectedDestination>;
   inspectCopy = (path?: string) => {
-    if (path !== undefined && this.operation?.kind !== "copy") {
+    if (path !== undefined && !this.copyOperation) {
       this.copyPath = path;
       this.persist();
     }
@@ -1875,8 +2423,10 @@ export class RevisionSessionController {
   };
   checkCopyStatus = async () => {
     if (this.deferredCopy) return this.deferredCopy;
-    if (this.operation?.kind === "copy") {
-      const operation = this.operation;
+    if (this.copyOperation) {
+      const operation = this.copyOperation;
+      if (this.activeOperations.has(operation.operation.operationId))
+        return null;
       const version = this.copyRequestVersion;
       const result = await this.api<SyncResult<ComparisonReviewData>>(
         `/operations/${encodeURIComponent(operation.operation.operationId)}/resolve`,
@@ -1885,13 +2435,13 @@ export class RevisionSessionController {
       if (version !== this.copyRequestVersion) return null;
       if (result?.status === "committed") {
         this.deferredCopy = result;
-        this.operation = null;
+        this.copyOperation = null;
         this.acknowledge(operation.operation.operationId);
         this.persist();
         return result;
       }
       if (result && ["not-received", "rejected"].includes(result.status)) {
-        this.operation = null;
+        this.copyOperation = null;
         this.acknowledge(operation.operation.operationId);
         this.persist();
         return result;
@@ -1906,24 +2456,47 @@ export class RevisionSessionController {
     if (!this.state) await this.refresh(true);
     if (!this.state)
       throw new Error("The server is unavailable. Your changes remain here.");
-    if (this.operation && !(await this.resolvePending()))
-      throw new Error("Check the previous save before creating another copy.");
+    const generation = this.generation;
+    const snapshot = this.current;
+    const uiDrafts = this.adapter?.readUiDrafts() ?? {};
+    return this.serialize(() =>
+      this.copyCaptured(
+        path,
+        relativeLinksAcknowledged,
+        generation,
+        snapshot,
+        uiDrafts,
+      ),
+    );
+  };
+  private async copyCaptured(
+    path: string,
+    relativeLinksAcknowledged: boolean,
+    generation: number,
+    snapshot: RevisionDraft,
+    uiDrafts: Record<string, unknown>,
+  ) {
+    if (this.copyOperation) {
+      await this.checkCopyStatus();
+      if (this.copyOperation)
+        throw new Error(
+          "Check the previous copy before creating another copy.",
+        );
+    }
     this.copyRequestVersion++;
     this.deferredCopy = null;
     this.copyPath = path;
     const identity = this.operationIdentity();
-    const generation = this.generation;
-    const snapshot = this.current;
     const body: CopyRequest = {
       ...identity,
       generation,
       workingDraft: snapshot,
-      uiDrafts: this.adapter?.readUiDrafts() ?? {},
+      uiDrafts,
       path,
       relativeLinksAcknowledged,
       conflictCheckpointId: this.checkpointEntryId,
     };
-    this.operation = {
+    this.copyOperation = {
       operation: identity,
       reviewId: this.snapshot.session.id,
       draft: snapshot,
@@ -1935,14 +2508,14 @@ export class RevisionSessionController {
     this.emit({ copyLocked: true });
     this.persist();
     try {
-      const result = await this.api<SyncResult<ComparisonReviewData>>(
+      const result = await this.postOperation(
         `/${encodeURIComponent(this.snapshot.session.id)}/copy`,
         body,
       );
       if (!result) throw new Error("The copy result is unavailable.");
       if (result.status === "committed" && result.state) {
         this.acknowledge(identity.operationId);
-        this.operation = null;
+        this.copyOperation = null;
         if (this.snapshot.copyLocked && generation === this.generation)
           this.switchToCopy(result, snapshot);
         else {
@@ -1954,14 +2527,15 @@ export class RevisionSessionController {
         }
       } else if (!["publishing", "indeterminate"].includes(result.status)) {
         this.acknowledge(identity.operationId);
-        this.operation = null;
+        this.copyOperation = null;
       }
       return result;
     } finally {
       this.emit({ copyLocked: false });
       this.persist();
+      this.resumeIncoming();
     }
-  };
+  }
   private switchToCopy(
     result: SyncResult<ComparisonReviewData>,
     captured: RevisionDraft,
@@ -1969,6 +2543,13 @@ export class RevisionSessionController {
     const state = result.state;
     if (!state) return;
     const oldKey = this.key();
+    // An uncertain ordinary publication still belongs to the original review.
+    // Preserve its recovery there before switching to the independently saved copy.
+    const keepOriginalRecovery = Boolean(this.operation);
+    if (keepOriginalRecovery) this.persist(false, true);
+    this.flushSharedRecovery();
+    this.operation = null;
+    this.pendingIncoming = null;
     this.copyRequestVersion++;
     this.deferredCopy = null;
     this.state = state;
@@ -1990,9 +2571,11 @@ export class RevisionSessionController {
       notice: "Saved separately.",
     });
     try {
-      this.tabStorage?.removeItem(oldKey);
-      if (this.storage?.getItem(oldKey) === this.lastRecord)
-        this.storage?.removeItem(oldKey);
+      if (!keepOriginalRecovery) {
+        this.tabStorage?.removeItem(oldKey);
+        if (this.storage?.getItem(oldKey) === this.lastRecord)
+          this.storage?.removeItem(oldKey);
+      }
       this.tabStorage?.setItem(
         `roughdraft-page:${state.review.id}`,
         this.pageId,
@@ -2097,6 +2680,8 @@ export function useRevisionSession(
     resolveConflict: controller.resolveConflict,
     reloadFromFile: controller.reloadFromFile,
     retrySync: controller.retry,
+    recoverPublication: controller.recoverPublication,
+    recreateFile: controller.recreateFile,
     inspectCopy: controller.inspectCopy,
     saveCopy: controller.copy,
     setCopyLocked: controller.setCopyLocked,
@@ -2104,6 +2689,7 @@ export function useRevisionSession(
     checkCopyStatus: controller.checkCopyStatus,
     generation: controller.getGeneration,
     restoreOrphan: controller.restoreOrphan,
+    dismissOrphan: controller.dismissOrphan,
     inspectRecovery: controller.inspectRecovery,
     inspectOrphan: controller.inspectOrphan,
     restoreRecoveryUi: controller.restoreRecoveryUi,

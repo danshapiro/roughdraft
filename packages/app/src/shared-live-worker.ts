@@ -31,6 +31,9 @@ export function installSharedLiveWorker(
   let source: EventSource | null = null;
   let sourceURL: string | null = null;
   let scheduled: ReturnType<typeof setTimeout> | null = null;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  let retryDelay = 1000;
+  let streaming = false;
   let disposed = false;
   let lastSequence: number | null = null;
   function send(port: MessagePort, value: unknown) {
@@ -46,10 +49,23 @@ export function installSharedLiveWorker(
       if (!id || subscription.ids.has(id)) send(port, value);
   }
   function closeSource() {
+    if (retry) clearTimeout(retry);
+    retry = null;
     source?.close();
     source = null;
     sourceURL = null;
     lastSequence = null;
+    streaming = false;
+  }
+  function retryStream() {
+    if (disposed || retry || !ports.size) return;
+    retry = setTimeout(() => {
+      retry = null;
+      if (scheduled) clearTimeout(scheduled);
+      scheduled = null;
+      reconcile();
+    }, retryDelay);
+    retryDelay = Math.min(30_000, retryDelay * 2);
   }
   function dispose() {
     if (disposed) return;
@@ -88,19 +104,47 @@ export function installSharedLiveWorker(
     const url = new URL("api/comparisons/events", baseURL);
     url.searchParams.set("ids", ids.join(","));
     url.searchParams.set("protocol", String(EVENT_STREAM_PROTOCOL));
+    if (retry) return;
     if (source && sourceURL === url.href) return;
     closeSource();
     sourceURL = url.href;
+    let current: EventSource;
     try {
-      source = createSource(url.href);
+      current = createSource(url.href);
+      source = current;
     } catch {
-      broadcast({ type: "fallback", reason: "stream-unavailable" });
+      sourceURL = null;
+      broadcast({
+        type: "fallback",
+        reason: "stream-unavailable",
+        recoverable: true,
+      });
+      retryStream();
       return;
     }
-    source.onopen = () => broadcast({ type: "notice", reason: "reconnected" });
-    source.onerror = () =>
-      broadcast({ type: "fallback", reason: "stream-unavailable" });
+    current.onopen = () => {
+      if (disposed || source !== current) return;
+      streaming = true;
+      lastSequence = null;
+      retryDelay = 1000;
+      broadcast({ type: "notice", reason: "reconnected" });
+    };
+    current.onerror = () => {
+      if (disposed || source !== current) return;
+      streaming = false;
+      broadcast({
+        type: "fallback",
+        reason: "stream-unavailable",
+        recoverable: true,
+      });
+      // CONNECTING sources already retry natively. A CLOSED source never does.
+      if (current.readyState === 2) {
+        closeSource();
+        retryStream();
+      }
+    };
     const receive = (event: Event) => {
+      if (disposed || source !== current) return;
       const message = event as MessageEvent<string>;
       try {
         const hint = JSON.parse(message.data) as Record<string, unknown>;
@@ -130,9 +174,9 @@ export function installSharedLiveWorker(
         broadcast({ type: "notice", reason: "reconnected" });
       }
     };
-    source.addEventListener("message", receive);
-    source.addEventListener("change", receive);
-    source.addEventListener("heartbeat", receive);
+    current.addEventListener("message", receive);
+    current.addEventListener("change", receive);
+    current.addEventListener("heartbeat", receive);
   }
   function schedule() {
     if (disposed) return;
@@ -196,6 +240,7 @@ export function installSharedLiveWorker(
           type: "ready",
           protocol: LIVE_TRANSPORT_PROTOCOL,
           namespace,
+          streaming,
         });
         schedule();
       } else if (message.type === "heartbeat") {

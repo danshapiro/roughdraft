@@ -30,7 +30,29 @@ const { app, dispose } = createApp({
   processStateDir: path.join(root, "process-state"),
   allowLocalFiles: true,
 });
-const server = createServer(app);
+const network = {
+  activeStreams: 0,
+  maximumStreams: 0,
+  streamRequests: 0,
+  stateRequests: 0,
+};
+const server = createServer((request, response) => {
+  const pathname = request.url?.split("?")[0];
+  if (pathname === "/api/comparisons/events") {
+    network.streamRequests++;
+    network.activeStreams++;
+    network.maximumStreams = Math.max(
+      network.maximumStreams,
+      network.activeStreams,
+    );
+    response.once("close", () => network.activeStreams--);
+  } else if (
+    request.method === "GET" &&
+    /^\/api\/comparisons\/[^/]+\/state$/.test(pathname ?? "")
+  )
+    network.stateRequests++;
+  app(request, response);
+});
 let stopping = false;
 function stop() {
   if (stopping) return;
@@ -43,6 +65,10 @@ process.once("SIGTERM", stop);
 process.once("SIGINT", stop);
 process.once("disconnect", stop);
 process.on("message", (message) => {
+  if (message.type === "network-stats") {
+    process.send?.({ type: "network-stats", id: message.id, network });
+    return;
+  }
   if (message.type !== "advance-clock") return;
   clockOffset += message.milliseconds;
   process.send?.({ type: "clock-advanced", id: message.id });

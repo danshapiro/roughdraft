@@ -1,3 +1,4 @@
+export { reviewHistoryProposalIds } from "./review-identities.js";
 export type { ReviewMergeOptions } from "./review-merge.js";
 export {
   mergeReviewDrafts,

@@ -1314,6 +1314,42 @@ test("an uncertain publication keeps its operation ID until resolve reports a co
   expect(server.draft.markdown).toContain("Local last continued.");
 });
 
+test.each([
+  ["review", "A newer saved review is available."],
+  ["file", "The file changed on disk."],
+  ["both", "The file changed on disk and a newer saved review is available."],
+] as const)("overlap notices identify the observed %s update", async (source, message) => {
+  let server = state();
+  const controller = install(
+    server,
+    async <T>(_path: string, body?: object) =>
+      body
+        ? ({ checkpointId: "preserved" } as T)
+        : (structuredClone(server) as T),
+    { adopt: (_base, markdown) => draft(markdown) },
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  controller.updateDraft(() => draft("My first.\n\nLast.\n"));
+  if (source !== "file") {
+    server = state("Peer first.\n\nLast.\n");
+    server.revision = 2;
+    server.review.revision = 2;
+  }
+  if (source !== "review") {
+    server.review.savedText = "First.\n\nLast.\n";
+    server.disk = {
+      path: "/practice.md",
+      version: "incoming",
+      hash: "hash",
+      availability: "available",
+      text: "File first.\n\nLast.\n",
+    };
+  }
+  await controller.refresh(true);
+  expect(controller.getSnapshot().conflict?.kind).toBe("conflict");
+  expect(controller.getSnapshot().conflict?.message).toContain(message);
+});
+
 test("normalizing the browser projection never writes an untouched annotated source", async () => {
   const markdown = "{~~\nOriginal.\n~>\nProposed.\n~~}{#s1}\n";
   const initial = state(markdown);
@@ -1365,6 +1401,127 @@ test("normalizing the browser projection never writes an untouched annotated sou
   expect(writes.length).toBeGreaterThan(0);
   expect(writes.every((write) => !write)).toBe(true);
   expect(server.review.savedText).toBe(markdown);
+});
+
+test("opening an annotated review preserves its saved clean file until an actual source edit", async () => {
+  const markdown = "The {++new ++}{#s1}draft.\n## Footer\nFooter stays.\n";
+  const savedClean = "The draft.\n## Footer\nFooter stays.\n";
+  const normalizedClean = "The draft.\n\n## Footer\nFooter stays.\n";
+  let server = state(markdown);
+  server.draft = { ...draft(markdown), cleanMarkdown: savedClean };
+  server.signature = reviewDraftSignature(server.draft);
+  server.review = {
+    ...server.review,
+    draft: server.draft,
+    destinationPath: "/feedback-copy.md",
+    savedPath: "/feedback-copy.md",
+    savedText: savedClean,
+    autosave: "/feedback-copy.md",
+  };
+  server.disk = {
+    path: "/feedback-copy.md",
+    version: "v1",
+    hash: "hash",
+    text: savedClean,
+    availability: "available",
+  };
+  const writes: ReconcileRequest[] = [];
+  const api = async <T>(path: string, body?: object): Promise<T | null> => {
+    if (!body) return structuredClone(server) as T;
+    if (!path.endsWith("/reconcile")) throw new Error(`Unexpected ${path}`);
+    const sent = body as ReconcileRequest;
+    writes.push(structuredClone(sent));
+    server = commit(server, sent);
+    if (sent.writeFile) {
+      const text = sent.draft.cleanMarkdown ?? sent.draft.markdown;
+      server.disk = {
+        ...required(server.disk),
+        text,
+        version: `v${server.revision}`,
+      };
+      server.review = { ...server.review, savedText: text };
+    }
+    return { status: "committed", state: structuredClone(server) } as T;
+  };
+  const projection = (value: RevisionDraft) => ({
+    ...value,
+    cleanMarkdown:
+      value.cleanMarkdown ??
+      (value.markdown === markdown ? normalizedClean : value.markdown),
+    reviewComments: [
+      {
+        id: "c1",
+        changeId: "document",
+        content: "An imported comment retained by review synchronization.",
+        createdAt: "2026-11-26T12:00:00.000Z",
+      },
+    ],
+  });
+  const firstController = install(server, api, { projection });
+  await vi.advanceTimersByTimeAsync(700);
+  expect(writes.length).toBeGreaterThan(0);
+  expect(writes.every((sent) => !sent.writeFile)).toBe(true);
+  expect(server.disk?.text).toBe(savedClean);
+  firstController.stop();
+
+  // A new browser has no in-memory disk-projection cache from the first load.
+  const controller = install(server, api, { projection });
+  await vi.advanceTimersByTimeAsync(700);
+  expect(writes.every((sent) => !sent.writeFile)).toBe(true);
+  expect(server.disk?.text).toBe(savedClean);
+  expect(server.draft.cleanMarkdown).toBe(savedClean);
+  expect(controller.getSnapshot().fileWritePending).toBe(false);
+
+  controller.updateDraft((current) => ({
+    ...current,
+    markdown: current.markdown.replace("Footer stays.", "Footer edited."),
+    cleanMarkdown: normalizedClean.replace("Footer stays.", "Footer edited."),
+  }));
+  await controller.flush();
+  expect(writes.at(-1)?.writeFile).toBe(true);
+  expect(server.disk?.text).toBe(
+    normalizedClean.replace("Footer stays.", "Footer edited."),
+  );
+
+  controller.updateDraft((current) => ({
+    ...current,
+    markdown: current.markdown.replace("\n## Footer", "\n\n## Footer"),
+    cleanMarkdown: current.cleanMarkdown?.replace(
+      "\n\n## Footer",
+      "\n\n\n## Footer",
+    ),
+  }));
+  await controller.flush();
+  expect(writes.at(-1)?.writeFile).toBe(true);
+  expect(server.disk?.text).toContain("\n\n\n## Footer");
+  controller.stop();
+
+  // A saved review can legitimately have prose awaiting publication, for
+  // example after Send feedback. Its next browser must still write that prose.
+  const pendingMarkdown = server.draft.markdown.replace(
+    "Footer edited.",
+    "Footer edited again.",
+  );
+  const pendingClean = server.draft.cleanMarkdown?.replace(
+    "Footer edited.",
+    "Footer edited again.",
+  );
+  server.draft = {
+    ...server.draft,
+    markdown: pendingMarkdown,
+    cleanMarkdown: pendingClean,
+  };
+  server.review = { ...server.review, draft: server.draft };
+  server.signature = reviewDraftSignature(server.draft);
+  install(server, api, {
+    projection: (value) => ({
+      ...value,
+      cleanMarkdown: value.cleanMarkdown ?? pendingClean,
+    }),
+  });
+  await vi.advanceTimersByTimeAsync(700);
+  expect(writes.at(-1)?.writeFile).toBe(true);
+  expect(server.disk?.text).toBe(pendingClean);
 });
 
 test("a fresh maintained review normalizes through a merge reservation without writing its annotated file", async () => {

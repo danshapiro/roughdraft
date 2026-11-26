@@ -1059,6 +1059,10 @@ function printAgentHelp(log: (message: string) => void) {
   log("");
   log(AGENT_SETUP_PROMPT);
   log("");
+  log(
+    "For edit FILE --autosave none, comparison FULL_REVIEW_URL --read --json returns saved feedback and reports source drift in targetChanged/liveSourceChanged. Read the current source file too before making further edits.",
+  );
+  log("");
   log(`Live setup instructions: ${AGENT_SETUP_URL}`);
   log("");
   log(

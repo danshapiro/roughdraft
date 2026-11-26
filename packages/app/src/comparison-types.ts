@@ -93,6 +93,9 @@ export interface ComparisonReviewData {
   liveSourcePath?: string | null;
   liveSourceVersion?: string | null;
   liveSourceChanged?: boolean;
+  fileObservationWarning?: string;
+  recoveryStoragePressure?: boolean;
+  referenceVersion?: string;
   copyDirectory?: string | null;
   outdatedSuggestions?: OutdatedSuggestion[];
   operationContext?: SyncContext;

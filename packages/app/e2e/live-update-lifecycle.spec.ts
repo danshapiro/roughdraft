@@ -17,6 +17,12 @@ import {
 const initial =
   "# Live update lifecycle\n\nThe planting schedule is ready.\n\nThe lighting schedule is ready.\n\nThe final notes are pending.\n";
 const headers = { Connection: "close" };
+interface NetworkStats {
+  activeStreams: number;
+  maximumStreams: number;
+  streamRequests: number;
+  stateRequests: number;
+}
 
 class OwnedServer {
   child: ChildProcess | undefined;
@@ -92,6 +98,27 @@ class OwnedServer {
         resolve();
       });
       child.send({ type: "advance-clock", milliseconds, id });
+    });
+  }
+  async networkStats(): Promise<NetworkStats> {
+    const child = this.child;
+    if (!child) throw new Error("The owned lifecycle server is stopped");
+    const id = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("The lifecycle network stats did not arrive")),
+        7_500,
+      );
+      child.once(
+        "message",
+        (message: { type: string; id: string; network: NetworkStats }) => {
+          clearTimeout(timer);
+          if (message.type !== "network-stats" || message.id !== id)
+            reject(new Error("Unexpected network stats acknowledgment"));
+          else resolve(message.network);
+        },
+      );
+      child.send({ type: "network-stats", id });
     });
   }
 }
@@ -195,6 +222,83 @@ async function openCopy(page: Page, destination: string) {
   await page.getByTestId("revision-copy-path").fill(destination);
   await expect(page.getByTestId("revision-save-copy-confirm")).toBeEnabled();
 }
+
+test("eight tabs resume one shared stream after a server restart and leave temporary polling", async ({
+  page,
+  context,
+  lifecycle,
+}, testInfo) => {
+  test.setTimeout(45_000);
+  const tabs = [page];
+  const states: Array<{ phase: string; network: NetworkStats }> = [];
+  try {
+    const extra = await Promise.all(
+      Array.from({ length: 7 }, () => context.newPage()),
+    );
+    tabs.push(...extra);
+    await Promise.all(
+      extra.map(async (tab) => {
+        await tab.goto(
+          `${lifecycle.server.origin}/?comparison=${lifecycle.id}`,
+        );
+        await expect(richTextEditor(tab)).toBeVisible();
+      }),
+    );
+    await expect
+      .poll(async () => (await lifecycle.server.networkStats()).activeStreams)
+      .toBe(1);
+    const before = await lifecycle.server.networkStats();
+    expect(before.maximumStreams).toBe(1);
+    states.push({ phase: "before restart", network: before });
+
+    await lifecycle.server.restart();
+    await expect
+      .poll(async () => (await lifecycle.server.networkStats()).activeStreams)
+      .toBe(1);
+    // A window longer than the one-second fallback interval distinguishes
+    // resumed streaming from permanent short-request polling.
+    await expect(async () => {
+      const beginning = await lifecycle.server.networkStats();
+      await new Promise((resolve) => setTimeout(resolve, 1250));
+      const end = await lifecycle.server.networkStats();
+      expect(end.stateRequests).toBe(beginning.stateRequests);
+      expect(end.activeStreams).toBe(1);
+      expect(end.maximumStreams).toBe(1);
+    }).toPass({ timeout: 10_000, intervals: [100] });
+    states.push({
+      phase: "stream recovered without polling",
+      network: await lifecycle.server.networkStats(),
+    });
+
+    const changed = initial.replace(
+      "The lighting schedule is ready.",
+      "The lighting schedule changed after stream recovery.",
+    );
+    fs.writeFileSync(lifecycle.target, changed);
+    await Promise.all(
+      tabs.map(async (tab) => {
+        await expect(richTextEditor(tab)).toContainText(
+          "The lighting schedule changed after stream recovery.",
+        );
+        await expect(tab.getByTestId("revision-conflict")).toHaveCount(0);
+      }),
+    );
+    expect(fs.readFileSync(lifecycle.target, "utf8")).toBe(changed);
+    const final = await lifecycle.server.networkStats();
+    expect(final.activeStreams).toBe(1);
+    expect(final.maximumStreams).toBe(1);
+    states.push({
+      phase: "outside edit reached all eight tabs",
+      network: final,
+    });
+  } finally {
+    fs.writeFileSync(
+      testInfo.outputPath("shared-stream-restart.json"),
+      JSON.stringify(states, null, 2),
+    );
+    await Promise.all(tabs.slice(1).map((tab) => tab.close()));
+  }
+});
 
 for (const interruption of [
   "expired offline request",

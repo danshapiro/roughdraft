@@ -1,11 +1,28 @@
 import { isMap, isScalar, parseDocument } from "yaml";
 import { extractRoughdraftReviewIndex } from "./index.js";
-import type { SyncDraft } from "./review-sync.js";
+import type { SyncDraft, SyncHistory } from "./review-sync.js";
 import {
   applySourcePatches,
   type SourcePatch,
   splitReviewSource,
 } from "./review-yaml.js";
+
+/** @internal Proposal IDs retained by reversible snapshots remain in use. */
+export function reviewHistoryProposalIds(history: readonly SyncHistory[] = []) {
+  const ids = new Set<string>();
+  const visit = (value: unknown) => {
+    if (Array.isArray(value)) {
+      for (const entry of value) visit(entry);
+    } else if (value && typeof value === "object") {
+      for (const [key, entry] of Object.entries(value)) {
+        if (key === "changeId" && typeof entry === "string") ids.add(entry);
+        else visit(entry);
+      }
+    }
+  };
+  for (const entry of history) visit(entry.inverse);
+  return ids;
+}
 
 function scalarSpelling(source: string, next: string) {
   if (source.startsWith('"')) return JSON.stringify(next);
