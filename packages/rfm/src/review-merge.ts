@@ -1,9 +1,10 @@
 import { diffArrays } from "diff";
 import {
   cleanRoughdraftMarkdown,
-  extractRoughdraftReviewIndex,
-  roughdraftAttachmentContexts,
   type RfmReviewItem,
+  type RfmReviewRange,
+  roughdraftAttachmentContexts,
+  scanRoughdraftReview,
 } from "./index.js";
 import { renumberReviewDraft } from "./review-identities.js";
 import type {
@@ -109,20 +110,24 @@ function nextIdentity(id: string, used: Set<string>) {
   return `${prefix}${next}`;
 }
 
-function tokenize(source: string): string[] {
-  const ranges: Array<{ from: number; to: number }> = [];
-  if (source.includes("{")) {
-    for (const item of extractRoughdraftReviewIndex(source).items) {
-      if (item.endOffset <= item.offset) continue;
-      const anchor =
-        item.anchorText === undefined ? "" : `{==${item.anchorText}==}`;
-      const from =
-        anchor && source.slice(0, item.offset).endsWith(anchor)
-          ? item.offset - anchor.length
-          : item.offset;
-      ranges.push({ from, to: item.endOffset });
-    }
-  }
+function tokenize(
+  source: string,
+  fragments: readonly RfmReviewRange[],
+  bodyOffset: number,
+): string[] {
+  // Reuse the full-context scan, retaining each same-ID fragment separately.
+  // Metadata-only feedback has no inline range and cannot consume body text.
+  const ranges = fragments
+    .filter(
+      (range) =>
+        range.from >= bodyOffset &&
+        range.to <= bodyOffset + source.length &&
+        range.to > range.from,
+    )
+    .map((range) => ({
+      from: range.from - bodyOffset,
+      to: range.to - bodyOffset,
+    }));
   for (const match of source.matchAll(
     /^([ \t]*)(`{3,}|~{3,})[^\r\n]*\r?\n/gm,
   )) {
@@ -226,7 +231,7 @@ function combinedComments(
   // insertion immediately beside it can therefore share its replacement
   // range even though the original comment's exact bytes are unchanged.
   const existingIds = new Set(
-    extractRoughdraftReviewIndex(base).items.map((item) => item.id),
+    scanRoughdraftReview(base).items.map((item) => item.id),
   );
   const annotationExtension = (extended: string, shared: string) => {
     if (!shared) return null;
@@ -234,9 +239,9 @@ function combinedComments(
     if (at < 0 || extended.indexOf(shared, at + 1) >= 0) return null;
     const extras = extended.slice(0, at) + extended.slice(at + shared.length);
     if (!extras || cleanRoughdraftMarkdown(extras) !== "") return null;
-    const additions = extractRoughdraftReviewIndex(extras).items;
+    const additions = scanRoughdraftReview(extras).items;
     const sharedIds = new Set(
-      extractRoughdraftReviewIndex(shared).items.map((item) => item.id),
+      scanRoughdraftReview(shared).items.map((item) => item.id),
     );
     return additions.length &&
       additions.every(
@@ -254,9 +259,7 @@ function combinedComments(
     annotationExtension(incoming, local);
   if (extension !== null) return extension;
   const sources = [base, local, incoming];
-  const entries = sources.map(
-    (source) => extractRoughdraftReviewIndex(source).items,
-  );
+  const entries = sources.map((source) => scanRoughdraftReview(source).items);
   if (
     entries.some((items) =>
       items.some(
@@ -436,9 +439,10 @@ export function mergeReviewDrafts(
       throw new UnsupportedReviewMerge(
         "Large documents use the bounded browser merge path.",
       );
-    const parsed = [base, local, incoming].map(
-      (draft) => extractRoughdraftReviewIndex(draft.markdown).items,
+    const scans = [base, local, incoming].map((draft) =>
+      scanRoughdraftReview(draft.markdown),
     );
+    const parsed = scans.map((scan) => scan.items);
     // Older inline feedback can omit its date. Parsing it on two pages invents
     // two import times; that is one existing comment, not two new comments.
     // Preserve explicitly authored dates, and use the committed sidecar's date
@@ -489,6 +493,7 @@ export function mergeReviewDrafts(
     if (Object.keys(mapping).length) {
       local = renumberReviewDraft(local, mapping);
       idRemap = mapping;
+      scans[1] = scanRoughdraftReview(local.markdown);
     }
     check();
     const parity = [base, local, incoming].every(
@@ -528,10 +533,17 @@ export function mergeReviewDrafts(
       body = localBody;
     else if (localBody === beforeBody) body = incomingBody;
     else {
-      const tokens = tokenize(beforeBody);
+      const tokensFor = (body: string, index: number) => {
+        const front = parts[index].frontmatter;
+        const offset = front
+          ? front.prefix.length + front.source.length + front.suffix.length
+          : 0;
+        return tokenize(body, scans[index].ranges, offset);
+      };
+      const tokens = tokensFor(beforeBody, 0);
       const patches = [
-        ...changes(tokens, tokenize(localBody), "local", remaining()),
-        ...changes(tokens, tokenize(incomingBody), "incoming", remaining()),
+        ...changes(tokens, tokensFor(localBody, 1), "local", remaining()),
+        ...changes(tokens, tokensFor(incomingBody, 2), "incoming", remaining()),
       ].sort((a, b) => a.from - b.from || a.to - b.to);
       body = "";
       let position = 0;

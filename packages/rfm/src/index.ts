@@ -492,15 +492,30 @@ export function validateRoughdraftMarkdown(
   };
 }
 
-export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
+/** @internal Exact inline fragments, before same-ID comment references coalesce. */
+export interface RfmReviewRange {
+  from: number;
+  to: number;
+}
+
+/** @internal Read merge inputs without computing unused validation diagnostics. */
+export function scanRoughdraftReview(markdown: string): {
+  items: RfmReviewItem[];
+  ranges: RfmReviewRange[];
+} {
   const lineStarts = createLineStarts(markdown);
-  const validation = validateRoughdraftMarkdown(markdown);
   const endmatter = parseRoughdraftEndmatter(markdown);
   const items: RfmReviewItem[] = [];
+  const ranges: RfmReviewRange[] = [];
   const referencedComments = new Map<string, RfmReviewItem>();
   const noopDiagnostic = () => {};
 
-  const addComment = (parsed: ParsedComment, anchorText?: string) => {
+  const addComment = (
+    parsed: ParsedComment,
+    anchorText?: string,
+    anchorFrom = parsed.offset,
+  ) => {
+    ranges.push({ from: anchorFrom, to: parsed.endOffset });
     const attrs = hydrateMetadataAttrs(parsed.metadata, endmatter, "comment");
     const id = attrs.get("id") ?? `comment-${parsed.offset.toString()}`;
     const parentId = attrs.get("re") ?? null;
@@ -538,6 +553,7 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
   };
 
   const addSuggestion = (parsed: ParsedSuggestion) => {
+    ranges.push({ from: parsed.offset, to: parsed.endOffset });
     const attrs = hydrateMetadataAttrs(
       parsed.metadata,
       endmatter,
@@ -592,6 +608,11 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
       continue;
     }
 
+    if (markdown[offset] !== "{") {
+      offset += 1;
+      continue;
+    }
+
     if (markdown.startsWith("{==", offset)) {
       const end = markdown.indexOf("==}", offset + 3);
       if (end === -1) {
@@ -605,7 +626,7 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
       while (markdown.startsWith("{>>", nextOffset)) {
         const parsed = parseComment(markdown, nextOffset, noopDiagnostic);
         if (!parsed) break;
-        addComment(parsed, anchorText);
+        addComment(parsed, anchorText, offset);
         anchoredComments += 1;
         nextOffset = parsed.endOffset;
       }
@@ -650,6 +671,12 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
     });
   }
 
+  return { items, ranges };
+}
+
+export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
+  const validation = validateRoughdraftMarkdown(markdown);
+  const { items } = scanRoughdraftReview(markdown);
   return {
     format: "roughdraft-flavored-markdown",
     version: RFM_VERSION,
