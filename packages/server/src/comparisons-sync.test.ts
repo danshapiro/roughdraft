@@ -9,7 +9,7 @@ import {
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComparisonOperations } from "./comparison-operations.js";
-import type { Comparison } from "./comparisons.js";
+import { type Comparison, ComparisonStore } from "./comparisons.js";
 import { createApp } from "./index.js";
 
 describe("guarded live review reconciliation", () => {
@@ -507,6 +507,116 @@ describe("guarded live review reconciliation", () => {
       });
     expect(merged.body.status).toBe("committed");
     expect(fs.readFileSync(target, "utf8")).toBe(candidate);
+  });
+
+  it("tells a blocked writer to wait for the remaining merge window and grants its next retry fairly", async () => {
+    const clock = { at: performance.now() };
+    vi.spyOn(performance, "now").mockImplementation(() => clock.at);
+    host.dispose();
+    host = freshHost();
+    const text = `${original}\n${"Unchanged paragraph.\n\n".repeat(3000)}`;
+    fs.writeFileSync(target, text);
+    const base = await open();
+    const route = `/api/comparisons/${base.review.id}/reconcile`;
+    const aText = text.replace("First", "A first");
+    const first = await api()
+      .post(route)
+      .send(payload(base, draft(base, aText), "cadence-a"));
+    expect(first.body.status).toBe("committed");
+    const turn = await api()
+      .post(route)
+      .send(
+        payload(
+          base,
+          draft(base, text.replace("Second", "B second")),
+          "cadence-b",
+          "page-b",
+        ),
+      );
+    expect(turn.body.status).toBe("client-merge-required");
+    const expiresAt = turn.body.reservation.expiresAt;
+    clock.at += 200;
+    const blocked = await api()
+      .post(route)
+      .send(
+        payload(
+          base,
+          draft(base, text.replace("Second", "C second")),
+          "cadence-c",
+          "page-c",
+        ),
+      );
+    expect(blocked.body.status).toBe("retry-later");
+    expect(blocked.body.retryAfter).toBe(550);
+    expect(
+      (await api().get("/api/comparisons/operations/cadence-c")).body
+        .retryAfter,
+    ).toBe(550);
+    clock.at += blocked.body.retryAfter;
+    const next = await api()
+      .post(route)
+      .send(
+        payload(
+          base,
+          draft(base, text.replace("Second", "C second")),
+          "cadence-c-next",
+          "page-c",
+          2,
+        ),
+      );
+    expect(next.body.status).toBe("client-merge-required");
+    expect(next.body.reservation.expiresAt).toBe(expiresAt + 750);
+    const current = next.body.state as SyncState<Comparison>;
+    const candidate = aText.replace("Second", "C second");
+    const committed = await api()
+      .post(route)
+      .send({
+        ...payload(
+          current,
+          draft(current, candidate),
+          "cadence-c-commit",
+          "page-c",
+          3,
+        ),
+        reservationToken: next.body.reservation.token,
+      });
+    expect(committed.body.status).toBe("committed");
+    expect(fs.readFileSync(target, "utf8")).toBe(candidate);
+  });
+
+  it("prepares the fallback snapshot before starting its bounded merge window", async () => {
+    const clock = { at: performance.now() };
+    vi.spyOn(performance, "now").mockImplementation(() => clock.at);
+    host.dispose();
+    host = freshHost();
+    const base = await open();
+    const beforePreparation = clock.at;
+    const originalState = ComparisonStore.prototype.state;
+    vi.spyOn(ComparisonStore.prototype, "state").mockImplementation(function (
+      this: ComparisonStore,
+      ...args: Parameters<typeof originalState>
+    ) {
+      const result = originalState.apply(this, args);
+      clock.at += 200;
+      return result;
+    });
+    const result = await api()
+      .post(`/api/comparisons/${base.review.id}/reconcile`)
+      .send({
+        ...payload(
+          base,
+          draft(base, "A candidate requiring browser reconciliation"),
+          "prepare-fallback",
+        ),
+        baseSignature: "unavailable-browser-base",
+      });
+    expect(result.body.status).toBe("base-unavailable");
+    const currentOperationTime =
+      base.operationContext.acceptUntil -
+      120_000 +
+      clock.at -
+      beforePreparation;
+    expect(result.body.reservation.expiresAt - currentOperationTime).toBe(750);
   });
 
   it("keeps a new outside disk write guarded, then records an explicit no-file adoption", async () => {

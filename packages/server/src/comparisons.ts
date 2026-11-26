@@ -1347,17 +1347,18 @@ export class ComparisonStore {
     status: "base-unavailable" | "client-merge-required",
     message?: string,
   ): SyncResult<Comparison> {
+    const state = this.state(review.id, review);
     const reservation = this.reservations.request(
       review.id,
       operation.pageInstanceId,
       review.revision,
     );
     return reservation
-      ? { status, state: this.state(review.id, review), reservation, message }
+      ? { status, state, reservation, message }
       : {
           status: "retry-later",
-          state: this.state(review.id, review),
-          retryAfter: 25,
+          state,
+          retryAfter: this.reservations.remaining(review.id) || 25,
           message: "Another page has the next merge turn.",
         };
   }
@@ -1395,6 +1396,8 @@ export class ComparisonStore {
           operationId: operation.operationId,
           revision: review.revision,
           result: result.status,
+          retryAfter: result.retryAfter,
+          reservationExpiresAt: result.reservation?.expiresAt,
           reason: typeof body.reason === "string" ? body.reason : "sync",
         });
         this.operations.prepare(record, result);
@@ -1422,12 +1425,14 @@ export class ComparisonStore {
           operation.pageInstanceId,
           request.reservationToken,
         )
-      )
+      ) {
+        const state = this.state(id, review);
         return reject({
           status: "retry-later",
-          retryAfter: 25,
-          state: this.state(id, review),
+          retryAfter: this.reservations.remaining(id) || 25,
+          state,
         });
+      }
       let submitted: SyncDraft;
       let base: SyncDraft;
       try {

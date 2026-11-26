@@ -68,6 +68,7 @@ interface Turn {
   owner: string;
   reservation: SyncReservation;
 }
+const MAX_REVIEW_RESERVATION_MS = 750;
 export class ReviewReservations {
   private turns = new Map<string, Turn>();
   private waiting = new Map<string, Map<string, number>>();
@@ -93,6 +94,20 @@ export class ReviewReservations {
     return true;
   }
 
+  remaining(id: string): number {
+    this.clean(id);
+    const turn = this.turns.get(id);
+    return turn
+      ? Math.max(
+          0,
+          Math.min(
+            MAX_REVIEW_RESERVATION_MS,
+            Math.ceil(turn.reservation.expiresAt - this.now()),
+          ),
+        )
+      : 0;
+  }
+
   valid(id: string, page: string, token: string | undefined, revision: number) {
     this.clean(id);
     const turn = this.turns.get(id);
@@ -115,7 +130,7 @@ export class ReviewReservations {
     const reservation = {
       token: crypto.randomUUID(),
       revision,
-      expiresAt: this.now() + 750,
+      expiresAt: this.now() + MAX_REVIEW_RESERVATION_MS,
     };
     this.turns.set(id, { owner: page, reservation });
     return reservation;
