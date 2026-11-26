@@ -52,13 +52,17 @@ function identityItems(
 ) {
   const items = new Map<string, unknown>();
   const contexts = attachmentContext
-    ? roughdraftAttachmentContexts(
-        draft.markdown,
-        parsed.map((item) => item.offset),
-      )
+    ? parsed.some((item) => item.endOffset > item.offset)
+      ? roughdraftAttachmentContexts(
+          draft.markdown,
+          parsed
+            .filter((item) => item.endOffset > item.offset)
+            .map((item) => item.offset),
+        )
+      : new Map<number, string>()
     : null;
   for (const item of parsed) {
-    if (contexts && !contexts.has(item.offset))
+    if (contexts && item.endOffset > item.offset && !contexts.has(item.offset))
       throw new UnsupportedReviewMerge(
         "This review attachment needs browser mapping.",
       );
@@ -73,7 +77,8 @@ function identityItems(
       createdAt: item.createdAt,
       ...(attachmentContext
         ? {
-            context: contexts?.get(item.offset),
+            context:
+              item.endOffset > item.offset ? contexts?.get(item.offset) : null,
           }
         : {}),
     });
