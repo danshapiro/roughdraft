@@ -28,6 +28,43 @@ const proposal = (body: string, id: string) =>
   `${body}\n\n---\nsuggestions:\n  ${id}:\n    by: AI\n    at: "2026-11-26T12:00:00.000Z"\n`;
 
 describe("review three-way reconciliation", () => {
+  it("materializes the same undated original comment once using its committed import date", () => {
+    const markdown = "{==Text==}{>>An imported comment<<}{#c1}\n";
+    const base = draft(markdown);
+    const left = {
+      ...comment("c1", "An imported comment"),
+      createdAt: "2026-11-26T12:00:01.000Z",
+    };
+    const right = { ...left, createdAt: "2026-11-26T12:00:00.000Z" };
+    const result = mergeReviewDrafts(
+      base,
+      draft(markdown, { reviewComments: [left] }),
+      draft(markdown, { reviewComments: [right] }),
+    );
+    expect(result.status).toBe("merged");
+    expect(result.idRemap).toBeUndefined();
+    expect(result.draft.reviewComments).toEqual([right]);
+  });
+
+  it("keeps an explicitly changed date on imported feedback as a metadata conflict", () => {
+    const markdown =
+      '{==Text==}{>>An imported comment<<}{#c1}\n\n---\ncomments:\n  c1:\n    at: "2026-11-26T12:00:00.000Z"\n';
+    const base = draft(markdown, {
+      reviewComments: [comment("c1", "An imported comment")],
+    });
+    const local = draft(markdown.replace("12:00:00", "12:00:01"), {
+      reviewComments: [
+        { ...base.reviewComments[0], createdAt: "2026-11-26T12:00:01.000Z" },
+      ],
+    });
+    const incoming = draft(markdown.replace("12:00:00", "12:00:02"), {
+      reviewComments: [
+        { ...base.reviewComments[0], createdAt: "2026-11-26T12:00:02.000Z" },
+      ],
+    });
+    expect(mergeReviewDrafts(base, local, incoming).status).toBe("conflict");
+  });
+
   it.each([
     false,
     true,

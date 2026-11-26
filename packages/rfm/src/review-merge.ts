@@ -44,9 +44,9 @@ const same = (a: unknown, b: unknown) =>
 const object = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
-function identityItems(draft: SyncDraft) {
+function identityItems(draft: SyncDraft, parsed: RfmReviewItem[]) {
   const items = new Map<string, unknown>();
-  for (const item of extractRoughdraftReviewIndex(draft.markdown).items) {
+  for (const item of parsed) {
     items.set(item.id, {
       kind: item.kind,
       text: item.text,
@@ -381,7 +381,36 @@ export function mergeReviewDrafts(
       throw new UnsupportedReviewMerge(
         "Large documents use the bounded browser merge path.",
       );
-    const indexes = [base, local, incoming].map(identityItems);
+    const parsed = [base, local, incoming].map(
+      (draft) => extractRoughdraftReviewIndex(draft.markdown).items,
+    );
+    // Older inline feedback can omit its date. Parsing it on two pages invents
+    // two import times; that is one existing comment, not two new comments.
+    // Preserve explicitly authored dates, and use the committed sidecar's date
+    // for a comment already present in the original Markdown.
+    const undated = new Set(
+      parsed[0]
+        .filter((item) => item.kind === "comment" && !item.createdAt)
+        .map((item) => item.id),
+    );
+    const authored = new Set(
+      parsed[1].filter((item) => item.createdAt).map((item) => item.id),
+    );
+    const committed = new Map(
+      incoming.reviewComments.map((comment) => [comment.id, comment]),
+    );
+    local = {
+      ...local,
+      reviewComments: local.reviewComments.map((comment) => {
+        const previous = committed.get(comment.id);
+        return previous && undated.has(comment.id) && !authored.has(comment.id)
+          ? { ...comment, createdAt: previous.createdAt }
+          : comment;
+      }),
+    };
+    const indexes = [base, local, incoming].map((draft, index) =>
+      identityItems(draft, parsed[index]),
+    );
     const used = new Set(indexes.flatMap((items) => [...items.keys()]));
     const mapping: Record<string, string> = {};
     for (const [id, item] of indexes[1]) {
