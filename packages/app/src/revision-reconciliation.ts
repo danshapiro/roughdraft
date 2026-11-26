@@ -25,7 +25,7 @@ interface Pending {
 let worker: Worker | null = null;
 let sequence = 0;
 let measuredSlow = false;
-let unavailable = false;
+let retryAfter = 0;
 let idle: ReturnType<typeof setTimeout> | null = null;
 const pending = new Map<number, Pending>();
 
@@ -40,6 +40,11 @@ function waiting(local: SyncDraft, reason: string): SyncMerge {
 }
 
 export function disposeReviewMergeWorker(): void {
+  retryAfter = 0;
+  releaseWorker();
+}
+
+function releaseWorker(): void {
   if (idle) clearTimeout(idle);
   idle = null;
   worker?.terminate();
@@ -66,7 +71,7 @@ function settle(id: number, result: SyncMerge) {
 }
 
 function startWorker() {
-  if (worker || unavailable) return worker;
+  if (worker || performance.now() < retryAfter) return worker;
   try {
     if (typeof Worker === "undefined") return null;
     worker = new Worker(
@@ -82,11 +87,11 @@ function startWorker() {
           event: "review-merge-worker-unavailable",
         }),
       );
-      unavailable = true;
-      disposeReviewMergeWorker();
+      retryAfter = performance.now() + 1_000;
+      releaseWorker();
     };
   } catch {
-    unavailable = true;
+    retryAfter = performance.now() + 1_000;
   }
   return worker;
 }

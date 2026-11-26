@@ -108,6 +108,44 @@ it("closing the review settles queued comparisons and releases the worker", asyn
   expect((await result).status).toBe("client-merge-required");
 });
 
+it("an explicit retry can compare again after a transient worker failure without reloading", async () => {
+  vi.stubGlobal("Worker", ComparisonWorker);
+  const prefix = "Unchanged paragraph.\n\n".repeat(3000);
+  const base = draft(`${prefix}First.\n\nSecond.`);
+  const local = draft(`${prefix}Local typing.\n\nSecond.`);
+  const incoming = draft(`${prefix}First.\n\nPeer update.`);
+  const failed = active.mergeReviewDraftsAsync(base, local, incoming);
+  ComparisonWorker.instances[0].onerror?.();
+  expect((await failed).draft).toBe(local);
+  expect(ComparisonWorker.instances[0].terminated).toBe(true);
+
+  // Retrying releases failed worker state; the same loaded app must recover.
+  active.disposeReviewMergeWorker();
+  const retry = active.mergeReviewDraftsAsync(base, local, incoming);
+  expect(ComparisonWorker.instances).toHaveLength(2);
+  ComparisonWorker.instances[1].complete();
+  const result = await retry;
+  expect(result.status).toBe("merged");
+  expect(result.draft.markdown).toBe(`${prefix}Local typing.\n\nPeer update.`);
+});
+
+it("a transient worker failure backs off briefly, then retries without reloading", async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal("Worker", ComparisonWorker);
+  const local = draft("Recoverable text.\n".repeat(4000));
+  const failed = active.mergeReviewDraftsAsync(local, local, local);
+  ComparisonWorker.instances[0].onerror?.();
+  expect((await failed).draft).toBe(local);
+  const backedOff = await active.mergeReviewDraftsAsync(local, local, local);
+  expect(backedOff.status).toBe("client-merge-required");
+  expect(ComparisonWorker.instances).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1_000);
+  const retry = active.mergeReviewDraftsAsync(local, local, local);
+  expect(ComparisonWorker.instances).toHaveLength(2);
+  ComparisonWorker.instances[1].complete();
+  expect((await retry).status).toBe("merged");
+});
+
 it("a failed worker preserves pending work and an idle worker is terminated", async () => {
   vi.useFakeTimers();
   vi.stubGlobal("Worker", ComparisonWorker);
