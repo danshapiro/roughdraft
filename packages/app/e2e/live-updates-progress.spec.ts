@@ -368,7 +368,9 @@ async function failureViews(
           ?.getAttribute("aria-label"),
         banner: document.querySelector('[data-testid="revision-conflict"]')
           ?.textContent,
-        editorOwners: [...document.querySelectorAll(".ProseMirror p")]
+        editorOwners: [
+          ...document.querySelectorAll('[data-testid="rich-text-editor"] p'),
+        ]
           .map((paragraph) => paragraph.textContent ?? "")
           .filter((text) => /^Live owner [AB]:/.test(text)),
         recovery: Object.fromEntries(
