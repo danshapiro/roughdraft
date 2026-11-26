@@ -807,12 +807,14 @@ describe("guarded live review reconciliation", () => {
     );
     expect(metadata).toBeDefined();
     expect(metadata.uiDrafts).toEqual(uiDrafts);
+    expect(metadata.entryUiDrafts).toEqual(uiDrafts);
     const preserved = (
       await api().get(
         `/api/comparisons/${current.review.id}/checkpoints/${metadata.id}`,
       )
     ).body;
     expect(preserved.uiDrafts).toEqual(uiDrafts);
+    expect(preserved.entryUiDrafts).toEqual(uiDrafts);
     expect(preserved.workingDraft).toEqual(next);
     expect(review.reviewComments).toEqual(next.reviewComments);
     expect(fs.readFileSync(destination, "utf8")).not.toContain(
@@ -825,6 +827,63 @@ describe("guarded live review reconciliation", () => {
         (entry: { id: string }) => entry.id === current.review.id,
       ).recoveryCheckpoints,
     ).toContainEqual(expect.objectContaining({ id: metadata.id, uiDrafts }));
+  });
+
+  it("retains conflict-entry unfinished feedback separately from newer feedback and working text", async () => {
+    const base = await open("none");
+    const route = `/api/comparisons/${base.review.id}`;
+    const entryUiDrafts = {
+      comments: {
+        c1: {
+          value: "Initial unfinished feedback",
+          original: "Comment",
+          editing: true,
+        },
+      },
+    };
+    const latestUiDrafts = {
+      comments: {
+        c1: {
+          value: "Latest unfinished feedback",
+          original: "Comment",
+          editing: true,
+        },
+      },
+    };
+    const checkpoint = await api().post(`${route}/checkpoint`).send({
+      pageInstanceId: "page-a",
+      conflictId: "overlapping-text",
+      generation: 1,
+      workingDraft: base.draft,
+      uiDrafts: entryUiDrafts,
+    });
+    const latestDraft = draft(base, "Newer working text");
+    const updated = await api().post(`${route}/checkpoint`).send({
+      pageInstanceId: "page-a",
+      conflictId: "overlapping-text",
+      generation: 2,
+      workingDraft: latestDraft,
+      uiDrafts: latestUiDrafts,
+    });
+    expect(updated.body.checkpointId).toBe(checkpoint.body.checkpointId);
+    const saved = (
+      await api().get(`${route}/checkpoints/${checkpoint.body.checkpointId}`)
+    ).body;
+    expect(saved.entryDraft).toEqual(base.draft);
+    expect(saved.entryUiDrafts).toEqual(entryUiDrafts);
+    expect(saved.workingDraft).toEqual(latestDraft);
+    expect(saved.uiDrafts).toEqual(latestUiDrafts);
+    await api().post(`${route}/checkpoint`).send({
+      pageInstanceId: "page-a",
+      conflictId: "overlapping-text",
+      generation: 1,
+      workingDraft: base.draft,
+      uiDrafts: entryUiDrafts,
+    });
+    expect(
+      (await api().get(`${route}/checkpoints/${checkpoint.body.checkpointId}`))
+        .body,
+    ).toEqual(saved);
   });
 
   it("returns root-relative paths, warns about moved links, and rejects existing copies", async () => {

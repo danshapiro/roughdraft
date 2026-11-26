@@ -149,6 +149,7 @@ export interface Comparison {
     reason: string;
     kind?: "copy-feedback";
     uiDrafts?: Record<string, unknown>;
+    entryUiDrafts?: Record<string, unknown>;
     createdAt: string;
     resolvedAt?: string;
     savedCopyId?: string;
@@ -1848,6 +1849,11 @@ export class ComparisonStore {
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
         entryDraft: previous?.entryDraft ?? draft,
+        ...(!previous
+          ? { entryUiDrafts: body.uiDrafts ?? {} }
+          : previous.entryUiDrafts !== undefined
+            ? { entryUiDrafts: previous.entryUiDrafts }
+            : {}),
         workingDraft: draft,
         uiDrafts: body.uiDrafts ?? {},
         baseVersions: body.baseVersions ?? null,
@@ -2818,10 +2824,14 @@ export class ComparisonStore {
               if (entry.kind !== "copy-feedback") return entry;
               const snapshot = this.readCheckpoint(review.id, entry.id) as {
                 uiDrafts?: Record<string, unknown>;
+                entryUiDrafts?: Record<string, unknown>;
               };
               return {
                 ...entry,
                 ...(snapshot.uiDrafts ? { uiDrafts: snapshot.uiDrafts } : {}),
+                ...(snapshot.entryUiDrafts
+                  ? { entryUiDrafts: snapshot.entryUiDrafts }
+                  : {}),
               };
             }),
           }
