@@ -477,6 +477,69 @@ test("autosave sends a coalesced snapshot without reserializing newer live typin
 });
 
 test.each([
+  true,
+  false,
+])("incoming peer state retains buffered typing with the registered adapter's flush contract (rebases=%s)", async (rebasesBufferedDocument) => {
+  let server = state();
+  let live = server.draft.markdown;
+  const controller = new RevisionSessionController(
+    server.review,
+    server.draft as RevisionDraft,
+    {
+      request: async <T>(_path: string, body?: object) => {
+        if (body) throw new Error("Observing peer state must not publish");
+        return structuredClone(server) as T;
+      },
+      storage: new MemoryStorage(),
+      tabStorage: new MemoryStorage(),
+      id: () => "buffered-page",
+    },
+  );
+  controllers.push(controller);
+  const flush = vi.fn(() =>
+    controller.updateDraft(() => draft(live), { readyToSave: false }),
+  );
+  controller.setAdapter({
+    rebasesBufferedDocument,
+    flush,
+    apply: (value, options) => {
+      const result =
+        rebasesBufferedDocument && options?.localBase
+          ? mergeReviewDrafts(options.localBase, draft(live), value, {
+              server: false,
+            })
+          : { status: "merged", draft: value };
+      if (result.status !== "merged")
+        throw new Error("Independent buffered text and peer text must merge");
+      live = result.draft.markdown;
+      return result.draft as RevisionDraft;
+    },
+    adopt: () => null,
+    readUiDrafts: () => ({}),
+    restoreUiDrafts: () => {},
+  });
+  controller.start();
+  await vi.advanceTimersByTimeAsync(0);
+  flush.mockClear();
+
+  controller.updateDraft(() => draft("My first.\n\nLast.\n"), {
+    readyToSave: false,
+  });
+  live = "My first. Newer buffered typing.\n\nLast.\n";
+  server = state("First.\n\nPeer last.\n");
+  server.revision = server.review.revision = 2;
+  server.registryGeneration = "2";
+  await controller.refresh(true);
+
+  expect(live).toBe("My first. Newer buffered typing.\n\nPeer last.\n");
+  expect(controller.readDraft().markdown).toBe(live);
+  expect(controller.getSnapshot().conflict).toBeNull();
+  expect(controller.getSnapshot().writePaused).toBe(false);
+  if (rebasesBufferedDocument) expect(flush).not.toHaveBeenCalled();
+  else expect(flush).toHaveBeenCalled();
+});
+
+test.each([
   "incoming",
   "local",
 ] as const)("resolving a disk conflict chooses %s against actual disk and preserves both checkpoints", async (choice) => {

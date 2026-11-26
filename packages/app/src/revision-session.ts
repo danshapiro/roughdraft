@@ -1194,7 +1194,7 @@ export class RevisionSessionController {
           this.schedule(0);
         return;
       }
-      this.adapter?.flush?.();
+      if (!this.adapter?.rebasesBufferedDocument) this.adapter?.flush?.();
       const localBase = this.current;
       const merged = await this.merge(this.base, localBase, incoming, {
         server: false,
