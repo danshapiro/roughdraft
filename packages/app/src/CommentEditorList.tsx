@@ -376,6 +376,7 @@ export function CommentEditorList({
           allowDeleteThread={allowDeleteThread}
           drafts={drafts}
           newCommentDraftIds={newCommentDraftIds}
+          allowNewRootCancel={Boolean(recoveryStore)}
           editingCommentIds={editingCommentIds}
           pendingFocusCommentId={pendingFocusCommentId}
           selectedCommentId={selectedCommentId}
@@ -426,6 +427,7 @@ interface CommentThreadNodeProps {
   allowDeleteThread: boolean;
   drafts: Record<string, string>;
   newCommentDraftIds: string[];
+  allowNewRootCancel: boolean;
   editingCommentIds: string[];
   pendingFocusCommentId: string | null;
   selectedCommentId: string | null;
@@ -527,6 +529,7 @@ function CommentThreadNode({
   allowDeleteThread,
   drafts,
   newCommentDraftIds,
+  allowNewRootCancel,
   editingCommentIds,
   pendingFocusCommentId,
   selectedCommentId,
@@ -648,9 +651,10 @@ function CommentThreadNode({
           },
         },
       ];
-  const defaultVisibleActions = isNewRootCommentDraft
-    ? defaultActions.filter((action) => action.key !== "cancel")
-    : defaultActions;
+  const defaultVisibleActions =
+    isNewRootCommentDraft && !allowNewRootCancel
+      ? defaultActions.filter((action) => action.key !== "cancel")
+      : defaultActions;
   const actions = readOnly
     ? []
     : (getCommentActions?.({
@@ -921,6 +925,7 @@ function CommentThreadNode({
               allowDeleteThread={allowDeleteThread}
               drafts={drafts}
               newCommentDraftIds={newCommentDraftIds}
+              allowNewRootCancel={allowNewRootCancel}
               editingCommentIds={editingCommentIds}
               pendingFocusCommentId={pendingFocusCommentId}
               selectedCommentId={selectedCommentId}

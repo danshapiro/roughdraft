@@ -1,4 +1,4 @@
-import { renumberReviewDraft } from "@roughdraft/rfm";
+import { mergeReviewDrafts, renumberReviewDraft } from "@roughdraft/rfm";
 import type { Editor } from "@tiptap/core";
 import { closeHistory, undo } from "@tiptap/pm/history";
 import { TextSelection } from "@tiptap/pm/state";
@@ -125,6 +125,178 @@ test("continuous rich-text typing emits its first coalesced snapshot within 225 
   await act(async () => vi.advanceTimersByTimeAsync(125));
   expect(changed).toHaveBeenCalledTimes(2);
   expect(changed.mock.calls[1][0]).toContain("paragraph.ABCDE");
+});
+
+test("renumbering a proposal preserves its excluded private reply while adopting the peer proposal", async () => {
+  const original =
+    '# Release\n\nAlpha owner: ready.\n\nBeta owner: ready.\n\nAn existing {++proposal++}{#s1}.\n\nKeep {==context==}{>>Saved feedback<<}{#c1}.\n\n---\ncomments:\n  c1:\n    by: AI\n    at: "2026-11-22T12:00:00.000Z"\nsuggestions:\n  s1:\n    by: AI\n    at: "2026-11-22T12:00:00.000Z"\n';
+  const peerSource = `${original.replace(
+    "Beta owner: ready.",
+    "Beta owner: ready. {++Beta-b++}{#s2}",
+  )}  s2:\n    by: user\n    at: "2026-11-26T12:00:01.000Z"\n`;
+  const parsed = criticMarkdownToEditorState(original);
+  const draft = (markdown: string): RevisionDraft => ({
+    markdown,
+    cleanMarkdown: cleanRevisionSourceMarkdown(markdown),
+    decisions: {},
+    reviewComments: [
+      ...criticMarkdownToEditorState(markdown).comments.values(),
+    ].map((comment) => ({ ...comment, changeId: "document" })),
+  });
+  const store = new RevisionUiDraftStore();
+  const remote = { current: null as RevisionRemoteAdapter["apply"] | null };
+  const flush = { current: null as (() => void) | null };
+  const changed = vi.fn();
+  let editor: Editor | null = null;
+  const profile = {
+    entries: [] as Array<{ stage: string; at: number; duration: number }>,
+  };
+  vi.stubGlobal("roughdraftProfile", profile);
+  await act(async () =>
+    root.render(
+      <TooltipProvider>
+        <RevisionUiDraftContext.Provider value={store}>
+          <RichTextEditorSurface
+            page={{
+              id: "private-renumber",
+              title: "Private reply renumber",
+              content: original,
+            }}
+            activeDocumentPath="practice.md"
+            selected
+            layout="default"
+            focusRequestKey={null}
+            sourceMarkdown={original}
+            onMarkdownChange={changed}
+            interactionMode="suggesting"
+            backend={
+              new ApiBackend({
+                kind: "local-files",
+                label: "Files",
+                detail: "/practice.md",
+                projectPath: "/",
+              })
+            }
+            onEditorReady={(value) => {
+              editor = value;
+            }}
+            editableReview={{
+              suggestions: [],
+              decisions: [],
+              comments: parsed.comments,
+              onCommentsChange: () => {},
+              onAccept: () => true,
+              onReject: () => true,
+              onBlockedSuggestionEdit: () => {},
+              uiDraftStore: store,
+              remoteUpdateRef: remote,
+              markdownFlushRef: flush,
+            }}
+          />
+        </RevisionUiDraftContext.Provider>
+      </TooltipProvider>,
+    ),
+  );
+  if (!editor) throw new Error("Expected the real editor");
+  const live = editor as Editor;
+  let proposalAt = -1;
+  live.state.doc.descendants((node, pos) => {
+    if (node.isText && node.text === "Alpha owner: ready.")
+      proposalAt = pos + node.nodeSize;
+  });
+  expect(proposalAt).toBeGreaterThan(0);
+  await act(async () => {
+    const tr = live.state.tr.insertText(" Alpha-a", proposalAt);
+    tr.addMark(
+      proposalAt,
+      proposalAt + 8,
+      live.schema.marks.criticChange.create({
+        kind: "addition",
+        changeId: "s2",
+        authorType: "user",
+        authorId: "user",
+        createdAt: "2026-11-26T12:00:00.000Z",
+      }),
+    );
+    live.view.dispatch(tr);
+    flush.current?.();
+  });
+  await act(
+    async () =>
+      new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+  );
+  const reply = container.querySelector<HTMLButtonElement>(
+    '[data-testid="comment-rail-s2-action-reply"]',
+  );
+  expect(reply).not.toBeNull();
+  await act(async () => reply?.click());
+  const privateId = Object.keys(store.getSnapshot().comments)[0];
+  const input = container.querySelector<HTMLTextAreaElement>(
+    `[data-testid="comment-rail-${privateId}-editor"]`,
+  );
+  expect(input).not.toBeNull();
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )?.set?.call(input, "Still private during renumber");
+    input?.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  let at = -1;
+  let marks = live.state.doc.firstChild?.marks ?? [];
+  live.state.doc.descendants((node, pos) => {
+    if (node.isText && node.text?.includes("Alpha-a")) {
+      at = pos + node.nodeSize;
+      marks = node.marks.filter((mark) => mark.type.name === "criticChange");
+    }
+  });
+  expect(at).toBeGreaterThan(0);
+  vi.useFakeTimers();
+  await act(async () => {
+    const tr = live.state.tr.insertText("-continu", at);
+    for (const mark of marks) tr.addMark(at, at + 8, mark);
+    live.view.dispatch(tr);
+    flush.current?.();
+  });
+  const local = draft(changed.mock.calls.at(-1)?.[0] ?? original);
+  expect(local.markdown).toContain("Alpha-a-continu");
+  await act(async () => {
+    const tr = live.state.tr.insertText("ed", at + 8);
+    for (const mark of marks) tr.addMark(at + 8, at + 10, mark);
+    live.view.dispatch(tr);
+  });
+  expect(local.markdown).not.toContain(privateId);
+  const merged = mergeReviewDrafts(draft(original), local, draft(peerSource), {
+    server: false,
+    budgetMs: 100,
+  });
+  expect(merged.status).toBe("merged");
+  if (merged.status !== "merged") throw new Error("Expected collision merge");
+  expect(merged.idRemap).toMatchObject({ s2: "s3" });
+  let applied: RevisionDraft | null = null;
+  await act(async () => {
+    applied =
+      remote.current?.(merged.draft as RevisionDraft, {
+        localBase: local,
+        idRemap: merged.idRemap,
+        currentCleanMarkdown: local.cleanMarkdown,
+      }) ?? null;
+  });
+  expect(
+    applied,
+    JSON.stringify(
+      profile.entries.filter((entry) =>
+        entry.stage.startsWith("remote-blocked"),
+      ),
+    ),
+  ).not.toBeNull();
+  expect(live.state.doc.textContent).toContain("Beta-b");
+  expect(store.getSnapshot().comments[privateId].target?.parentCommentId).toBe(
+    "s3",
+  );
+  expect(store.getSnapshot().comments[privateId].value).toBe(
+    "Still private during renumber",
+  );
 });
 
 test("remote application rebases buffered native typing with its selection, Undo and exact source intact", async () => {
@@ -648,12 +820,33 @@ test.each([
     async () =>
       new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
   );
+  const restoredParsed = criticMarkdownToEditorState(source);
+  await act(async () => {
+    remote.current?.({
+      markdown: source,
+      decisions: {},
+      reviewComments: [...restoredParsed.comments.values()].map((comment) => ({...comment,changeId:"document"})),
+    }, {forceCleanProjection:true});
+  });
+  if (scenario === "unchanged" || scenario === "moved") {
+    let quote = "";
+    (editor as Editor | null)?.state.doc.descendants((node)=>{
+      if(node.isText&&node.marks.some((mark)=>mark.attrs.commentIds?.includes(privateId)))quote+=node.text;
+    });
+    expect(quote).toBe("unique anchor");
+  }
   const reopened = container.querySelector<HTMLTextAreaElement>(
     `[data-testid="comment-rail-${privateId}-editor"]`,
   );
   if (scenario === "unchanged" || scenario === "moved")
     expect(reopened?.value).toBe("My unsaved anchored feedback");
   else expect(reopened).toBeNull();
+  if (scenario === "unchanged" || scenario === "moved")
+    expect(
+      container.querySelector(
+        `[data-testid="comment-rail-${privateId}-action-cancel"]`,
+      ),
+    ).not.toBeNull();
   expect(restored.getSnapshot().comments[privateId].value).toBe(
     "My unsaved anchored feedback",
   );

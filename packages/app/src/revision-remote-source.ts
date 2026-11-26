@@ -1,4 +1,4 @@
-import { Fragment, type Node } from "@tiptap/pm/model";
+import { Fragment, type Mark, type Node } from "@tiptap/pm/model";
 import type { EditorState, Transaction } from "@tiptap/pm/state";
 import { diffArrays, diffChars } from "diff";
 import { Marked } from "marked";
@@ -193,7 +193,9 @@ export function parseRemoteRevision(
     let parsed = cache.get(key);
     if (!parsed) {
       const source = `${frontmatter ? `${frontmatter}\n` : ""}${raw}\n${blocks.definitions ? `\n${blocks.definitions}\n` : ""}${endmatter ? `\n${endmatter}` : ""}`;
-      const framedBody = `${raw}\n${blocks.definitions ? `\n${blocks.definitions}\n` : ""}`;
+      // Terminal newlines are part of preserved code/endnote source attributes.
+      // Add a separator only when appending the document's link definitions.
+      const framedBody = `${raw}${blocks.definitions ? `\n\n${blocks.definitions}\n` : ""}`;
       const result = criticMarkdownBodyToEditorState(
         endmatter ? framedBody.replace(/\s*$/, "\n") : framedBody,
         { frontmatter, endmatter, review: registry.metadata },
@@ -275,6 +277,100 @@ export function parseRemoteRevision(
   };
 }
 
+/** Separate text edits from mark changes when formatting splits text nodes. */
+function patchTextFragments(
+  tr: Transaction,
+  before: Node[],
+  after: Node[],
+  offset: number,
+) {
+  const text = (nodes: Node[]) => nodes.map((node) => node.text ?? "").join("");
+  const oldText = text(before),
+    newText = text(after);
+  const parts = diffChars(oldText, newText, {
+    timeout: 8,
+    maxEditLength: 4096,
+  });
+  if (!parts) return false;
+  const spans = (nodes: Node[]) => {
+    let at = 0;
+    return nodes.map((node) => {
+      const from = at;
+      at += node.nodeSize;
+      return { from, to: at, node };
+    });
+  };
+  const oldSpans = spans(before),
+    newSpans = spans(after);
+  const edits: Array<{
+    from: number;
+    to: number;
+    content?: Node[];
+    remove?: Mark;
+    add?: Mark;
+  }> = [];
+  let oldAt = 0,
+    newAt = 0,
+    oldIndex = 0,
+    newIndex = 0;
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index];
+    if (!part.added && !part.removed) {
+      let remaining = part.value.length;
+      while (remaining) {
+        while (oldSpans[oldIndex].to <= oldAt) oldIndex++;
+        while (newSpans[newIndex].to <= newAt) newIndex++;
+        const old = oldSpans[oldIndex],
+          next = newSpans[newIndex];
+        const length = Math.min(remaining, old.to - oldAt, next.to - newAt);
+        const from = offset + oldAt,
+          to = from + length;
+        for (const mark of old.node.marks)
+          if (!next.node.marks.some((other) => other.eq(mark)))
+            edits.push({ from, to, remove: mark });
+        for (const mark of next.node.marks)
+          if (!old.node.marks.some((other) => other.eq(mark)))
+            edits.push({ from, to, add: mark });
+        oldAt += length;
+        newAt += length;
+        remaining -= length;
+      }
+      continue;
+    }
+    const from = oldAt,
+      newFrom = newAt;
+    while (
+      index < parts.length &&
+      (parts[index].added || parts[index].removed)
+    ) {
+      const change = parts[index++];
+      if (change.removed) oldAt += change.value.length;
+      else newAt += change.value.length;
+    }
+    index--;
+    const content =
+      newAt === newFrom
+        ? []
+        : newSpans.flatMap((span) =>
+            span.from < newAt && span.to > newFrom
+              ? [
+                  span.node.cut(
+                    Math.max(0, newFrom - span.from),
+                    Math.min(span.node.nodeSize, newAt - span.from),
+                  ),
+                ]
+              : [],
+          );
+    edits.push({ from: offset + from, to: offset + oldAt, content });
+  }
+  for (const edit of edits.reverse()) {
+    if (edit.content) tr.replaceWith(edit.from, edit.to, edit.content);
+    else if (edit.remove) tr.removeMark(edit.from, edit.to, edit.remove);
+    else if (edit.add) tr.addMark(edit.from, edit.to, edit.add);
+  }
+  return true;
+}
+
 function patchFragment(
   tr: Transaction,
   before: Fragment,
@@ -305,6 +401,12 @@ function patchFragment(
   }
   flush();
   for (const patch of patches.reverse()) {
+    if (
+      patch.old.every((node) => node.isText) &&
+      patch.next.every((node) => node.isText) &&
+      patchTextFragments(tr, patch.old, patch.next, patch.from)
+    )
+      continue;
     // Adjacent changed paragraphs are separate editor blocks even when no
     // unchanged block remains between them. Preserve those boundaries so an
     // active composition in one block need not hold back the others.

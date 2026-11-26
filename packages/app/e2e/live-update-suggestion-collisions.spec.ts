@@ -112,6 +112,7 @@ async function append(
 function installBannerRecorder() {
   const scope = window as Window & { collisionBanners: string[] };
   scope.collisionBanners = [];
+  Reflect.set(window, "roughdraftProfile", { entries: [] });
   new MutationObserver(() => {
     const text = document
       .querySelector('[data-testid="revision-conflict"]')
@@ -406,6 +407,7 @@ for (const { peer, arrival } of [
             banner: document.querySelector('[data-testid="revision-conflict"]')
               ?.textContent,
             banners: Reflect.get(window, "collisionBanners"),
+            profile: Reflect.get(window, "roughdraftProfile"),
             editors: [
               ...document.querySelectorAll<HTMLTextAreaElement>(
                 '[data-testid^="comment-rail-"][data-testid$="-editor"]',

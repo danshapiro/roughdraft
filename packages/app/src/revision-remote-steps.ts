@@ -3,11 +3,26 @@ import type { EditorState, Transaction } from "@tiptap/pm/state";
 import { Mapping } from "@tiptap/pm/transform";
 import { replaceRevisionContent } from "./revision-remote-source";
 
-type Range = { from: number; to: number };
+type Range = { from: number; to: number; markType?: string };
 function rangeOf(step: { toJSON(): unknown }): Range | null {
-  const json = step.toJSON() as { from?: number; to?: number; pos?: number };
+  const json = step.toJSON() as {
+    from?: number;
+    to?: number;
+    pos?: number;
+    stepType?: string;
+    mark?: { type?: string };
+  };
   const from = json.from ?? json.pos;
-  return from === undefined ? null : { from, to: json.to ?? from };
+  return from === undefined
+    ? null
+    : {
+        from,
+        to: json.to ?? from,
+        ...((json.stepType === "addMark" || json.stepType === "removeMark") &&
+        json.mark?.type
+          ? { markType: json.mark.type }
+          : {}),
+      };
 }
 function overlaps(a: Range, b: Range) {
   return a.from === a.to
@@ -15,6 +30,15 @@ function overlaps(a: Range, b: Range) {
     : b.from === b.to
       ? b.from > a.from && b.from < a.to
       : a.from < b.to && a.to > b.from;
+}
+
+function independentMarks(a: Range, b: Range, state: EditorState) {
+  if (!a.markType || !b.markType || a.markType === b.markType) return false;
+  const left = state.schema.marks[a.markType];
+  const right = state.schema.marks[b.markType];
+  return Boolean(
+    left && right && !left.excludes(right) && !right.excludes(left),
+  );
 }
 
 /** Apply an incoming worker result across typing newer than the worker snapshot. */
@@ -34,6 +58,7 @@ export function rebaseRemoteTransaction(
     if (range) {
       const inverse = ownProgress.invert();
       ownRanges.push({
+        ...range,
         from: inverse.map(range.from, -1),
         to: inverse.map(range.to, 1),
       });
@@ -46,11 +71,13 @@ export function rebaseRemoteTransaction(
     const inverse = incomingProgress.invert();
     if (
       range &&
-      ownRanges.some((own) =>
-        overlaps(
-          { from: inverse.map(range.from, -1), to: inverse.map(range.to, 1) },
-          own,
-        ),
+      ownRanges.some(
+        (own) =>
+          !independentMarks(own, range, base) &&
+          overlaps(
+            { from: inverse.map(range.from, -1), to: inverse.map(range.to, 1) },
+            own,
+          ),
       )
     )
       return null;

@@ -2125,7 +2125,11 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       ),
     );
     remoteUpdateRef.current = (draft, options) => {
-      if (editor.isDestroyed) return null;
+      const blocked = (reason: string) => {
+        measureRevision(`remote-blocked-${reason}`, () => {});
+        return null;
+      };
+      if (editor.isDestroyed) return blocked("destroyed");
       const active = document.activeElement;
       if (
         options?.idRemap &&
@@ -2134,7 +2138,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           (active instanceof HTMLTextAreaElement &&
             active.dataset.composing === "true"))
       )
-        return null;
+        return blocked("composing-identity");
       const previous = editor.state;
       const previousMarkdown = currentMarkdownRef.current;
       // Source spelling belongs to the last serialized snapshot. The live
@@ -2172,18 +2176,19 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           previousMarkdown,
           draft.markdown,
         );
-        if (rebased === null) return null;
+        if (rebased === null) return blocked("metadata");
         if (rebased !== draft.markdown)
           draft = { ...draft, markdown: rebased, cleanMarkdown: undefined };
       }
       let baseDoc = options?.localBase
         ? (sourceDocSnapshots.current.get(options.localBase.markdown) ??
           parseRemoteRevision(options.localBase.markdown, previous).doc)
-        : previous.doc;
+        : previousSourceDoc;
       if (options?.idRemap)
         for (const target of Object.values(options.idRemap)) {
           const existing = rangesOfId(previous.doc, target);
-          if (existing && !rangesOfId(baseDoc, target)) return null;
+          if (existing && !rangesOfId(baseDoc, target))
+            return blocked("identity-target");
         }
       const parsed = measureRevision("remote-parse", () =>
         parseRemoteRevision(draft.markdown, previous),
@@ -2242,7 +2247,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           identityState,
           parsed.doc,
         );
-        if (!transaction) return null;
+        if (!transaction) return blocked("document-rebase");
         const composing = compositionSessionRef.current;
         if (composing || editor.view.composing) {
           const $from = editor.state.selection.$from;
