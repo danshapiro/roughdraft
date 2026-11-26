@@ -28,6 +28,25 @@ const proposal = (body: string, id: string) =>
   `${body}\n\n---\nsuggestions:\n  ${id}:\n    by: AI\n    at: "2026-11-26T12:00:00.000Z"\n`;
 
 describe("review three-way reconciliation", () => {
+  it.each([
+    false,
+    true,
+  ])("conflicts when one side removes an inline comment that the other edits (reverse=%s)", (reverse) => {
+    const base = draft("{==Text==}{>>Original<<}{#c1}\n", {
+      cleanMarkdown: "Text\n",
+    });
+    const removed = draft("Text\n");
+    const edited = draft("{==Text==}{>>Revised<<}{#c1}\n", {
+      cleanMarkdown: "Text\n",
+    });
+    const result = mergeReviewDrafts(
+      base,
+      reverse ? edited : removed,
+      reverse ? removed : edited,
+    );
+    expect(result.status).toBe("conflict");
+  });
+
   it("preserves both independent edits and exact untouched CRLF spelling", () => {
     const base = draft("* First paragraph.\r\n\r\nSecond paragraph.\r\n");
     const local = draft(base.markdown.replace("First", "Local"));

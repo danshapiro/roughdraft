@@ -35,6 +35,9 @@ export interface OutdatedSuggestion {
   proposedText: string;
   reason: string;
   parentId?: string | null;
+  createdAt?: string;
+  authorType?: "user" | "ai";
+  authorId?: string | null;
 }
 export interface SyncDraft {
   markdown: string;

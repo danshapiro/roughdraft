@@ -228,8 +228,10 @@ function combinedComments(
     const b = raw(before),
       l = raw(left),
       r = raw(right);
+    // Deleting an annotation competes with changing it, just as two changed
+    // bodies do. An absent side must not silently win over the edited thread.
+    if (l !== r && l !== b && r !== b) return null;
     const next = l === r || r === b ? left : l === b ? right : undefined;
-    if (!next && l !== undefined && r !== undefined && l !== r) return null;
     if (next) chosen.set(id, next);
   }
   const anchors = new Map<
