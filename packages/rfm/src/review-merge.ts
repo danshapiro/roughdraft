@@ -2,6 +2,7 @@ import { diffArrays } from "diff";
 import {
   cleanRoughdraftMarkdown,
   extractRoughdraftReviewIndex,
+  roughdraftAttachmentContexts,
   type RfmReviewItem,
 } from "./index.js";
 import { renumberReviewDraft } from "./review-identities.js";
@@ -50,7 +51,17 @@ function identityItems(
   attachmentContext = false,
 ) {
   const items = new Map<string, unknown>();
+  const contexts = attachmentContext
+    ? roughdraftAttachmentContexts(
+        draft.markdown,
+        parsed.map((item) => item.offset),
+      )
+    : null;
   for (const item of parsed) {
+    if (contexts && !contexts.has(item.offset))
+      throw new UnsupportedReviewMerge(
+        "This review attachment needs browser mapping.",
+      );
     items.set(item.id, {
       kind: item.kind,
       text: item.text,
@@ -62,9 +73,7 @@ function identityItems(
       createdAt: item.createdAt,
       ...(attachmentContext
         ? {
-            context: cleanRoughdraftMarkdown(
-              draft.markdown.slice(0, item.offset),
-            ).slice(-40),
+            context: contexts?.get(item.offset),
           }
         : {}),
     });

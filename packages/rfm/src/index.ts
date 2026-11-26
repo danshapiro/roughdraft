@@ -666,6 +666,21 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
 
 /** Omit pending suggestions and review metadata while preserving source spelling. */
 export function cleanRoughdraftMarkdown(markdown: string): string {
+  return projectRoughdraftMarkdown(markdown).text;
+}
+
+/** Read attachment context using the complete document's metadata and code scopes. */
+export function roughdraftAttachmentContexts(
+  markdown: string,
+  offsets: readonly number[],
+): Map<number, string> {
+  return projectRoughdraftMarkdown(markdown, offsets).contexts;
+}
+
+function projectRoughdraftMarkdown(
+  markdown: string,
+  contextOffsets?: readonly number[],
+): { text: string; contexts: Map<number, string>; attachment: string } {
   const endmatter = parseRoughdraftEndmatter(markdown);
   const end =
     endmatter.offset === null
@@ -674,7 +689,21 @@ export function cleanRoughdraftMarkdown(markdown: string): string {
         ? endmatter.offset - 1
         : endmatter.offset;
   let result = "";
+  let attachment = "";
   let offset = 0;
+  const contexts = new Map<number, string>();
+  const points = contextOffsets
+    ? [...new Set(contextOffsets)].sort((a, b) => a - b)
+    : [];
+  let point = 0;
+  const capture = contextOffsets
+    ? () => {
+        while (point < points.length && points[point] <= offset) {
+          const at = points[point++];
+          if (at === offset) contexts.set(at, attachment.slice(-40));
+        }
+      }
+    : null;
   let fence: FenceState | null = null;
   const noopDiagnostic = () => {};
   // Frontmatter belongs to the document, even when a value quotes markup.
@@ -683,34 +712,47 @@ export function cleanRoughdraftMarkdown(markdown: string): string {
   );
   if (frontmatter) {
     result = frontmatter[0];
+    if (capture) attachment = result;
     offset = result.length;
   }
   while (offset < end) {
+    capture?.();
     if (isLineStart(markdown, offset)) {
       const marker = matchFence(markdown, offset, fence);
       if (marker) fence = fence ? null : marker.fence;
       if (marker || fence) {
         const next = Math.min(nextLineOffset(markdown, offset), end);
-        result += markdown.slice(offset, next);
+        const raw = markdown.slice(offset, next);
+        result += raw;
+        if (capture) attachment += raw;
         offset = next;
         continue;
       }
     }
     if (markdown[offset] === "\\") {
-      result += markdown.slice(offset, Math.min(offset + 2, end));
+      const raw = markdown.slice(offset, Math.min(offset + 2, end));
+      result += raw;
+      if (capture) attachment += raw;
       offset += 2;
       continue;
     }
     const codeEnd = matchInlineCodeSpan(markdown, offset);
     if (codeEnd !== null) {
-      result += markdown.slice(offset, codeEnd);
+      const raw = markdown.slice(offset, codeEnd);
+      result += raw;
+      if (capture) attachment += raw;
       offset = codeEnd;
       continue;
     }
     if (markdown.startsWith("{==", offset)) {
       const close = markdown.indexOf("==}", offset + 3);
       if (close !== -1) {
-        result += cleanRoughdraftMarkdown(markdown.slice(offset + 3, close));
+        const content = projectRoughdraftMarkdown(
+          markdown.slice(offset + 3, close),
+          capture ? [] : undefined,
+        );
+        result += content.text;
+        if (capture) attachment += content.attachment;
         offset = close + 3;
         continue;
       }
@@ -724,19 +766,39 @@ export function cleanRoughdraftMarkdown(markdown: string): string {
     }
     const suggestion = parseSuggestion(markdown, offset, noopDiagnostic);
     if (suggestion) {
-      result += cleanRoughdraftMarkdown(
+      const content = projectRoughdraftMarkdown(
         suggestion.suggestionKind === "addition"
           ? ""
           : suggestion.suggestionKind === "substitution"
             ? (suggestion.originalText ?? "")
             : suggestion.text,
+        capture ? [] : undefined,
       );
+      result += content.text;
+      if (capture) attachment += content.attachment;
       offset = suggestion.endOffset;
       continue;
     }
     result += markdown[offset];
+    if (capture) {
+      if (markdown[offset] === "\n") {
+        const crlf = attachment.endsWith("\r");
+        const end = attachment.length - (crlf ? 1 : 0);
+        let from = end;
+        while (from > 0 && /[ \t]/.test(attachment[from - 1])) from--;
+        // A single separator space before an ordinary line ending does not
+        // change attachment. Preserve two-space hard breaks and literal code.
+        if (end - from === 1)
+          attachment = attachment.slice(0, from) + (crlf ? "\r" : "");
+      }
+      attachment += markdown[offset];
+    }
     offset++;
   }
+  capture?.();
+  // Endmatter-only feedback attaches at the body boundary (including CRLF).
+  while (point < points.length && points[point] >= end)
+    contexts.set(points[point++], attachment.slice(-40));
   if (endmatter.data) {
     const {
       comments: _comments,
@@ -748,7 +810,7 @@ export function cleanRoughdraftMarkdown(markdown: string): string {
       result += `${newline}---${newline}${stringifyYaml(other).replaceAll("\n", newline)}`;
     }
   }
-  return result;
+  return { text: result, contexts, attachment };
 }
 
 export function appendRoughdraftDocumentComment(
