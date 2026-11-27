@@ -7,6 +7,7 @@ import {
 } from "@playwright/test";
 import type { ComparisonReviewData } from "../src/comparison-types";
 import {
+  activeCommentDraft,
   createMarkdownProject,
   removeMarkdownProject,
   richTextEditor,
@@ -151,3 +152,81 @@ test("deleted imported feedback and a kept proposal stay resolved after later wa
     removeMarkdownProject(project);
   }
 });
+
+for (const feedback of ["comment", "suggestion"] as const) {
+  test(`an agent rewrite detaches a saved browser-only ${feedback} without a false writing conflict`, async ({
+    page,
+    request,
+  }) => {
+    const project = createMarkdownProject(`disk-ancestry-browser-${feedback}`);
+    try {
+      const target = writeProjectFile(project, "practice.md", original);
+      const read = await open(page, request, target);
+      await selectRichText(page, "planting schedule");
+      if (feedback === "comment") {
+        await page.getByTestId("selection-menu-action-comment").click();
+        const { editor } = await activeCommentDraft(page);
+        await editor.fill("Check the review-only planting dates.");
+        await editor.press("Control+Enter");
+        await expect
+          .poll(async () =>
+            (await read()).reviewComments?.map((c) => c.content),
+          )
+          .toContain("Check the review-only planting dates.");
+      } else {
+        await page.getByTestId("revision-mode").click();
+        await page.getByTestId("revision-mode-suggest").click();
+        await selectRichText(page, "planting schedule");
+        await page.keyboard.insertText("orchard schedule");
+        await expect
+          .poll(async () => (await read()).draft?.markdown)
+          .toContain("orchard");
+      }
+      await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
+        "aria-label",
+        "Review saved",
+      );
+      expect(fs.readFileSync(target, "utf8")).toBe(original);
+      const disk = original.replace(
+        "The planting schedule is ready.",
+        "The agent rewrote the planting plan.",
+      );
+      fs.writeFileSync(target, disk);
+      await expect(richTextEditor(page)).toContainText(
+        "The agent rewrote the planting plan.",
+      );
+      await expect(page.getByTestId("revision-conflict")).toHaveCount(0);
+      if (feedback === "comment") {
+        await expect
+          .poll(async () => (await read()).reviewComments)
+          .toEqual([
+            expect.objectContaining({
+              content: "Check the review-only planting dates.",
+              scope: "document",
+              originalQuote: "planting schedule",
+              detachedReason: expect.any(String),
+            }),
+          ]);
+      } else {
+        await expect
+          .poll(async () => (await read()).draft?.outdatedSuggestions)
+          .toEqual([
+            expect.objectContaining({
+              originalText: "planting",
+              proposedText: "orchard",
+              reason: expect.any(String),
+            }),
+          ]);
+        await expect(page.getByTestId("revision-pending")).toBeEmpty();
+      }
+      await page.reload();
+      await expect(richTextEditor(page)).toContainText(
+        "The agent rewrote the planting plan.",
+      );
+      await expect(page.getByTestId("revision-conflict")).toHaveCount(0);
+      expect(fs.readFileSync(target, "utf8")).toBe(disk);
+    } finally {
+      removeMarkdownProject(project);
+    }
+  });
+}

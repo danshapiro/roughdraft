@@ -9,6 +9,7 @@ import {
 import {
   renumberReviewDraft,
   reviewHistoryProposalIds,
+  nextReviewIdentity,
 } from "./review-identities.js";
 import type {
   SyncConflict,
@@ -148,19 +149,6 @@ function identityItems(
   for (const proposal of draft.outdatedSuggestions ?? [])
     items.set(proposal.id, proposal);
   return items;
-}
-
-function nextIdentity(id: string, used: Set<string>) {
-  const numbered = /^(.*?)(\d+)$/.exec(id);
-  const prefix = numbered?.[1] ?? `${id}-`;
-  let next = numbered ? Number(numbered[2]) + 1 : 2;
-  for (const value of used) {
-    if (!value.startsWith(prefix)) continue;
-    const suffix = value.slice(prefix.length);
-    if (/^\d+$/.test(suffix)) next = Math.max(next, Number(suffix) + 1);
-  }
-  while (used.has(`${prefix}${next}`)) next++;
-  return `${prefix}${next}`;
 }
 
 function tokenize(
@@ -567,7 +555,7 @@ export function mergeReviewDrafts(
           throw new UnsupportedReviewMerge(
             "New review IDs collide; the browser must renumber its own items.",
           );
-        const replacement = nextIdentity(id, used);
+        const replacement = nextReviewIdentity(id, used);
         mapping[id] = replacement;
         used.add(replacement);
       }
@@ -600,7 +588,7 @@ export function mergeReviewDrafts(
         throw new UnsupportedReviewMerge(
           "Resolved proposal IDs collide; the browser must renumber its own items.",
         );
-      const replacement = nextIdentity(id, used);
+      const replacement = nextReviewIdentity(id, used);
       mapping[id] = replacement;
       used.add(replacement);
     }

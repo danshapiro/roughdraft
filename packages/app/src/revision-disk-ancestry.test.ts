@@ -436,3 +436,160 @@ test("an imported comment edited differently in the browser and on disk remains 
     reviewDraftSignature(value),
   );
 });
+
+for (const autosave of ["none", "target"] as const) {
+  for (const feedback of ["comment", "suggestion"] as const) {
+    test(`saved review-only ${feedback} becomes detached feedback after an outside rewrite, autosave ${autosave}`, async () => {
+      open(original, autosave === "target" ? target : "none");
+      const annotated =
+        feedback === "comment"
+          ? original.replace(
+              "Alpha paragraph.",
+              `Alpha {==paragraph==}{>>Browser question.<<}${stamp}.`,
+            )
+          : original.replace(
+              "Alpha paragraph.",
+              'Alpha {++long ++}{id="s1" by="Dan" at="2026-11-22T12:00:00.000Z"}paragraph.',
+            );
+      commit(draft(annotated));
+      const controller = mount();
+      await vi.advanceTimersByTimeAsync(0);
+      await writeDisk(
+        original.replace("Alpha paragraph.", "Alpha rewritten by the agent."),
+      );
+      await settle(controller);
+      expect(controller.getSnapshot().conflict).toBeNull();
+      const saved = store.state(id).draft;
+      expect(saved.cleanMarkdown).toContain("Alpha rewritten by the agent.");
+      expect(fs.readFileSync(target, "utf8")).toContain(
+        "Alpha rewritten by the agent.",
+      );
+      if (feedback === "comment") {
+        expect(saved.reviewComments).toEqual([
+          expect.objectContaining({
+            id: "c1",
+            content: "Browser question.",
+            scope: "document",
+            originalQuote: "paragraph",
+            detachedReason: expect.any(String),
+          }),
+        ]);
+      } else {
+        expect(saved.markdown).not.toContain("{++long ++}");
+        expect(saved.outdatedSuggestions).toEqual([
+          expect.objectContaining({
+            id: "s1",
+            proposedText: "long ",
+            reason: expect.any(String),
+          }),
+        ]);
+      }
+    });
+  }
+}
+
+test("detaching a saved review-only comment also preserves unrelated saved browser prose", async () => {
+  open(original);
+  commit(
+    draft(
+      original
+        .replace(
+          "Alpha paragraph.",
+          `Alpha {==paragraph==}{>>Browser question.<<}${stamp}.`,
+        )
+        .replace("Beta paragraph.", "Beta saved in the browser."),
+    ),
+  );
+  const controller = mount();
+  await vi.advanceTimersByTimeAsync(0);
+  await writeDisk(
+    original.replace("Alpha paragraph.", "Alpha rewritten by the agent."),
+  );
+  await settle(controller);
+  expect(controller.getSnapshot().conflict).toBeNull();
+  const saved = store.state(id).draft;
+  expect(saved.cleanMarkdown).toContain("Alpha rewritten by the agent.");
+  expect(saved.cleanMarkdown).toContain("Beta saved in the browser.");
+  expect(saved.reviewComments[0]).toEqual(
+    expect.objectContaining({ originalQuote: "paragraph", scope: "document" }),
+  );
+});
+
+test("new disk comment IDs that equal prior alias targets stay distinct through later writes and reload", async () => {
+  open(original);
+  commit(
+    draft(
+      original.replace(
+        "Alpha paragraph.",
+        `Alpha {==paragraph==}{>>Browser feedback.<<}${stamp}.`,
+      ),
+    ),
+  );
+  let controller = mount();
+  await vi.advanceTimersByTimeAsync(0);
+  const first = original.replace(
+    "Beta paragraph.",
+    `Beta {==paragraph==}{>>Agent first note.<<}${stamp}.`,
+  );
+  await writeDisk(first);
+  await settle(controller);
+  expect(store.state(id).draft.diskOrigin?.ids).toEqual({ c1: "c2" });
+  controller.stop();
+  controller = mount();
+  const second = first.replace(
+    "# Plan",
+    '# {==Plan==}{>>Agent second note.<<}{id="c2" by="AI" at="2026-11-22T12:20:00.000Z"}',
+  );
+  await writeDisk(second);
+  await settle(controller);
+  const saved = store.state(id).draft;
+  expect(controller.getSnapshot().conflict).toBeNull();
+  expect(saved.reviewComments.map((c) => [c.id, c.content]).sort()).toEqual([
+    ["c1", "Browser feedback."],
+    ["c2", "Agent first note."],
+    ["c3", "Agent second note."],
+  ]);
+  expect(
+    draft(saved.markdown)
+      .reviewComments.map((c) => [c.id, c.content])
+      .sort(),
+  ).toEqual(saved.reviewComments.map((c) => [c.id, c.content]).sort());
+  expect(saved.diskOrigin?.ids).toEqual({ c1: "c2", c2: "c3" });
+  controller.stop();
+  controller = mount();
+  await writeDisk(second.replace("Beta", "Updated Beta"));
+  await settle(controller);
+  expect(store.state(id).draft.reviewComments).toHaveLength(3);
+  expect(
+    store
+      .state(id)
+      .draft.reviewComments.map((c) => c.content)
+      .sort(),
+  ).toEqual(["Agent first note.", "Agent second note.", "Browser feedback."]);
+});
+
+test.each([
+  "\n",
+  "\r\n",
+])("outside adoption keeps list spelling and line endings %j while merging independent prose", async (newline) => {
+  const source = [
+    "# Plan",
+    "",
+    "* Alpha paragraph.",
+    "* Beta paragraph.",
+    "",
+  ].join(newline);
+  open(source);
+  commit(
+    draft(source.replace("Alpha paragraph.", "Alpha saved in the browser.")),
+  );
+  const controller = mount();
+  await vi.advanceTimersByTimeAsync(0);
+  await writeDisk(source.replace("Beta paragraph.", "Beta edited on disk."));
+  await settle(controller);
+  expect(controller.getSnapshot().conflict).toBeNull();
+  const expected = source
+    .replace("Alpha paragraph.", "Alpha saved in the browser.")
+    .replace("Beta paragraph.", "Beta edited on disk.");
+  expect(store.state(id).draft.cleanMarkdown).toBe(expected);
+});

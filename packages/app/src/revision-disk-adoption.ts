@@ -2,6 +2,8 @@ import {
   contentSignature,
   extractRoughdraftReviewIndex,
   mergeReviewDrafts,
+  nextReviewIdentity,
+  reviewHistoryProposalIds,
   renumberReviewDraft,
   reviewDraftSignature,
   type SyncDraft,
@@ -155,23 +157,86 @@ function mergeDisk(
   const aliases =
     origin?.path === diskBase.path &&
     origin.signature === contentSignature(diskBase.markdown)
-      ? origin.ids
+      ? { ...origin.ids }
       : {};
+  const rawIds = new Set(
+    [diskBase.markdown, markdown].flatMap((source) =>
+      extractRoughdraftReviewIndex(source).items.map((item) => item.id),
+    ),
+  );
+  const targets = new Set(Object.values(aliases));
+  const used = new Set([
+    ...rawIds,
+    ...targets,
+    ...Object.keys(aliases),
+    ...extractRoughdraftReviewIndex(review.markdown).items.map(
+      (item) => item.id,
+    ),
+    ...review.reviewComments.map((comment) => comment.id),
+    ...Object.keys(review.decisions),
+    ...reviewHistoryProposalIds(review.reviewed),
+    ...(review.outdatedSuggestions ?? []).map((item) => item.id),
+  ]);
+  // The disk and review have separate ID spaces once an imported item was
+  // renamed. Reserve fresh targets before applying aliases simultaneously.
+  for (const id of rawIds)
+    if (!Object.hasOwn(aliases, id) && targets.has(id)) {
+      const fresh = nextReviewIdentity(id, used);
+      aliases[id] = fresh;
+      used.add(fresh);
+      targets.add(fresh);
+    }
   const before = renumberReviewDraft(
     diskDraft(diskBase.markdown, schema),
     aliases,
   );
   const disk = renumberReviewDraft(diskDraft(markdown, schema), aliases);
-  // When outside prose displaces a saved anchor, retain the original feedback
-  // detached from that passage. A deliberately removed annotation on unchanged
-  // prose stays removed. Reuse the editor's existing annotation mapper.
-  const displaced = adoptDisk(
-    before,
-    disk.cleanMarkdown ?? disk.markdown,
-    schema,
-    force,
+  const options = {
+    server: false,
+    budgetMs: 100,
+    ...(diskBase.resolution
+      ? {
+          resolution:
+            diskBase.resolution === "local"
+              ? ("incoming" as const)
+              : ("local" as const),
+        }
+      : {}),
+  };
+  const plain = (draft: SyncDraft): SyncDraft => {
+    const text =
+      draft.cleanMarkdown ?? cleanRevisionSourceMarkdown(draft.markdown);
+    return {
+      markdown: text,
+      cleanMarkdown: text,
+      decisions: {},
+      reviewComments: [],
+    };
+  };
+  // Pending feedback is not a prose edit. First merge the accepted text, then
+  // map each side's feedback onto that result before comparing its decisions.
+  // In particular, review-only comments/suggestions displaced by an agent edit
+  // become detached/outdated feedback rather than a false writing conflict.
+  const prose = mergeReviewDrafts(
+    plain(before),
+    plain(disk),
+    plain(review),
+    options,
   );
-  if (!displaced)
+  if (prose.status !== "merged")
+    return {
+      ...prose,
+      conflicts: prose.conflicts.map((conflict) => ({
+        ...conflict,
+        local: conflict.incoming,
+        incoming: conflict.local,
+      })),
+    };
+  const mapped = [before, disk, review].map((value) =>
+    adoptDisk(value, prose.draft.markdown, schema, force),
+  );
+  const [mappedBefore, mappedDisk, mappedReview] = mapped;
+  if (!mappedBefore || !mappedDisk || !mappedReview)
     return {
       status: "client-merge-required",
       draft: review,
@@ -179,23 +244,40 @@ function mergeDisk(
       signature: reviewDraftSignature(review),
       reason: "The outside update could not be mapped safely.",
     };
-  {
-    const ids = new Set(disk.reviewComments.map((comment) => comment.id));
-    disk.reviewComments.push(
-      ...displaced.reviewComments.filter(
-        (comment) => comment.detachedReason && !ids.has(comment.id),
-      ),
-    );
-    if (displaced.outdatedSuggestions?.length)
-      disk.outdatedSuggestions = displaced.outdatedSuggestions;
-  }
-  const merged = mergeReviewDrafts(before, disk, review, {
-    server: false,
-    budgetMs: 100,
-    ...(diskBase.resolution
-      ? { resolution: diskBase.resolution === "local" ? "incoming" : "local" }
-      : {}),
-  });
+  // Removing a passage must not remove its discussion. Deliberately removing
+  // markup on unchanged prose still counts as an annotation deletion.
+  const diskCommentIds = new Set(
+    mappedDisk.reviewComments.map((comment) => comment.id),
+  );
+  mappedDisk.reviewComments.push(
+    ...mappedBefore.reviewComments.filter(
+      (comment) =>
+        comment.detachedReason &&
+        !before.reviewComments.find((old) => old.id === comment.id)
+          ?.detachedReason &&
+        !diskCommentIds.has(comment.id),
+    ),
+  );
+  const previousOutdated = new Set(
+    (before.outdatedSuggestions ?? []).map((item) => item.id),
+  );
+  const diskOutdated = new Set(
+    (mappedDisk.outdatedSuggestions ?? []).map((item) => item.id),
+  );
+  const displaced = (mappedBefore.outdatedSuggestions ?? []).filter(
+    (item) => !previousOutdated.has(item.id) && !diskOutdated.has(item.id),
+  );
+  if (displaced.length)
+    mappedDisk.outdatedSuggestions = [
+      ...(mappedDisk.outdatedSuggestions ?? []),
+      ...displaced,
+    ];
+  const merged = mergeReviewDrafts(
+    mappedBefore,
+    mappedDisk,
+    mappedReview,
+    options,
+  );
   if (merged.status !== "merged")
     return {
       ...merged,

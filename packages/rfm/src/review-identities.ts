@@ -24,6 +24,20 @@ export function reviewHistoryProposalIds(history: readonly SyncHistory[] = []) {
   return ids;
 }
 
+/** Allocate an unused review identity without changing existing references. */
+export function nextReviewIdentity(id: string, used: Set<string>) {
+  const numbered = /^(.*?)(\d+)$/.exec(id);
+  const prefix = numbered?.[1] ?? `${id}-`;
+  let next = numbered ? Number(numbered[2]) + 1 : 2;
+  for (const value of used) {
+    if (!value.startsWith(prefix)) continue;
+    const suffix = value.slice(prefix.length);
+    if (/^\d+$/.test(suffix)) next = Math.max(next, Number(suffix) + 1);
+  }
+  while (used.has(`${prefix}${next}`)) next++;
+  return `${prefix}${next}`;
+}
+
 function scalarSpelling(source: string, next: string) {
   if (source.startsWith('"')) return JSON.stringify(next);
   if (source.startsWith("'")) return `'${next.replaceAll("'", "''")}'`;

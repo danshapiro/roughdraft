@@ -1,4 +1,7 @@
-export { reviewHistoryProposalIds } from "./review-identities.js";
+export {
+  reviewHistoryProposalIds,
+  nextReviewIdentity,
+} from "./review-identities.js";
 export { contentSignature } from "./review-values.js";
 export { hasUnsubmittedReviewFeedback } from "./review-feedback.js";
 export type { ReviewMergeOptions } from "./review-merge.js";
