@@ -696,3 +696,54 @@ test("Overwrite keeps a restorable incoming disk version before replacing it", a
     true,
   );
 });
+
+test("an agent rewrite retains a saved browser reply to its disk comment through reload", async () => {
+  open(annotated);
+  const value = draft(annotated);
+  value.reviewComments.push({
+    id: "c2",
+    parentCommentId: "c1",
+    changeId: "c1",
+    content: "Browser reply before the agent rewrite.",
+    createdAt: "2026-11-22T12:05:00.000Z",
+  });
+  commit(value);
+  let controller = mount();
+  await vi.advanceTimersByTimeAsync(0);
+  const rewritten = original.replace(
+    "Alpha paragraph.",
+    "Alpha rewritten by the agent.",
+  );
+  await writeDisk(rewritten);
+  await settle(controller);
+  expect(controller.getSnapshot().conflict).toBeNull();
+  expect(store.state(id).draft.reviewComments).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        id: "c1",
+        scope: "document",
+        originalQuote: "paragraph",
+        detachedReason: expect.any(String),
+      }),
+      expect.objectContaining({
+        id: "c2",
+        parentCommentId: "c1",
+        content: "Browser reply before the agent rewrite.",
+      }),
+    ]),
+  );
+  controller.stop();
+  controller = mount();
+  await writeDisk(rewritten.replace("Beta paragraph.", "Beta revised later."));
+  await settle(controller);
+  expect(controller.getSnapshot().conflict).toBeNull();
+  expect(store.state(id).draft.reviewComments).toHaveLength(2);
+  expect(
+    store.state(id).draft.reviewComments.find((c) => c.id === "c2"),
+  ).toEqual(
+    expect.objectContaining({
+      parentCommentId: "c1",
+      content: "Browser reply before the agent rewrite.",
+    }),
+  );
+});
