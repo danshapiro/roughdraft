@@ -267,6 +267,7 @@ async function mountReview(source: string, id = "spelling-rewrite") {
   return { editor, controller, current: () => current };
 }
 
+// The complete mounted save/Undo flow also runs with V8 coverage instrumentation.
 test("keeping a suggestion and rewriting a long paragraph preserves exact list spelling and CRLF through native typing and Undo", async () => {
   const opening = "a".repeat(1900);
   const rewritten = "b".repeat(1900);
@@ -344,7 +345,7 @@ test("keeping a suggestion and rewriting a long paragraph preserves exact list s
   expect(controller.readDraft().cleanMarkdown).toBe(
     expected.replace(rewritten + suffix, opening),
   );
-});
+}, 30_000);
 
 test("the first plain Edit keystroke after a large review opens uses its initialized accepted-spelling proof", async () => {
   const metadata = editingReview.lastIndexOf("\n---\n");

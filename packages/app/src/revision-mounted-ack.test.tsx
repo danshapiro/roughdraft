@@ -382,6 +382,7 @@ test("a source update checks composition against its final rebase across newer p
   expect(source.compositionStarted).toBe(true);
 }, 15_000);
 
+// Allow full fixture setup, two peer updates and Undo/Redo under V8 coverage.
 test.each([
   "other paragraph",
   "same paragraph",
@@ -600,7 +601,7 @@ test.each([
   }
   expect(store.getSnapshot().comments.c1.value).toBe(privateComment);
   expect(store.getSnapshot().comments.c99.value).toBe(privateReply);
-}, 20_000);
+}, 30_000);
 
 test.each([
   "outside prose",
