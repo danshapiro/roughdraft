@@ -23,6 +23,10 @@ import {
   decodeBrowserRecovery,
   encodeBrowserRecovery,
 } from "./revision-browser-recovery";
+import type {
+  RevisionDiskBase,
+  RevisionDiskMerge,
+} from "./revision-disk-adoption";
 import { subscribeReviewChanges } from "./revision-live-transport";
 import { measureRevision } from "./revision-performance";
 import { hasPreparedIdentityClash } from "./revision-prepared-identities";
@@ -36,10 +40,6 @@ import {
   type SentDraftReference,
 } from "./revision-sync-transfer";
 import { privateReplyTarget, privateRootTarget } from "./revision-ui-drafts";
-import type {
-  RevisionDiskBase,
-  RevisionDiskMerge,
-} from "./revision-disk-adoption";
 
 export interface InspectedDestination {
   path: string;
@@ -68,6 +68,7 @@ export interface RevisionRemoteAdapter {
       currentCleanMarkdown?: string;
     },
   ): RevisionDraft | null;
+  /** Derive from immutable source inputs and schema, independently of live typing. */
   adopt(
     base: RevisionDraft,
     markdown: string,
@@ -372,6 +373,10 @@ export class RevisionSessionController {
   private checkpointRecoveryId: string | undefined;
   private checkpointEpisode: CheckpointEpisode | undefined;
   private diskProjections = new Map<string, string>();
+  private diskAdoption: {
+    inputs: unknown[];
+    outcome: { result: RevisionDiskMerge | null } | { error: unknown };
+  } | null = null;
   private reflectedDisk: {
     path: string;
     baseSignature: string;
@@ -1110,6 +1115,7 @@ export class RevisionSessionController {
     this.refreshPromise = null;
     this.refreshReviewId = null;
     this.refreshRequested = false;
+    this.diskAdoption = null;
     this.unsubscribe?.();
     this.unsubscribe = null;
     this.unsubscribeUi?.();
@@ -1131,6 +1137,7 @@ export class RevisionSessionController {
   }
   setAdapter = (adapter: RevisionRemoteAdapter | null) => {
     this.unsubscribeUi?.();
+    this.diskAdoption = null;
     this.adapter = adapter;
     if (!adapter) this.projectionReady = false;
     this.unsubscribeUi =
@@ -1752,34 +1759,73 @@ export class RevisionSessionController {
     resolution?: "local" | "incoming",
   ): RevisionDiskMerge | null {
     const disk = state.disk;
-    if (!disk || disk.text === null || disk.text === state.review.savedText)
+    if (!disk || disk.text === null || disk.text === state.review.savedText) {
+      this.diskAdoption = null;
       return {
         status: "merged",
         draft: state.draft,
         conflicts: [],
         signature: state.signature,
       };
-    const adopted =
-      this.adapter?.adopt(
-        state.draft as RevisionDraft,
-        disk.text,
-        force,
-        typeof state.review.savedText === "string"
-          ? { path: disk.path, markdown: state.review.savedText, resolution }
-          : undefined,
-      ) ?? null;
-    if (!adopted) return null;
-    const result: RevisionDiskMerge =
-      "status" in adopted
-        ? adopted
-        : {
-            status: "merged",
-            draft: adopted,
-            conflicts: [],
-            signature: reviewDraftSignature(adopted),
-            diskCleanMarkdown: adopted.cleanMarkdown,
-          };
-    if (result.status === "merged")
+    }
+    // Checkpoint notices and newer local typing do not change this pure input.
+    // Keep one result, including refusals, while editor application retries on
+    // every observation. Real source/review changes or explicit Retry recompute.
+    const inputs = [
+      this.adapter,
+      this.adapter?.adopt,
+      state.review.id,
+      state.revision,
+      state.signature,
+      state.draft.markdown,
+      state.draft.cleanMarkdown,
+      state.review.savedText,
+      disk.path,
+      disk.version,
+      disk.hash,
+      disk.text,
+      force,
+      resolution,
+    ];
+    let cached = this.diskAdoption;
+    if (
+      !cached ||
+      !inputs.every((value, index) => value === cached?.inputs[index])
+    ) {
+      try {
+        const adopted =
+          this.adapter?.adopt(
+            state.draft as RevisionDraft,
+            disk.text,
+            force,
+            typeof state.review.savedText === "string"
+              ? {
+                  path: disk.path,
+                  markdown: state.review.savedText,
+                  resolution,
+                }
+              : undefined,
+          ) ?? null;
+        const result: RevisionDiskMerge | null = !adopted
+          ? null
+          : "status" in adopted
+            ? adopted
+            : {
+                status: "merged",
+                draft: adopted,
+                conflicts: [],
+                signature: reviewDraftSignature(adopted),
+                diskCleanMarkdown: adopted.cleanMarkdown,
+              };
+        cached = { inputs, outcome: { result } };
+      } catch (error) {
+        cached = { inputs, outcome: { error } };
+      }
+      this.diskAdoption = cached;
+    }
+    if ("error" in cached.outcome) throw cached.outcome.error;
+    const result = cached.outcome.result;
+    if (result?.status === "merged")
       this.rememberDiskProjection(state, result.diskCleanMarkdown);
     return result;
   }
@@ -3006,6 +3052,7 @@ export class RevisionSessionController {
     return !recoveredState.publishing;
   };
   retry = async () => {
+    this.diskAdoption = null;
     this.emit({ recoveryError: "" });
     if (this.operation && !(await this.resolvePending())) return false;
     this.emit({ writePaused: false, conflict: null });
