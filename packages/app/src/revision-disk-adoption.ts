@@ -3,21 +3,22 @@ import {
   extractRoughdraftReviewIndex,
   mergeReviewDrafts,
   nextReviewIdentity,
-  reviewHistoryProposalIds,
   renumberReviewDraft,
   reviewDraftSignature,
+  reviewHistoryProposalIds,
   type SyncDraft,
   type SyncMerge,
 } from "@roughdraft/rfm";
-import { EditorState } from "@tiptap/pm/state";
-import { Mapping } from "@tiptap/pm/transform";
 import type { Node, Schema } from "@tiptap/pm/model";
+import { EditorState } from "@tiptap/pm/state";
+import { Mapping, type Step } from "@tiptap/pm/transform";
 import {
-  editorStateToCriticMarkdown,
   type CriticComment,
+  editorStateToCriticMarkdown,
 } from "./critic-markup";
 import { rejectCriticChangeTransaction } from "./editor-extensions";
 import { suggestionDetail } from "./revision-bulk";
+import { cleanSourceFromNode } from "./revision-clean-cache";
 import {
   cleanRevisionDocument,
   cleanRevisionSourceMarkdown,
@@ -31,7 +32,6 @@ import {
   parseRemoteRevision,
   replaceRevisionContent,
 } from "./revision-remote-source";
-import { cleanSourceFromNode } from "./revision-clean-cache";
 
 function annotationRanges(doc: Node) {
   const comments = new Map<string, { from: number; to: number }>();
@@ -217,10 +217,12 @@ function mergeDisk(
   // map each side's feedback onto that result before comparing its decisions.
   // In particular, review-only comments/suggestions displaced by an agent edit
   // become detached/outdated feedback rather than a false writing conflict.
+  const sides = [before, disk, review];
+  const plainSides = sides.map(plain);
   const prose = mergeReviewDrafts(
-    plain(before),
-    plain(disk),
-    plain(review),
+    plainSides[0],
+    plainSides[1],
+    plainSides[2],
     options,
   );
   if (prose.status !== "merged")
@@ -232,8 +234,15 @@ function mergeDisk(
         incoming: conflict.local,
       })),
     };
-  const mapped = [before, disk, review].map((value) =>
-    adoptDisk(value, prose.draft.markdown, schema, force),
+  const mapped = sides.map((value, index) =>
+    adoptDisk(
+      value,
+      prose.draft.markdown,
+      schema,
+      force,
+      undefined,
+      plainSides[index].markdown,
+    ),
   );
   const [mappedBefore, mappedDisk, mappedReview] = mapped;
   if (!mappedBefore || !mappedDisk || !mappedReview)
@@ -317,6 +326,7 @@ function adoptDisk(
   schema: Schema,
   force: boolean,
   projected?: ReturnType<typeof parseRemoteRevision>,
+  comparisonMarkdown?: string,
 ): SyncDraft | null {
   let state = EditorState.create({ schema });
   const parsedBase = parseRemoteRevision(base.markdown, state);
@@ -393,6 +403,15 @@ function adoptDisk(
       : null;
   }
   const accepted = projectAcceptedDocument(state.doc);
+  // Source projection may serialize adjacent whitespace differently from the
+  // model left by Revert. Compare new prose with the exact source baseline used
+  // by the three-way merge, then map only its actual edits into that model.
+  // A projection-only spelling difference must not displace pending feedback.
+  const comparison =
+    comparisonMarkdown === undefined
+      ? accepted.doc
+      : parseRemoteRevision(comparisonMarkdown, state).doc;
+  const comparisonState = EditorState.create({ schema, doc: comparison });
   const originalComments = new Map(parsedBase.comments);
   for (const comment of base.reviewComments)
     originalComments.set(comment.id, comment);
@@ -401,11 +420,12 @@ function adoptDisk(
     originalComments,
     { frontmatter: parsedBase.frontmatter, endmatter: parsedBase.endmatter },
   );
-  const changes = replaceRevisionContent(
-    EditorState.create({ schema, doc: accepted.doc }),
-    parsedIncoming.doc,
+  const changes = replaceRevisionContent(comparisonState, parsedIncoming.doc);
+  const inverse = new Mapping();
+  inverse.appendMapping(
+    replaceRevisionContent(comparisonState, accepted.doc).mapping,
   );
-  const inverse = accepted.mapping.invert();
+  inverse.appendMapping(accepted.mapping.invert());
   const ranges = annotationRanges(state.doc);
   const affectedComments = new Set<string>();
   const affectedSuggestions = new Set<string>();
@@ -520,24 +540,19 @@ function adoptDisk(
   if (annotationTr.docChanged) state = state.apply(annotationTr);
   const projection = projectAcceptedDocument(state.doc);
   const acceptedState = EditorState.create({ schema, doc: projection.doc });
-  const acceptedUpdate = replaceRevisionContent(
-    acceptedState,
-    parsedIncoming.doc,
-  );
-  let mapping = projection.mapping.invert();
-  const transaction = state.tr;
-  for (const step of acceptedUpdate.steps) {
-    const mapped = step.map(mapping);
-    if (!mapped || transaction.maybeStep(mapped).failed) return null;
-    const nextMapping = new Mapping();
-    nextMapping.appendMap(step.getMap().invert());
-    nextMapping.appendMapping(mapping);
-    nextMapping.appendMap(mapped.getMap());
-    mapping = nextMapping;
-  }
+  const toAccepted = replaceRevisionContent(
+    comparisonState,
+    projection.doc,
+  ).mapping;
+  const expected = applyMappedSteps(acceptedState, changes.steps, toAccepted);
+  const toReview = new Mapping();
+  toReview.appendMapping(toAccepted);
+  toReview.appendMapping(projection.mapping.invert());
+  const transaction = applyMappedSteps(state, changes.steps, toReview);
+  if (!expected || !transaction) return null;
   if (
     !projectAcceptedDocument(transaction.doc).doc.content.eq(
-      parsedIncoming.doc.content,
+      expected.doc.content,
     )
   )
     return null;
@@ -566,4 +581,23 @@ function adoptDisk(
     outdatedSuggestions: outdated,
     reviewed: base.reviewed,
   };
+}
+
+function applyMappedSteps(
+  state: EditorState,
+  steps: readonly Step[],
+  initial: Mapping,
+) {
+  let mapping = initial;
+  const transaction = state.tr;
+  for (const step of steps) {
+    const mapped = step.map(mapping);
+    if (!mapped || transaction.maybeStep(mapped).failed) return null;
+    const next = new Mapping();
+    next.appendMap(step.getMap().invert());
+    next.appendMapping(mapping);
+    next.appendMap(mapped.getMap());
+    mapping = next;
+  }
+  return transaction;
 }
