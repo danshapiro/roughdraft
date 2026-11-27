@@ -1515,7 +1515,7 @@ export class ComparisonStore {
           reservationExpiresAt: result.reservation?.expiresAt,
           reason: typeof body.reason === "string" ? body.reason : "sync",
         });
-        this.operations.prepare(record, result);
+        this.operations.prepare(record, result, { terminal: true });
         return this.operations.finish(record);
       };
       if (review.pendingPublication?.owner === this.operations.owner) {
@@ -2835,7 +2835,7 @@ export class ComparisonStore {
         });
       const record = this.operations.begin(operation, id);
       const reject = (result: SyncResult<Comparison>) => {
-        this.operations.prepare(record, result);
+        this.operations.prepare(record, result, { terminal: true });
         return this.operations.finish(record);
       };
       if (review.pendingPublication || review.pendingSave)

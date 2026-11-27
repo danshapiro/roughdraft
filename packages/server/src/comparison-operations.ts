@@ -400,7 +400,15 @@ export class ComparisonOperations<Review> {
     return record;
   }
 
-  prepare(record: OperationRecord<Review>, result: SyncResult<Review>): void {
+  prepare(
+    record: OperationRecord<Review>,
+    result: SyncResult<Review>,
+    options: { terminal?: boolean } = {},
+  ): void {
+    if (options.terminal && result.status === "committed")
+      throw new Error(
+        "Committed outcomes require an authoritative review commit",
+      );
     record.result = { ...result, operationId: record.operation.operationId };
     delete record.resultUnavailable;
     this.unavailableResults.delete(record.operation.operationId);
@@ -429,7 +437,9 @@ export class ComparisonOperations<Review> {
         encoding: "gzip",
       };
     } else delete record.resultPayload;
-    record.phase = "prepared";
+    // A rejection has no authoritative review commit to wait for. Persist its
+    // terminal result once; publication results retain prepared → review → done.
+    record.phase = options.terminal ? "done" : "prepared";
     this.write(record);
   }
 
@@ -466,8 +476,10 @@ export class ComparisonOperations<Review> {
 
   finish(record: OperationRecord<Review>): SyncResult<Review> {
     if (!record.result) throw new Error("An operation outcome is required");
-    record.phase = "done";
-    this.write(record);
+    if (record.phase !== "done") {
+      record.phase = "done";
+      this.write(record);
+    }
     this.cleanPublication(record);
     return record.result;
   }
@@ -478,7 +490,7 @@ export class ComparisonOperations<Review> {
     result: SyncResult<Review>,
   ) {
     const record = this.begin(operation, reviewId);
-    this.prepare(record, result);
+    this.prepare(record, result, { terminal: true });
     return this.finish(record);
   }
 
