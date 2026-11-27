@@ -230,3 +230,73 @@ for (const feedback of ["comment", "suggestion"] as const) {
     }
   });
 }
+
+test("a newer outside overlap during Overwrite waits for a new confirmation and saves both incoming versions", async ({
+  page,
+  request,
+}) => {
+  const project = createMarkdownProject("disk-ancestry-overwrite-race");
+  try {
+    const target = writeProjectFile(project, "practice.md", original);
+    const read = await open(page, request, target);
+    const id = new URL(page.url()).searchParams.get("comparison");
+    await selectRichText(page, "planting schedule");
+    await page.keyboard.insertText("orchard schedule");
+    await expect
+      .poll(async () => (await read()).draft?.markdown)
+      .toContain("orchard schedule");
+    const first = original.replace("planting schedule", "citrus schedule");
+    const second = original.replace("planting schedule", "meadow schedule");
+    fs.writeFileSync(target, first);
+    await expect(page.getByTestId("revision-conflict")).toBeVisible();
+    let raced = false;
+    await page.route("**/api/comparisons/*/reconcile", async (route) => {
+      const body = route.request().postDataJSON();
+      if (!raced && body.reason === "resolve") {
+        raced = true;
+        fs.writeFileSync(target, second);
+      }
+      await route.continue();
+    });
+    await page.getByTestId("revision-overwrite").click();
+    const dialog = page.getByTestId("revision-resolve-dialog");
+    await expect(dialog).toContainText("citrus");
+    await page.getByTestId("revision-resolve-confirm").click();
+    await expect(dialog).toContainText("The overlapping changes changed");
+    await expect(page.getByTestId("revision-resolve-confirm")).toBeDisabled();
+    expect(raced).toBe(true);
+    expect(fs.readFileSync(target, "utf8")).toBe(second);
+    const copies = async () =>
+      Promise.all(
+        ((await read()).recoveryCheckpoints ?? []).map(async (entry) => {
+          const response = await request.get(
+            `${api}/${id}/checkpoints/${entry.id}`,
+            { headers },
+          );
+          await expect(response).toBeOK();
+          return response.json();
+        }),
+      );
+    expect(
+      (await copies()).some(
+        (copy) => copy.workingDraft?.cleanMarkdown === first,
+      ),
+    ).toBe(true);
+    await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await page.getByTestId("revision-overwrite").click();
+    await expect(dialog).toContainText("meadow");
+    await page.getByTestId("revision-resolve-confirm").click();
+    await expect(dialog).toBeHidden();
+    await expect
+      .poll(async () => (await read()).draft?.markdown)
+      .toContain("orchard schedule");
+    expect(
+      (await copies()).some(
+        (copy) => copy.workingDraft?.cleanMarkdown === second,
+      ),
+    ).toBe(true);
+    expect(fs.readFileSync(target, "utf8")).toBe(second);
+  } finally {
+    removeMarkdownProject(project);
+  }
+});

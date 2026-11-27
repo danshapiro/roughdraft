@@ -593,3 +593,106 @@ test.each([
     .replace("Beta paragraph.", "Beta edited on disk.");
   expect(store.state(id).draft.cleanMarkdown).toBe(expected);
 });
+
+test.each([
+  "none",
+  "target",
+] as const)("a changed outside overlap needs a new Overwrite confirmation and preserves both incoming versions, autosave %s", async (mode) => {
+  open(original, mode === "target" ? target : "none");
+  const browser = original.replace(
+    "Alpha paragraph.",
+    "Alpha edited in browser.",
+  );
+  const first = original.replace("Alpha paragraph.", "Alpha edited on disk.");
+  const second = original.replace(
+    "Alpha paragraph.",
+    "Alpha rewritten AGAIN on disk.",
+  );
+  commit(draft(browser));
+  if (mode === "target") await writeDisk(first);
+  let raced = false;
+  const controller = mount((body) => {
+    if (!raced && body.reason === "resolve") {
+      raced = true;
+      fs.writeFileSync(target, second);
+      store.watchers.invalidate(target);
+    }
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  if (mode === "none") await writeDisk(first);
+  await settle(controller);
+  const inspected = controller.getSnapshot().conflict;
+  expect(inspected?.kind).toBe("conflict");
+  if (!inspected) throw new Error("Expected the initial inspected conflict");
+  const result = await controller.resolveConflict("local", inspected.signature);
+  const afterResolution = controller.getSnapshot().conflict;
+  expect(result).toBe(false);
+  expect(afterResolution?.signature).not.toBe(inspected.signature);
+  expect(fs.readFileSync(target, "utf8")).toBe(second);
+  // The real watcher publishes its refreshed disk cache asynchronously.
+  // This fixture disables transport callbacks, so wait for that state before
+  // explicitly delivering the next notice through refresh.
+  await vi.waitFor(() => expect(store.state(id).disk?.text).toBe(second));
+  await settle(controller);
+  expect(raced).toBe(true);
+  expect(result).toBe(false);
+  expect(fs.readFileSync(target, "utf8")).toBe(second);
+  const updated = controller.getSnapshot().conflict;
+  expect(updated?.kind).toBe("conflict");
+  expect(updated?.signature).not.toBe(inspected.signature);
+  expect(
+    updated?.conflicts.some((c) =>
+      JSON.stringify(c.incoming).includes("AGAIN"),
+    ),
+  ).toBe(true);
+  const copies = () =>
+    store.checkpoints(id).map(
+      (entry) =>
+        store.readCheckpoint(id, entry.id) as {
+          workingDraft: RevisionDraft;
+          entryDraft?: RevisionDraft;
+        },
+    );
+  expect(
+    copies().some((copy) => copy.workingDraft.cleanMarkdown === first),
+  ).toBe(true);
+  if (!updated) throw new Error("Expected the refreshed conflict");
+  expect(await controller.resolveConflict("local", updated.signature)).toBe(
+    true,
+  );
+  expect(
+    copies().some((copy) => copy.workingDraft.cleanMarkdown === second),
+  ).toBe(true);
+  expect(store.state(id).draft.cleanMarkdown).toBe(browser);
+  expect(fs.readFileSync(target, "utf8")).toBe(
+    mode === "target" ? browser : second,
+  );
+});
+
+test("Overwrite keeps a restorable incoming disk version before replacing it", async () => {
+  open(original);
+  const browser = original.replace(
+    "Alpha paragraph.",
+    "Alpha edited in browser.",
+  );
+  const disk = original.replace("Alpha paragraph.", "Alpha edited on disk.");
+  commit(draft(browser));
+  const controller = mount();
+  await vi.advanceTimersByTimeAsync(0);
+  await writeDisk(disk);
+  await settle(controller);
+  const inspected = controller.getSnapshot().conflict;
+  if (!inspected) throw new Error("Expected a real prose conflict");
+  expect(await controller.resolveConflict("local", inspected.signature)).toBe(
+    true,
+  );
+  const copies = store
+    .checkpoints(id)
+    .map(
+      (entry) =>
+        store.readCheckpoint(id, entry.id) as { workingDraft: RevisionDraft },
+    );
+  expect(copies.some((copy) => copy.workingDraft.cleanMarkdown === disk)).toBe(
+    true,
+  );
+});

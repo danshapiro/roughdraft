@@ -2468,11 +2468,22 @@ export class RevisionSessionController {
           result.state
         ) {
           if (result.status === "base-unavailable") includeBase = true;
-          const adoption = this.incomingFor(
-            result.state,
-            false,
-            resolution?.choice,
-          );
+          let adoption = this.incomingFor(result.state);
+          // Inspect the disk-versus-review conflict before applying a previous
+          // choice. A newer overlapping disk value requires a new confirmation,
+          // just like a changed conflict in the subsequent local merge.
+          if (resolution && adoption?.status === "conflict") {
+            if (adoption.signature !== resolution.signature) {
+              this.wait(
+                "conflict",
+                "The overlapping changes changed. Please inspect them again.",
+                result.state,
+                adoption,
+              );
+              return false;
+            }
+            adoption = this.incomingFor(result.state, false, resolution.choice);
+          }
           const incoming =
             adoption?.status === "merged"
               ? (adoption.draft as RevisionDraft)
@@ -2802,6 +2813,21 @@ export class RevisionSessionController {
       if (!resolvedAdoption || resolvedAdoption.status !== "merged")
         return false;
       const incoming = resolvedAdoption.draft as RevisionDraft;
+      // Checkpoint the outside side before applying the user's choice. In an
+      // Overwrite, the resolved candidate already contains the user's wording.
+      const incomingVersion =
+        adoption.status === "conflict" && choice === "local"
+          ? this.incomingFor(fresh, false, "incoming")
+          : resolvedAdoption;
+      if (!incomingVersion || incomingVersion.status !== "merged") {
+        this.wait(
+          "waiting",
+          "The incoming recovery copy is waiting for safe mapping.",
+          fresh,
+          incomingVersion ?? undefined,
+        );
+        return false;
+      }
       const incomingCheckpoint = await this.api<{ checkpointId: string }>(
         `/${encodeURIComponent(this.snapshot.session.id)}/checkpoint`,
         {
@@ -2810,7 +2836,7 @@ export class RevisionSessionController {
           conflictId: `${inspectedSignature}:incoming`,
           recoveryId: `${this.checkpointRecoveryId ?? randomId()}:incoming`,
           generation: fresh.revision,
-          workingDraft: incoming,
+          workingDraft: incomingVersion.draft,
           reason: "Incoming version before conflict resolution",
         },
       );
