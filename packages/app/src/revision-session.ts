@@ -3423,7 +3423,6 @@ export class RevisionSessionController {
   setCopyLocked = (locked: boolean) => this.emit({ copyLocked: locked });
   copy = async (path: string, relativeLinksAcknowledged: boolean) => {
     this.invalidateDiskAdoption();
-    this.latestDiskAdoptionInputs = null;
     this.adapter?.flush?.();
     if (!this.state) await this.refresh(true);
     if (!this.state)
