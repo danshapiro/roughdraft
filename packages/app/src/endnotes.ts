@@ -1,8 +1,8 @@
 import type {
   MarkedExtension,
-  Tokens,
-  TokenizerThis,
   RendererThis,
+  TokenizerThis,
+  Tokens,
 } from "marked";
 
 const escapeHtml = (value: string) =>
@@ -55,6 +55,9 @@ export function endnoteExtension(
           return {
             type: "endnoteDefinition",
             raw,
+            // Marked may append a following separator newline to token.raw.
+            // Preserve only the definition captured by this tokenizer.
+            definitionSource: raw,
             label: first[1],
             tokens: this.lexer.blockTokens(body),
           };
@@ -63,7 +66,7 @@ export function endnoteExtension(
           const label = token.label as string;
           const number = numberFor(label);
           const body = this.parser.parse(token.tokens ?? []);
-          return `<div data-endnote-definition="${escapeHtml(label)}" data-endnote-number="${number}" data-endnote-source="${escapeHtml(encodeURIComponent(token.raw))}" data-endnote-original="${escapeHtml(encodeURIComponent(body))}" id="${noteId(label)}" role="doc-endnote"><span class="endnote-label" contenteditable="false">${number}.</span><div class="endnote-body">${body}</div><a href="#${noteId(label)}-ref-1" class="endnote-backlink" aria-label="Back to reference ${number}" contenteditable="false">↩</a></div>\n`;
+          return `<div data-endnote-definition="${escapeHtml(label)}" data-endnote-number="${number}" data-endnote-source="${escapeHtml(encodeURIComponent(String(token.definitionSource ?? token.raw)))}" data-endnote-original="${escapeHtml(encodeURIComponent(body))}" id="${noteId(label)}" role="doc-endnote"><span class="endnote-label" contenteditable="false">${number}.</span><div class="endnote-body">${body}</div><a href="#${noteId(label)}-ref-1" class="endnote-backlink" aria-label="Back to reference ${number}" contenteditable="false">↩</a></div>\n`;
         },
         childTokens: ["tokens"],
       },

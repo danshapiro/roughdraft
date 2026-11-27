@@ -13,16 +13,12 @@ import {
 import type { Node, Schema } from "@tiptap/pm/model";
 import { EditorState } from "@tiptap/pm/state";
 import { Mapping, type Step } from "@tiptap/pm/transform";
-import {
-  type CriticComment,
-  editorStateToCriticMarkdown,
-} from "./critic-markup";
+import type { CriticComment } from "./critic-markup";
 import { rejectCriticChangeTransaction } from "./editor-extensions";
 import { splitYamlDocumentMetadata } from "./markdown";
 import { suggestionDetail } from "./revision-bulk";
-import { cleanSourceFromNode } from "./revision-clean-cache";
+import { cleanRevisionNode, cleanSourceFromNode } from "./revision-clean-cache";
 import {
-  cleanRevisionDocument,
   cleanRevisionSourceMarkdown,
   createSourceSpellingPreserver,
 } from "./revision-markdown";
@@ -31,6 +27,7 @@ import {
   sameMetadata,
   withDocumentMetadata,
 } from "./revision-metadata";
+import { measureRevision } from "./revision-performance";
 import {
   projectAcceptedDocument,
   suggestionPositions,
@@ -38,7 +35,9 @@ import {
 import {
   parseRemoteRevision,
   replaceRevisionContent,
+  unchangedPlainParagraph,
 } from "./revision-remote-source";
+import { serializeRevisionNode } from "./revision-review-cache";
 import {
   RevisionCanonicalSpellingProof,
   RevisionSpellingProof,
@@ -122,6 +121,7 @@ export function adoptRevisionDisk(
   schema: Schema,
   force: boolean | undefined,
   diskBase: RevisionDiskBase | undefined,
+  unchangedParagraphsFrom?: Node,
 ): SyncDraft | RevisionDiskMerge | null;
 export function adoptRevisionDisk(
   base: SyncDraft,
@@ -129,14 +129,23 @@ export function adoptRevisionDisk(
   schema: Schema,
   force = false,
   diskBase?: RevisionDiskBase,
+  unchangedParagraphsFrom?: Node,
 ): SyncDraft | RevisionDiskMerge | null {
+  const context = paragraphReuseContext(schema, unchangedParagraphsFrom);
   if (diskBase) {
     try {
-      const result = mergeDisk(base, markdown, schema, force, diskBase);
+      const result = mergeDisk(
+        base,
+        markdown,
+        schema,
+        force,
+        diskBase,
+        context,
+      );
       return result.status !== "merged" &&
         force &&
         diskBase.resolution === "incoming"
-        ? reloadRawDisk(base, markdown, schema, diskBase)
+        ? reloadRawDisk(base, markdown, schema, diskBase, context)
         : result;
     } catch (error) {
       console.warn(
@@ -156,11 +165,53 @@ export function adoptRevisionDisk(
       };
     }
   }
-  return adoptDisk(base, markdown, schema, force);
+  return adoptDisk(
+    base,
+    markdown,
+    schema,
+    force,
+    undefined,
+    undefined,
+    context,
+  );
 }
 
-function diskDraft(markdown: string, schema: Schema): SyncDraft {
-  const parsed = parseRemoteRevision(markdown, EditorState.create({ schema }));
+/** Resource reuse only: no live identity, dates, metadata or nonplain content. */
+function paragraphReuseContext(schema: Schema, source?: Node) {
+  if (!source || source.type.schema !== schema)
+    return EditorState.create({ schema });
+  const placeholder = schema.nodes.paragraph.create();
+  const doc = schema.topNodeType.create(
+    null,
+    source.children.map((node) =>
+      unchangedPlainParagraph(node.textContent, node, placeholder)
+        ? node
+        : placeholder,
+    ),
+  );
+  return EditorState.create({ schema, doc });
+}
+
+function diskDraft(
+  markdown: string,
+  schema: Schema,
+  context?: EditorState,
+): SyncDraft {
+  const parsed = parseRemoteRevision(
+    markdown,
+    context ?? EditorState.create({ schema }),
+  );
+  const sourceDoc = parsed.doc.type.create(
+    {
+      ...parsed.doc.attrs,
+      sourceMetadata: {
+        markdown,
+        frontmatter: parsed.frontmatter,
+        endmatter: parsed.endmatter,
+      },
+    },
+    parsed.doc.content,
+  );
   const undated = new Set(
     extractRoughdraftReviewIndex(markdown)
       .items.filter((item) => item.kind === "comment" && !item.createdAt)
@@ -168,7 +219,7 @@ function diskDraft(markdown: string, schema: Schema): SyncDraft {
   );
   return {
     markdown,
-    cleanMarkdown: cleanRevisionSourceMarkdown(markdown),
+    cleanMarkdown: cleanSourceFromNode(markdown, sourceDoc, parsed.comments),
     decisions: {},
     reviewComments: [...parsed.comments.values()].map((comment) => ({
       ...comment,
@@ -185,6 +236,7 @@ function readDiskSides(
   markdown: string,
   schema: Schema,
   diskBase: RevisionDiskBase,
+  context?: EditorState,
 ) {
   const origin = review.diskOrigin;
   const aliases =
@@ -220,10 +272,13 @@ function readDiskSides(
       targets.add(fresh);
     }
   const before = renumberReviewDraft(
-    diskDraft(diskBase.markdown, schema),
+    diskDraft(diskBase.markdown, schema, context),
     aliases,
   );
-  const disk = renumberReviewDraft(diskDraft(markdown, schema), aliases);
+  const disk = renumberReviewDraft(
+    diskDraft(markdown, schema, context),
+    aliases,
+  );
   return { aliases, before, disk };
 }
 
@@ -234,10 +289,18 @@ function mergeDisk(
   schema: Schema,
   force: boolean,
   diskBase: RevisionDiskBase,
+  context: EditorState,
 ): RevisionDiskMerge {
   if (
     review.cleanMarkdown !== undefined &&
-    !provesAcceptedSpelling(review.markdown, review.cleanMarkdown, schema)
+    !measureRevision("disk-adoption-review-proof", () =>
+      provesAcceptedSpelling(
+        review.markdown,
+        review.cleanMarkdown as string,
+        schema,
+        context,
+      ),
+    )
   )
     return {
       status: "client-merge-required",
@@ -246,17 +309,22 @@ function mergeDisk(
       signature: reviewDraftSignature(review),
       reason: "The saved clean text could not be verified against its review.",
     };
-  const { aliases, before, disk } = readDiskSides(
-    review,
-    markdown,
-    schema,
-    diskBase,
+  const { aliases, before, disk } = measureRevision(
+    "disk-adoption-source-read",
+    () => readDiskSides(review, markdown, schema, diskBase, context),
   );
   if (
-    [before, disk].some(
-      (side) =>
-        side.cleanMarkdown !== undefined &&
-        !provesAcceptedSpelling(side.markdown, side.cleanMarkdown, schema),
+    measureRevision("disk-adoption-source-proof", () =>
+      [before, disk].some(
+        (side) =>
+          side.cleanMarkdown !== undefined &&
+          !provesAcceptedSpelling(
+            side.markdown,
+            side.cleanMarkdown,
+            schema,
+            context,
+          ),
+      ),
     )
   )
     return {
@@ -295,11 +363,8 @@ function mergeDisk(
   // become detached/outdated feedback rather than a false writing conflict.
   const sides = [before, disk, review];
   const plainSides = sides.map(plain);
-  const prose = mergeReviewDrafts(
-    plainSides[0],
-    plainSides[1],
-    plainSides[2],
-    options,
+  const prose = measureRevision("disk-adoption-prose-merge", () =>
+    mergeReviewDrafts(plainSides[0], plainSides[1], plainSides[2], options),
   );
   if (prose.status !== "merged")
     return {
@@ -311,13 +376,16 @@ function mergeDisk(
       })),
     };
   const mapped = sides.map((value, index) =>
-    adoptDisk(
-      value,
-      prose.draft.markdown,
-      schema,
-      force,
-      undefined,
-      plainSides[index].markdown,
+    measureRevision(`disk-adoption-map-${index}`, () =>
+      adoptDisk(
+        value,
+        prose.draft.markdown,
+        schema,
+        force,
+        undefined,
+        plainSides[index].markdown,
+        context,
+      ),
     ),
   );
   const [mappedBefore, mappedDisk, mappedReview] = mapped;
@@ -357,11 +425,8 @@ function mergeDisk(
       ...(mappedDisk.outdatedSuggestions ?? []),
       ...displaced,
     ];
-  const merged = mergeReviewDrafts(
-    mappedBefore,
-    mappedDisk,
-    mappedReview,
-    options,
+  const merged = measureRevision("disk-adoption-feedback-merge", () =>
+    mergeReviewDrafts(mappedBefore, mappedDisk, mappedReview, options),
   );
   if (merged.status !== "merged")
     return {
@@ -380,7 +445,7 @@ function mergeDisk(
     merged.draft.markdown,
     documentMetadata(prose.draft.markdown),
   );
-  const finalState = EditorState.create({ schema });
+  const finalState = context;
   const parsedFinal = parseRemoteRevision(mergedMarkdown, finalState);
   const finalAccepted = projectAcceptedDocument(parsedFinal.doc).doc;
   const canonical = acceptedSpelling(finalAccepted, prose.draft.markdown);
@@ -480,12 +545,14 @@ function reloadRawDisk(
   markdown: string,
   schema: Schema,
   diskBase: RevisionDiskBase,
+  context: EditorState,
 ): RevisionDiskMerge {
   const { aliases, before, disk } = readDiskSides(
     review,
     markdown,
     schema,
     diskBase,
+    context,
   );
   const localFeedback = reloadFeedback(review);
   const beforeFeedback = reloadFeedback(before);
@@ -538,10 +605,7 @@ function reloadRawDisk(
         "The source identities could not be restored without changing its text.",
     };
 
-  const parsed = parseRemoteRevision(
-    review.markdown,
-    EditorState.create({ schema }),
-  );
+  const parsed = parseRemoteRevision(review.markdown, context);
   const ranges = annotationRanges(parsed.doc);
   const comments = new Map<string, SyncDraft["reviewComments"][number]>(
     review.reviewComments.map((comment) => [comment.id, comment]),
@@ -651,8 +715,9 @@ function adoptDisk(
   force: boolean,
   projected?: ReturnType<typeof parseRemoteRevision>,
   comparisonMarkdown?: string,
+  context?: EditorState,
 ): SyncDraft | null {
-  let state = EditorState.create({ schema });
+  let state = context ?? EditorState.create({ schema });
   const parsedBase = parseRemoteRevision(base.markdown, state);
   state = EditorState.create({
     schema,
@@ -739,11 +804,10 @@ function adoptDisk(
   const originalComments = new Map(parsedBase.comments);
   for (const comment of base.reviewComments)
     originalComments.set(comment.id, comment);
-  const canonicalOriginal = editorStateToCriticMarkdown(
-    state.doc.toJSON(),
-    originalComments,
-    { frontmatter: parsedBase.frontmatter, endmatter: parsedBase.endmatter },
-  );
+  const canonicalOriginal = serializeRevisionNode(state.doc, originalComments, {
+    frontmatter: parsedBase.frontmatter,
+    endmatter: parsedBase.endmatter,
+  });
   const changes = replaceRevisionContent(comparisonState, parsedIncoming.doc);
   const inverse = new Mapping();
   inverse.appendMapping(
@@ -868,19 +932,15 @@ function adoptDisk(
   const comments = new Map<string, CriticComment>(
     [...commentMap].map(([id, comment]) => [id, comment]),
   );
-  const review = editorStateToCriticMarkdown(
-    transaction.doc.toJSON(),
-    comments,
-    {
-      frontmatter: parsedIncoming.frontmatter,
-      endmatter:
-        comparisonMarkdown === undefined
-          ? parsedIncoming.endmatter
-          : splitYamlDocumentMetadata(
-              withDocumentMetadata(base.markdown, documentMetadata(markdown)),
-            ).endmatter,
-    },
-  );
+  const review = serializeRevisionNode(transaction.doc, comments, {
+    frontmatter: parsedIncoming.frontmatter,
+    endmatter:
+      comparisonMarkdown === undefined
+        ? parsedIncoming.endmatter
+        : splitYamlDocumentMetadata(
+            withDocumentMetadata(base.markdown, documentMetadata(markdown)),
+          ).endmatter,
+  });
   const clean = acceptedSpelling(expected.doc, markdown);
   const oldSpelling = createSourceSpellingPreserver(
     base.markdown,
@@ -924,14 +984,24 @@ function adoptDisk(
 }
 
 function acceptedSpelling(doc: Node, markdown: string) {
-  return cleanRevisionDocument({
-    ...doc.toJSON(),
-    attrs: { ...doc.attrs, sourceMetadata: documentMetadata(markdown) },
-  });
+  return cleanRevisionNode(
+    doc.type.create(
+      {
+        ...doc.attrs,
+        sourceMetadata: { markdown, ...documentMetadata(markdown) },
+      },
+      doc.content,
+    ),
+  );
 }
 
-function provesAcceptedSpelling(review: string, clean: string, schema: Schema) {
-  const state = EditorState.create({ schema });
+function provesAcceptedSpelling(
+  review: string,
+  clean: string,
+  schema: Schema,
+  context?: EditorState,
+) {
+  const state = context ?? EditorState.create({ schema });
   const parsed = parseRemoteRevision(review, state);
   const accepted = projectAcceptedDocument(parsed.doc).doc;
   return new RevisionCanonicalSpellingProof().matches(

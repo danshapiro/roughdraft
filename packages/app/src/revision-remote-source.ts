@@ -43,7 +43,7 @@ const MAX_LAYOUT_BYTES = 1024 * 1024;
 let layoutBytes = 0;
 
 /** Reuse only literal prose whose Markdown meaning needs no parser or context. */
-function unchangedPlainParagraph(
+export function unchangedPlainParagraph(
   raw: string,
   live: Node | null,
   template: Node | undefined,
@@ -200,7 +200,13 @@ function lexSourceBlocks(body: string): SourceLayout | null {
   const footnoteTokens = tokens.filter(
     (token) => token.type === "endnoteDefinition",
   );
-  const footnotes = footnoteTokens.map((token) => token.raw).join("\n");
+  const footnotes = footnoteTokens
+    .map(
+      (token) =>
+        (token as unknown as { definitionSource?: string }).definitionSource ??
+        token.raw,
+    )
+    .join("\n");
   const endnoteDefinitions = new Set(
     footnoteTokens.map((token) =>
       noteKey(String((token as unknown as { label: string }).label)),

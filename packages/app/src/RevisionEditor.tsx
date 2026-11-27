@@ -780,7 +780,14 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       },
       adopt: (base, markdown, force, diskBase) =>
         measureRevision("disk-adoption", () =>
-          adoptRevisionDisk(base, markdown, editor.schema, force, diskBase),
+          adoptRevisionDisk(
+            base,
+            markdown,
+            editor.schema,
+            force,
+            diskBase,
+            editor.state.doc,
+          ),
         ),
       readUiDrafts: uiDraftStore.read,
       restoreUiDrafts: uiDraftStore.restore,
