@@ -4685,6 +4685,16 @@ export function comparisonRouter(
   router.use((req, res, next) => {
     const protocol = req.get("X-Roughdraft-Sync");
     if (protocol === "compact-v1" || protocol === "compact-v2") {
+      const signature = req.get("X-Roughdraft-Draft-Reference");
+      const draft = req.body?.draft;
+      const draftReference =
+        req.method === "POST" &&
+        signature &&
+        draft &&
+        typeof draft === "object" &&
+        !Array.isArray(draft)
+          ? { signature, draft: draft as SyncDraft }
+          : undefined;
       const send = res.json.bind(res);
       res.json = (value) =>
         send(
@@ -4695,6 +4705,7 @@ export function comparisonRouter(
               : String(req.body?.reviewId ?? ""),
             req.get("X-Roughdraft-Reference"),
             protocol,
+            draftReference,
           ),
         );
     }

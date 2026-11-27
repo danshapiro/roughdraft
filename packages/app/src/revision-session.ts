@@ -30,7 +30,10 @@ import {
   mergeReviewDraftsAsync,
   prepareReviewMergeWorker,
 } from "./revision-reconciliation";
-import { receiveSyncResponse } from "./revision-sync-transfer";
+import {
+  receiveSyncResponse,
+  type SentDraftReference,
+} from "./revision-sync-transfer";
 import { privateReplyTarget, privateRootTarget } from "./revision-ui-drafts";
 
 export interface InspectedDestination {
@@ -161,16 +164,32 @@ class RevisionRequestError extends Error {
     super(message);
   }
 }
-async function request<T>(
+export async function requestRevisionSync<T>(
   path: string,
   body?: object,
   etag?: string,
-  referenceVersion?: string,
+  previous?: ComparisonReviewData,
 ): Promise<T | null> {
   const serialized =
     body === undefined
       ? undefined
       : measureRevision("save-encode", () => JSON.stringify(body));
+  // Capture the actual bytes sent, before fetch can yield to newer typing or
+  // callbacks that mutate the caller's object. Only these private strings may
+  // satisfy a server's request-text reference.
+  const sentBody = serialized ? JSON.parse(serialized) : undefined;
+  const sentDraft = sentBody?.draft;
+  let sent: SentDraftReference | undefined;
+  if (
+    previous?.referenceVersion &&
+    typeof sentDraft?.markdown === "string" &&
+    typeof sentDraft?.cleanMarkdown === "string" &&
+    Array.isArray(sentDraft.reviewComments) &&
+    sentDraft.decisions &&
+    typeof sentDraft.decisions === "object"
+  ) {
+    sent = { signature: reviewDraftSignature(sentDraft), draft: sentDraft };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15_000);
   try {
@@ -179,9 +198,10 @@ async function request<T>(
       method: body === undefined ? "GET" : "POST",
       headers: {
         "X-Roughdraft-Sync": "compact-v2",
-        ...(referenceVersion
-          ? { "X-Roughdraft-Reference": referenceVersion }
+        ...(previous?.referenceVersion
+          ? { "X-Roughdraft-Reference": previous.referenceVersion }
           : {}),
+        ...(sent ? { "X-Roughdraft-Draft-Reference": sent.signature } : {}),
         ...(serialized ? { "Content-Type": "application/json" } : {}),
         ...(etag ? { "If-None-Match": etag } : {}),
       },
@@ -200,7 +220,7 @@ async function request<T>(
         data.error ?? "Roughdraft could not complete that action.",
         response.status,
       );
-    return data;
+    return previous ? receiveSyncResponse(data, previous, sent) : data;
   } finally {
     clearTimeout(timer);
   }
@@ -358,9 +378,12 @@ export class RevisionSessionController {
     this.api = async <T>(path: string, body?: object, etag?: string) => {
       const previous = this.snapshot?.session ?? initial;
       const value = dependencies.request
-        ? await dependencies.request<T>(path, body, etag)
-        : await request<T>(path, body, etag, previous.referenceVersion);
-      return readableResponse(receiveSyncResponse(value, previous));
+        ? receiveSyncResponse(
+            await dependencies.request<T>(path, body, etag),
+            previous,
+          )
+        : await requestRevisionSync<T>(path, body, etag, previous);
+      return readableResponse(value);
     };
     this.merge = dependencies.merge ?? mergeReviewDraftsAsync;
     this.pageId = dependencies.id?.() ?? randomId();

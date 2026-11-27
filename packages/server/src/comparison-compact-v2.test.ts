@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { reviewDraftSignature } from "@roughdraft/rfm";
 import request from "supertest";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./index.js";
@@ -31,9 +32,9 @@ afterEach(() => {
   host.dispose();
   fs.rmSync(root, { recursive: true, force: true });
 });
-async function open() {
+async function open(markdown = original) {
   const target = path.join(root, "source.md");
-  fs.writeFileSync(target, original);
+  fs.writeFileSync(target, markdown);
   const opened = await request(host.app)
     .post("/api/comparisons/document")
     .send({ targetPath: target, autosave: target });
@@ -301,4 +302,258 @@ test("v2 publication deferrals retain the complete recoverable publication state
   );
   expect(recovered.body.state.draft.markdown).toBe(original);
   expect(fs.readFileSync(target, "utf8")).toBe(original);
+});
+
+test("an exact opted-in large commit aliases only its sent text while journal and lost-response recovery retain the complete draft", async () => {
+  const { state, route, target } = await open();
+  const sent = body(
+    state,
+    "text-reference",
+    "a",
+    original.replace("A: old", "A: new"),
+  );
+  const saved = await request(host.app)
+    .post(route)
+    .set("X-Roughdraft-Sync", "compact-v2")
+    .set("X-Roughdraft-Reference", state.review.referenceVersion)
+    .set("X-Roughdraft-Draft-Reference", reviewDraftSignature(sent.draft))
+    .send(sent);
+  expect(saved.body.status).toBe("committed");
+  expect(saved.body.state.draftTextFromRequest).toBe(true);
+  expect(saved.body.state.draft.markdown).toBeUndefined();
+  expect(saved.body.state.draft.cleanMarkdown).toBeUndefined();
+  const {
+    markdown: _markdown,
+    cleanMarkdown: _clean,
+    ...metadata
+  } = sent.draft;
+  expect(saved.body.state.draft).toEqual(metadata);
+  expect(Buffer.byteLength(saved.text)).toBeLessThan(16 * 1024);
+  const ordinary = await request(host.app)
+    .post(route)
+    .set("X-Roughdraft-Sync", "compact-v2")
+    .set("X-Roughdraft-Reference", state.review.referenceVersion)
+    .send(sent);
+  expect(ordinary.body.state.draftTextFromRequest).toBeUndefined();
+  expect(ordinary.body.state.draft).toEqual(sent.draft);
+  const journal = path.join(
+    root,
+    "comparisons",
+    "operations",
+    "text-reference.json",
+  );
+  const persisted = fs.readFileSync(journal, "utf8");
+  host.dispose();
+  host = start();
+  const status = await request(host.app).get(
+    "/api/comparisons/operations/text-reference",
+  );
+  expect(status.body.state.draft).toEqual(sent.draft);
+  expect(status.body.state.draftTextFromRequest).toBeUndefined();
+  const resolved = await request(host.app)
+    .post("/api/comparisons/operations/text-reference/resolve")
+    .send({ ...sent, reviewId: state.review.id, draft: undefined });
+  expect(resolved.body.state.draft).toEqual(sent.draft);
+  expect(fs.readFileSync(journal, "utf8")).toBe(persisted);
+  expect(fs.readFileSync(target, "utf8")).toBe(sent.draft.cleanMarkdown);
+  console.info(
+    JSON.stringify({
+      severity: "info",
+      component: "draft-text-reference-resource",
+      fullV2Bytes: Buffer.byteLength(ordinary.text),
+      aliasedBytes: Buffer.byteLength(saved.text),
+      markdownBytes: Buffer.byteLength(sent.draft.markdown),
+      cleanMarkdownBytes: Buffer.byteLength(sent.draft.cleanMarkdown),
+    }),
+  );
+});
+
+test.each([
+  "no header",
+  "wrong signature",
+  "wrong frozen reference",
+  "v1",
+  "missing clean text",
+])("draft text stays explicit without every exact opt-in guard: %s", async (scenario) => {
+  const { state, route } = await open();
+  const sent = body(
+    state,
+    `guard-${scenario.replaceAll(" ", "-")}`,
+    "a",
+    original.replace("A: old", "A: new"),
+  );
+  if (scenario === "missing clean text") delete sent.draft.cleanMarkdown;
+  const response = request(host.app)
+    .post(route)
+    .set("X-Roughdraft-Sync", scenario === "v1" ? "compact-v1" : "compact-v2")
+    .set(
+      "X-Roughdraft-Reference",
+      scenario === "wrong frozen reference"
+        ? "wrong"
+        : state.review.referenceVersion,
+    );
+  if (scenario !== "no header")
+    response.set(
+      "X-Roughdraft-Draft-Reference",
+      scenario === "wrong signature"
+        ? "wrong"
+        : reviewDraftSignature(sent.draft),
+    );
+  const saved = await response.send(sent);
+  expect(saved.body.status).toBe("committed");
+  expect(saved.body.state.draftTextFromRequest).toBeUndefined();
+  expect(saved.body.state.draft.markdown).toBe(sent.draft.markdown);
+  expect(saved.body.state.draft.cleanMarkdown).toBe(sent.draft.cleanMarkdown);
+});
+
+test("text aliasing retains authoritative normalized History metadata instead of borrowing request metadata", async () => {
+  const { state, route } = await open();
+  const sent = body(
+    state,
+    "normalized-history",
+    "a",
+    original.replace("A: old", "A: new"),
+  );
+  sent.draft.reviewed = [
+    {
+      id: "decision-example",
+      decision: "accept",
+      oldText: "old",
+      newText: "new",
+      inverse: [],
+      guard: { from: 0, to: 0, slice: null },
+      stale: false,
+      keptIds: [],
+    },
+  ];
+  sent.draft.reviewComments = [
+    {
+      id: "c1",
+      changeId: "document",
+      content: "Authoritative feedback",
+      createdAt: "2026-11-26T12:00:00.000Z",
+      authorType: "ai",
+      authorId: null,
+      parentCommentId: null,
+      legacyNote: "request-only metadata",
+    },
+  ];
+  const saved = await request(host.app)
+    .post(route)
+    .set("X-Roughdraft-Sync", "compact-v2")
+    .set("X-Roughdraft-Reference", state.review.referenceVersion)
+    .set("X-Roughdraft-Draft-Reference", reviewDraftSignature(sent.draft))
+    .send(sent);
+  expect(saved.body.status).toBe("committed");
+  expect(saved.body.state.signature).toBe(reviewDraftSignature(sent.draft));
+  expect(saved.body.state.draftTextFromRequest).toBe(true);
+  expect(saved.body.state.draft.reviewed).toHaveLength(1);
+  expect(
+    Object.hasOwn(saved.body.state.draft.reviewComments[0], "legacyNote"),
+  ).toBe(false);
+  expect(saved.body.state.draft.reviewComments[0]).toMatchObject({
+    authorType: "ai",
+    authorId: null,
+    parentCommentId: null,
+  });
+  expect(saved.body.state.draft.reviewed[0]).toMatchObject({
+    stale: false,
+    keptIds: [],
+    guard: { from: 0, to: 0, slice: null },
+  });
+});
+
+test.each([
+  false,
+  true,
+])("a changed incoming result keeps its complete draft despite an exact request header (large fallback=%s)", async (large) => {
+  const source = large ? original : "Owner A: old\n\nOwner B: old\n";
+  const { state, route } = await open(source);
+  const first = await request(host.app)
+    .post(route)
+    .send(
+      body(
+        state,
+        "incoming-first",
+        "peer",
+        source.replace("A: old", "A: peer"),
+      ),
+    );
+  expect(first.body.status).toBe("committed");
+  const sent = body(
+    state,
+    "changed-incoming",
+    "local",
+    source.replace("B: old", "B: mine"),
+  );
+  const saved = await request(host.app)
+    .post(route)
+    .set("X-Roughdraft-Sync", "compact-v2")
+    .set("X-Roughdraft-Reference", state.review.referenceVersion)
+    .set("X-Roughdraft-Draft-Reference", reviewDraftSignature(sent.draft))
+    .send(sent);
+  expect(saved.body.status).toBe(large ? "client-merge-required" : "committed");
+  expect(saved.body.state.draftTextFromRequest).toBeUndefined();
+  expect(saved.body.state.draft.markdown).toContain("A: peer");
+  if (!large) expect(saved.body.state.draft.markdown).toContain("B: mine");
+});
+
+test("a newly created review keeps complete text even when its request explicitly supplies the text reference", async () => {
+  const { state } = await open();
+  const working = { ...state.draft, cleanMarkdown: state.draft.markdown };
+  const saved = await request(host.app)
+    .post(`/api/comparisons/${state.review.id}/copy`)
+    .set("X-Roughdraft-Sync", "compact-v2")
+    .set("X-Roughdraft-Reference", state.review.referenceVersion)
+    .set("X-Roughdraft-Draft-Reference", reviewDraftSignature(working))
+    .send({
+      operationId: "different-review",
+      operationSequence: 1,
+      pageInstanceId: "a",
+      operationContext: state.operationContext,
+      generation: 1,
+      workingDraft: working,
+      draft: working,
+      path: path.join(root, "separate.md"),
+      relativeLinksAcknowledged: true,
+    });
+  expect(saved.body.status).toBe("committed");
+  expect(saved.body.state.review.id).not.toBe(state.review.id);
+  expect(saved.body.state.draftTextFromRequest).toBeUndefined();
+  expect(saved.body.state.draft).toEqual(working);
+  expect(saved.body.state.review.beforeText).toBe(state.review.beforeText);
+});
+
+test("a malformed opted-in request still receives the complete authoritative rejection state", async () => {
+  const { state, route } = await open();
+  const first = await request(host.app)
+    .post(route)
+    .send(
+      body(
+        state,
+        "prepare-malformed-reference",
+        "a",
+        original.replace("A: old", "A: new"),
+      ),
+    );
+  expect(first.body.status).toBe("committed");
+  const current = first.body.state;
+  const sent = body(
+    current,
+    "malformed-reference",
+    "a",
+    current.draft.markdown,
+    2,
+  );
+  sent.draft.reviewComments = null;
+  const rejected = await request(host.app)
+    .post(route)
+    .set("X-Roughdraft-Sync", "compact-v2")
+    .set("X-Roughdraft-Reference", current.review.referenceVersion)
+    .set("X-Roughdraft-Draft-Reference", current.signature)
+    .send(sent);
+  expect(rejected.status).toBe(200);
+  expect(rejected.body.status).toBe("rejected");
+  expect(rejected.body.state.draftTextFromRequest).toBeUndefined();
+  expect(rejected.body.state.draft).toEqual(current.draft);
 });

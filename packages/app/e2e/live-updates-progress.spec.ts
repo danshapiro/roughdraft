@@ -218,6 +218,8 @@ function installMeasurements() {
       record("json-finished", {
         status: value?.status,
         revision: value?.state?.revision ?? value?.revision,
+        draftTextFromRequest: Boolean(value?.state?.draftTextFromRequest),
+        savedTextFromDraft: Boolean(value?.state?.savedTextFromDraft),
         reservationExpiresAt: value?.reservation?.expiresAt,
         lastOperationId:
           value?.state?.review?.lastOperation?.id ??

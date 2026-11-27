@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { cleanRoughdraftMarkdown } from "@roughdraft/rfm";
+import { cleanRoughdraftMarkdown, reviewDraftSignature } from "@roughdraft/rfm";
 import { expect, test } from "vitest";
 import { transferSyncResponse } from "../../server/src/comparison-sync-transfer";
 import type { ComparisonReviewData } from "./comparison-types";
@@ -152,11 +152,13 @@ function withoutTransferFlags(received: ReturnType<typeof receiveSyncState>) {
     reviewFormat: _format,
     savedTextFromDraft: _saved,
     diskTextFromReview: _disk,
+    draftTextFromRequest: _sent,
     ...state
   } = received as ReturnType<typeof receiveSyncState> & {
     reviewFormat?: string;
     savedTextFromDraft?: boolean;
     diskTextFromReview?: boolean;
+    draftTextFromRequest?: boolean;
   };
   return state;
 }
@@ -353,4 +355,166 @@ test("old-server full responses and a lost copy result remain self-contained und
   expect(
     receiveSyncResponse(JSON.parse(JSON.stringify(full)), previous),
   ).toEqual(full);
+});
+
+function sentDraft() {
+  return {
+    ...draft,
+    reviewComments: [
+      {
+        id: "c1",
+        changeId: "document",
+        content: "Saved feedback",
+        createdAt: "2026-11-26T12:00:00.000Z",
+      },
+    ],
+  };
+}
+function referencedPacket() {
+  const sent = sentDraft();
+  const full = fullState(sent.cleanMarkdown, sent.cleanMarkdown);
+  full.draft = {
+    ...sent,
+    reviewComments: sent.reviewComments.map((comment) => ({
+      ...comment,
+      authorId: null,
+      parentCommentId: null,
+    })),
+  };
+  full.signature = reviewDraftSignature(full.draft);
+  full.review = {
+    ...full.review,
+    draft: full.draft,
+    reviewComments: full.draft.reviewComments,
+  };
+  const packet = v2Packet(full, true, true);
+  delete packet.draft.markdown;
+  delete packet.draft.cleanMarkdown;
+  packet.draftTextFromRequest = true;
+  return {
+    full: JSON.parse(JSON.stringify(full)),
+    packet,
+    reference: { signature: reviewDraftSignature(sent), draft: sent },
+  };
+}
+
+test("request text is restored before saved-file aliases while server feedback metadata remains authoritative", () => {
+  const { full, packet, reference } = referencedPacket();
+  const before = JSON.stringify(packet);
+  const received = receiveSyncState(packet, previous, reference);
+  expect(withoutTransferFlags(received)).toEqual(full);
+  expect(received.draft.markdown).toBe(reference.draft.markdown);
+  expect(received.draft.cleanMarkdown).toBe(reference.draft.cleanMarkdown);
+  expect(received.draft.reviewComments[0]).toMatchObject({
+    authorId: null,
+    parentCommentId: null,
+  });
+  expect(reference.draft.reviewComments[0]).not.toHaveProperty("authorId");
+  expect(received.review.savedText).toBe(reference.draft.cleanMarkdown);
+  expect(received.disk?.text).toBe(reference.draft.cleanMarkdown);
+  expect(JSON.stringify(packet)).toBe(before);
+});
+
+test.each([
+  "missing reference",
+  "wrong request signature",
+  "changed request text",
+  "missing clean projection",
+  "wrong state signature",
+  "changed server feedback",
+  "conflicting server Markdown",
+  "conflicting server clean text",
+  "wrong review",
+  "changed frozen references",
+  "legacy format",
+  "full format",
+] as const)("request text aliases reject an unusable reference: %s", (scenario) => {
+  const { packet, reference } = referencedPacket();
+  if (scenario === "wrong request signature") reference.signature = "wrong";
+  if (scenario === "changed request text")
+    reference.draft.markdown += "Changed.";
+  if (scenario === "missing clean projection")
+    Reflect.deleteProperty(reference.draft, "cleanMarkdown");
+  if (scenario === "wrong state signature") packet.signature = "wrong";
+  if (scenario === "changed server feedback")
+    packet.draft.reviewComments[0].content = "A different saved comment.";
+  if (scenario === "conflicting server Markdown")
+    packet.draft.markdown = "Other text.";
+  if (scenario === "conflicting server clean text")
+    packet.draft.cleanMarkdown = "Other text.";
+  if (scenario === "wrong review") packet.review.id = "another-review";
+  if (scenario === "changed frozen references")
+    packet.review.referenceVersion = "another-base";
+  if (scenario === "legacy format") packet.reviewFormat = "compact-v1";
+  if (scenario === "full format") delete packet.reviewFormat;
+  expect(() =>
+    receiveSyncState(
+      packet,
+      previous,
+      scenario === "missing reference" ? undefined : reference,
+    ),
+  ).toThrow(
+    /request|reference|signature|incomplete|inconsistent|review|format/i,
+  );
+});
+
+test("the real text-reference encoder cuts a complex document response while preserving exact server metadata", () => {
+  const fixture = readFileSync(
+    resolve(process.cwd(), "../../docs/spec/fixtures/editing-review.md"),
+    "utf8",
+  );
+  const metadataAt = fixture.lastIndexOf("\n---\n");
+  const markdown =
+    `${fixture.slice(0, metadataAt)}\n${"Unchanged reading distance in this complex review.\n\n".repeat(2100)}${fixture.slice(metadataAt)}`.replaceAll(
+      "\n",
+      "\r\n",
+    );
+  const cleanMarkdown = cleanRoughdraftMarkdown(markdown);
+  const submitted = { ...sentDraft(), markdown, cleanMarkdown };
+  const full = fullState(cleanMarkdown, cleanMarkdown);
+  full.draft = {
+    ...submitted,
+    reviewComments: submitted.reviewComments.map((comment) => ({
+      ...comment,
+      authorId: null,
+      parentCommentId: null,
+    })),
+  };
+  full.signature = reviewDraftSignature(full.draft);
+  full.review = {
+    ...full.review,
+    draft: full.draft,
+    reviewComments: full.draft.reviewComments,
+  };
+  const reference = {
+    signature: reviewDraftSignature(submitted),
+    draft: submitted,
+  };
+  const encode = (sent?: typeof reference) =>
+    JSON.parse(
+      JSON.stringify(
+        transferSyncResponse(
+          full,
+          previous.id,
+          previous.referenceVersion,
+          "compact-v2",
+          sent,
+        ),
+      ),
+    );
+  const ordinary = encode();
+  const referenced = encode(reference);
+  expect(referenced.draftTextFromRequest).toBe(true);
+  expect(referenced.draft.markdown).toBeUndefined();
+  expect(referenced.draft.cleanMarkdown).toBeUndefined();
+  expect(referenced.draft.reviewComments).toEqual(full.draft.reviewComments);
+  expect(
+    withoutTransferFlags(receiveSyncState(referenced, previous, reference)),
+  ).toEqual(full);
+  const bytes = Buffer.byteLength(JSON.stringify(referenced));
+  const ordinaryBytes = Buffer.byteLength(JSON.stringify(ordinary));
+  expect(bytes).toBeLessThan(ordinaryBytes / 10);
+  process.stdout.write(
+    `${JSON.stringify({ severity: "info", event: "request-text-reference-wire", sourceBytes: Buffer.byteLength(markdown), ordinaryBytes, referenceBytes: bytes })}\n`,
+  );
 });
