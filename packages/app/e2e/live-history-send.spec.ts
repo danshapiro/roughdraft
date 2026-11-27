@@ -55,6 +55,13 @@ async function readReview(
   await expect(response).toBeOK();
   return response.json();
 }
+async function historyCount(request: APIRequestContext, id: string) {
+  const review = await readReview(request, id);
+  if (!review.draft)
+    throw new Error("Expected the saved review's actual draft");
+  // The shared merge omits the optional field when no History entries remain.
+  return (review.draft.reviewed ?? []).length;
+}
 async function createReview(
   request: APIRequestContext,
   project: string,
@@ -226,9 +233,7 @@ test("two pages editing above History reopen the actual passages when identical 
     expect(file).toContain(revertDecoy);
     expect(file).toContain("Peer inserted above History.");
     expect(file).toContain("LocalA-history");
-    await expect
-      .poll(async () => (await readReview(request, id)).draft?.reviewed?.length)
-      .toBe(0);
+    await expect.poll(() => historyCount(request, id)).toBe(0);
   } finally {
     held.resolve();
     await peerContext.close();
@@ -331,11 +336,7 @@ for (const sameProposal of [false, true]) {
             other.getByTestId(`comment-rail-${id}-action-accept`),
           ).toBeVisible();
         }
-        await expect
-          .poll(
-            async () => (await readReview(request, id)).draft?.reviewed?.length,
-          )
-          .toBe(0);
+        await expect.poll(() => historyCount(request, id)).toBe(0);
         const final = await readReview(request, id);
         expect(comments(final.draft?.markdown ?? "")).toEqual(
           comments(original),
