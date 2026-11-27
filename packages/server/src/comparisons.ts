@@ -1683,10 +1683,17 @@ export class ComparisonStore {
               : request.localGeneration,
           );
         }
-      if (turn.blocked) {
+      const latest = this.syncDraft(review);
+      // The selected page may already have merged this exact base while its
+      // peer was saving. Keep its turn and use the ordinary guarded save path.
+      const currentHandoff =
+        turn.recoverToken &&
+        request.expectedRevision === review.revision &&
+        request.baseRevision === review.revision &&
+        request.baseSignature === reviewDraftSignature(latest);
+      if (turn.blocked && !currentHandoff) {
         // A page selected from the waiting queue has not received its token
-        // yet. The existing fallback reveals that same turn to its owner;
-        // other pages remain denied and the deadline is never renewed.
+        // yet. Stale candidates receive the same token without renewing the turn.
         if (turn.recoverToken)
           return reject(
             this.fallback(review, operation, "client-merge-required"),
@@ -1701,7 +1708,6 @@ export class ComparisonStore {
       }
       let submitted: SyncDraft;
       let base: SyncDraft;
-      const latest = this.syncDraft(review);
       const baseInput =
         body.base ??
         (request.baseRevision === review.revision

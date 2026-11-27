@@ -124,6 +124,117 @@ async function releasedHolder() {
   };
 }
 
+test("the selected page commits its prepared current-base candidate on its first handoff request", async () => {
+  const { state, route, target, holderText } = await releasedHolder();
+  const denied = await request(host.app)
+    .post(route)
+    .send(body(state, "a-second", "a", holderText, 3));
+  expect(denied.body.status).toBe("retry-later");
+
+  const candidate = holderText.replace("B: old", "B: waiting");
+  const saved = await request(host.app)
+    .post(route)
+    .send(body(state, "b-prepared-current", "b", candidate, 2));
+  expect(saved.body.status).toBe("committed");
+  expect(saved.body.state.revision).toBe(state.revision + 1);
+  expect(fs.readFileSync(target, "utf8")).toBe(candidate);
+});
+
+test.each([
+  "older-expected-revision",
+  "older-base-revision",
+  "different-base-signature",
+  "wrong-owner",
+  "wrong-token",
+] as const)("a current-base handoff does not bypass the %s guard", async (mismatch) => {
+  const { initial, state, route, target, holderText } = await releasedHolder();
+  const denied = await request(host.app)
+    .post(route)
+    .send(body(state, "a-second", "a", holderText, 3));
+  expect(denied.body.status).toBe("retry-later");
+
+  const page = mismatch === "wrong-owner" ? "a" : "b";
+  const sent = {
+    ...body(
+      state,
+      "guarded-handoff",
+      page,
+      holderText.replace("B: old", "B: waiting"),
+      page === "a" ? 4 : 2,
+    ),
+    ...(mismatch === "wrong-token" ? { reservationToken: "wrong-token" } : {}),
+  };
+  if (mismatch === "older-expected-revision") sent.expectedRevision -= 1;
+  if (mismatch === "older-base-revision") sent.baseRevision -= 1;
+  if (mismatch === "different-base-signature") {
+    sent.base = initial.draft;
+    sent.baseSignature = initial.signature;
+  }
+  const result = await request(host.app).post(route).send(sent);
+  expect(result.body.status).toBe(
+    mismatch === "wrong-owner" || mismatch === "wrong-token"
+      ? "retry-later"
+      : "client-merge-required",
+  );
+  if (result.body.state)
+    expect(result.body.state.revision).toBe(state.revision);
+  expect(fs.readFileSync(target, "utf8")).toBe(holderText);
+});
+
+test("a prepared current-base handoff cannot overwrite an outside edit made during operation journal writes", async () => {
+  const { state, route, target, holderText } = await releasedHolder();
+  const denied = await request(host.app)
+    .post(route)
+    .send(body(state, "a-second", "a", holderText, 3));
+  expect(denied.body.status).toBe("retry-later");
+
+  const write = fs.writeFileSync.bind(fs);
+  const flush = fs.fsyncSync.bind(fs);
+  let journalStarted = false;
+  let outsideWritten = false;
+  const outside = holderText.replace("C: seeded", "C: outside during journal");
+  vi.spyOn(fs, "writeFileSync").mockImplementation(
+    (...args: Parameters<typeof fs.writeFileSync>) => {
+      if (typeof args[1] === "string") {
+        try {
+          const value = JSON.parse(args[1]);
+          if (
+            value.phase === "running" &&
+            value.operation?.operationId === "b-journal-race"
+          )
+            journalStarted = true;
+        } catch {
+          // Only this operation's real journal activates the outside writer.
+        }
+      }
+      return write(...args);
+    },
+  );
+  vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+    if (journalStarted && !outsideWritten) {
+      outsideWritten = true;
+      write(target, outside);
+    }
+    return flush(fd);
+  });
+  const result = await request(host.app)
+    .post(route)
+    .send(
+      body(
+        state,
+        "b-journal-race",
+        "b",
+        holderText.replace("B: old", "B: waiting"),
+        2,
+      ),
+    );
+  expect(outsideWritten).toBe(true);
+  expect(result.body.status).toBe("incoming-changed");
+  expect(result.body.state.revision).toBe(state.revision);
+  expect(result.body.state.draft.markdown).toBe(holderText);
+  expect(fs.readFileSync(target, "utf8")).toBe(outside);
+});
+
 test("a second current-base save cannot pass a queued page while that page prepares its current candidate", async () => {
   const { state, route, target, holderText } = await releasedHolder();
   const secondHolder = await request(host.app)
