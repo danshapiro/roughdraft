@@ -1,9 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import {
-  extractRoughdraftReviewIndex,
-  mergeReviewDrafts,
-} from "@roughdraft/rfm";
+import * as rfm from "@roughdraft/rfm";
+import { extractRoughdraftReviewIndex } from "@roughdraft/rfm";
 import type { Editor } from "@tiptap/core";
 import { act, useEffect, useMemo, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
@@ -67,7 +65,7 @@ vi.mock("./revision-session", async (load) => {
             storage: new MemoryStorage(),
             tabStorage: new MemoryStorage(),
             merge: async (base, local, incoming, options) =>
-              mergeReviewDrafts(base, local, incoming, {
+              rfm.mergeReviewDrafts(base, local, incoming, {
                 ...options,
                 server: false,
                 budgetMs: 1000,
@@ -124,6 +122,23 @@ let store: ComparisonStore;
 let releaseAck = () => {};
 let pendingOperations: Promise<unknown>[];
 beforeEach(() => {
+  // These mounted cases protect content and History, not merge elapsed time.
+  // Freeze only each real merge's clocks so coverage or a descheduled worker
+  // cannot exhaust its allowance. Parsing, source spelling, tasks and rendering
+  // retain real clocks; separate 99/100/101 ms cases protect the deadline.
+  const merge = rfm.mergeReviewDrafts;
+  vi.spyOn(rfm, "mergeReviewDrafts").mockImplementation((...args) => {
+    const now = performance.now();
+    const date = Date.now();
+    const monotonic = vi.spyOn(performance, "now").mockReturnValue(now);
+    const wall = vi.spyOn(Date, "now").mockReturnValue(date);
+    try {
+      return merge(...args);
+    } finally {
+      wall.mockRestore();
+      monotonic.mockRestore();
+    }
+  });
   mounted.editor = null;
   mounted.controller = null;
   mounted.request = null;
@@ -188,6 +203,7 @@ afterEach(async () => {
   container.remove();
   Reflect.deleteProperty(Range.prototype, "getClientRects");
   Reflect.deleteProperty(Range.prototype, "getBoundingClientRect");
+  vi.restoreAllMocks();
 });
 
 for (const scenario of ["settled", "held", "no outside"] as const) {
