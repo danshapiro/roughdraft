@@ -25,6 +25,7 @@ import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
 import { RichTextEditorSurface } from "./PageCard";
 import { applySuggestionDecisions } from "./review-decisions";
 import { suggestionDetail } from "./revision-bulk";
+import { adoptRevisionDisk } from "./revision-disk-adoption";
 import {
   recordReviewedChange,
   reopenReviewedChange,
@@ -299,6 +300,207 @@ async function mountEditor(
   );
   return { live, flush, remote };
 }
+
+test.each([
+  "outside prose",
+  "idle disk adoption",
+  "shared History reopen",
+] as const)("a native outside update retains known archived proposal identities (%s)", async (kind) => {
+  const store = privateDrafts();
+  const { live, remote } = await mountEditor(store);
+  vi.useFakeTimers();
+  const comments = criticMarkdownToEditorState(original).comments;
+  const snapshot = (doc = live.state.doc): RevisionDraft => {
+    const metadata = doc.attrs.sourceMetadata;
+    return {
+      ...draft(
+        serializeRevisionNode(doc, comments, {
+          frontmatter: metadata?.frontmatter,
+          endmatter: metadata?.endmatter,
+        }),
+      ),
+      reviewed: reviewedChanges(doc),
+    };
+  };
+  await act(async () => {
+    for (const [id, decision] of [
+      ["s10", "accept"],
+      ["s11", "reject"],
+    ] as const) {
+      const detail = suggestionDetail(live.state.doc, id);
+      const transaction = live.state.tr;
+      applySuggestionDecisions(transaction, [id], decision);
+      live.view.dispatch(
+        recordReviewedChange(
+          transaction,
+          {
+            decision,
+            oldText: detail.oldText,
+            newText: detail.newText,
+            keptIds: [id],
+          },
+          detail,
+        ).setMeta(explicitReviewEdit, true),
+      );
+    }
+  });
+  const baseline = snapshot();
+  // A saved peer/base may retain valid source spelling absent from this
+  // page's native snapshot cache. History itself lives in the sidecar.
+  const canonical = baseline.markdown;
+  baseline.markdown = canonical.replace("**Changes**", "__Changes__");
+  expect(baseline.markdown).not.toBe(canonical);
+  expect(baseline.reviewed).toHaveLength(2);
+  expect(suggestionPositions(live.state.doc).has("s10")).toBe(false);
+  expect(suggestionPositions(live.state.doc).has("s11")).toBe(false);
+  let incoming: RevisionDraft;
+  if (kind === "shared History reopen") {
+    const entry = baseline.reviewed?.find((item) =>
+      item.keptIds?.includes("s10"),
+    );
+    if (!entry) throw new Error("Expected the actual Keep History entry");
+    const reopened = reopenReviewedChange(live.state, entry.id);
+    if (!reopened) throw new Error("Expected the peer's shared History reopen");
+    incoming = snapshot(live.state.apply(reopened).doc);
+  } else if (kind === "idle disk adoption") {
+    const adopted = adoptRevisionDisk(
+      baseline,
+      baseline.cleanMarkdown?.replace(
+        "Live owner A: unchanged.",
+        "Live owner A: unchanged. Outside text above History.",
+      ) ?? "",
+      live.schema,
+    );
+    if (!adopted) throw new Error("Expected the actual disk adoption result");
+    incoming = adopted as RevisionDraft;
+  } else {
+    incoming = {
+      ...baseline,
+      ...draft(
+        baseline.markdown.replace(
+          "Live owner A: unchanged.",
+          "Live owner A: unchanged. Outside text above History.",
+        ),
+      ),
+    };
+  }
+  let applied: RevisionDraft | null | undefined;
+  await act(async () => {
+    applied = remote.current?.(incoming, { localBase: baseline });
+  });
+  expect(applied).not.toBeNull();
+  expect(reviewedChanges(live.state.doc)).toHaveLength(
+    kind === "shared History reopen" ? 1 : 2,
+  );
+  if (kind !== "shared History reopen")
+    expect(live.state.doc.textContent).toContain("Outside text above History.");
+  else expect(suggestionPositions(live.state.doc).has("s10")).toBe(true);
+  await act(async () => {
+    for (const entry of [...reviewedChanges(live.state.doc)]) {
+      const reopened = reopenReviewedChange(live.state, entry.id);
+      expect(reopened).not.toBeNull();
+      if (reopened)
+        live.view.dispatch(reopened.setMeta(explicitReviewEdit, true));
+    }
+  });
+  for (const id of ["s10", "s11"])
+    expect(suggestionPositions(live.state.doc).has(id)).toBe(true);
+  expect(store.getSnapshot().comments.c1.value).toBe(privateComment);
+  expect(store.getSnapshot().comments.c99.value).toBe(privateReply);
+}, 15_000);
+
+test("a native outside update still waits for a different proposal newly archived in the local buffer", async () => {
+  const store = privateDrafts();
+  const { live, remote } = await mountEditor(store);
+  vi.useFakeTimers();
+  const baseline = draft(original);
+  const change = createCriticChange("addition", undefined, {
+    existingChanges: documentProposalIdentities(live.state.doc),
+  });
+  await act(async () => {
+    let at = -1;
+    live.state.doc.descendants((node, position) => {
+      if (node.isText && node.text?.startsWith("Live owner B:"))
+        at = position + node.nodeSize;
+    });
+    if (at < 0) throw new Error("Expected the actual local proposal target");
+    const text = " Local archived proposal";
+    live.view.dispatch(
+      live.state.tr
+        .insertText(text, at)
+        .addMark(
+          at,
+          at + text.length,
+          live.schema.marks.criticChange.create(change),
+        ),
+    );
+    const detail = suggestionDetail(live.state.doc, change.changeId);
+    const transaction = live.state.tr;
+    applySuggestionDecisions(transaction, [change.changeId], "accept");
+    live.view.dispatch(
+      recordReviewedChange(
+        transaction,
+        {
+          decision: "accept",
+          oldText: detail.oldText,
+          newText: detail.newText,
+          keptIds: [change.changeId],
+        },
+        detail,
+      ).setMeta(explicitReviewEdit, true),
+    );
+  });
+  const incoming = draft(
+    original.replace(
+      "Live owner A: unchanged.",
+      `Live owner A: unchanged. {++Different peer proposal++}{#${change.changeId}}`,
+    ),
+  );
+  const before = live.state;
+  let applied: RevisionDraft | null | undefined;
+  await act(async () => {
+    applied = remote.current?.(incoming, { localBase: baseline });
+  });
+  expect(applied).toBeNull();
+  expect(live.state).toBe(before);
+  expect(reviewedChanges(live.state.doc)).toHaveLength(1);
+  const comments = criticMarkdownToEditorState(original).comments;
+  const local = {
+    ...draft(
+      serializeRevisionNode(live.state.doc, comments, {
+        frontmatter: live.state.doc.attrs.sourceMetadata?.frontmatter,
+        endmatter: live.state.doc.attrs.sourceMetadata?.endmatter,
+      }).replace("**Changes**", "__Changes__"),
+    ),
+    reviewed: reviewedChanges(live.state.doc),
+  };
+  const merged = merge(baseline, local, incoming);
+  const localId = merged.idRemap?.[change.changeId];
+  expect(localId).toBeDefined();
+  expect(localId).not.toBe(change.changeId);
+  await act(async () => {
+    applied = remote.current?.(merged.draft as RevisionDraft, {
+      localBase: local,
+      idRemap: merged.idRemap,
+    });
+  });
+  expect(applied).not.toBeNull();
+  expect(suggestionPositions(live.state.doc).has(change.changeId)).toBe(true);
+  expect(live.state.doc.textContent).toContain("Different peer proposal");
+  const reopened = reopenReviewedChange(
+    live.state,
+    reviewedChanges(live.state.doc)[0].id,
+  );
+  expect(reopened).not.toBeNull();
+  if (reopened) {
+    await act(async () => live.view.dispatch(reopened));
+    expect(suggestionDetail(live.state.doc, localId ?? "").newText).toContain(
+      "Local archived proposal",
+    );
+    expect(suggestionPositions(live.state.doc).has(change.changeId)).toBe(true);
+    expect(live.state.doc.textContent).toContain("Different peer proposal");
+  }
+}, 15_000);
 
 test.each([
   "native",

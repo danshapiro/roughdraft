@@ -1,3 +1,4 @@
+import { reviewHistoryProposalIds } from "@roughdraft/rfm";
 import { Extension, type JSONContent } from "@tiptap/core";
 import { closeHistory, isHistoryTransaction } from "@tiptap/pm/history";
 import type {
@@ -2214,9 +2215,14 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         // A proposal can be created in the native buffer after the worker's
         // snapshot. Defer its ID collision before any document/UI mutation;
         // the coalesced source will resume browser renumbering automatically.
-        const originalIds = new Set(
-          documentProposalIdentities(baseDoc).map((item) => item.changeId),
-        );
+        const originalIds = new Set([
+          ...documentProposalIdentities(baseDoc).map((item) => item.changeId),
+          // A parsed Markdown base has no sidecar History attributes. Its
+          // known inverse IDs still belong to the same original proposals.
+          ...[...reviewHistoryProposalIds(options?.localBase?.reviewed)].map(
+            (id) => options?.idRemap?.[id] ?? id,
+          ),
+        ]);
         const liveIds = new Set(
           documentProposalIdentities(identityState.doc).map(
             (item) => item.changeId,
