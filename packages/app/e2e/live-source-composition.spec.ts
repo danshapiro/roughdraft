@@ -77,6 +77,10 @@ test("a real source keyboard composition accepts and saves another paragraph bef
     await expect
       .poll(async () => (await read()).draft?.markdown)
       .toContain("Remote owner: incoming.");
+    // The keyboard keeps composing while the user pauses. Preserve native
+    // history's pause-separated groups, as verified by the no-update control.
+    await page.waitForTimeout(600);
+    await expect(source).toHaveAttribute("data-ime-ends", "0");
     await keyboard.send("Input.imeSetComposition", {
       text: "日本語入力",
       selectionStart: 5,
@@ -90,8 +94,78 @@ test("a real source keyboard composition accepts and saves another paragraph bef
       .poll(() => fs.readFileSync(target, "utf8"))
       .toContain("Typing owner: 日本語入力.");
     await page.keyboard.press("Control+z");
+    await expect(source).toContainText("Typing owner: 日本語.");
+    await expect(source).toContainText("Remote owner: incoming.");
+    await page.keyboard.press("Control+z");
     await expect(source).toContainText("Typing owner: .");
     await expect(source).toContainText("Remote owner: incoming.");
+    await page.keyboard.press("Control+Shift+Z");
+    await expect(source).toContainText("Typing owner: 日本語.");
+    await expect(source).toContainText("Remote owner: incoming.");
+    await page.keyboard.press("Control+Shift+Z");
+    await expect(source).toContainText("Typing owner: 日本語入力.");
+    await expect(source).toContainText("Remote owner: incoming.");
+  } finally {
+    await keyboard.detach();
+    removeMarkdownProject(project);
+  }
+});
+
+test("source Undo preserves the native paused-composition steps without an outside update", async ({
+  page,
+  request,
+}) => {
+  const project = createMarkdownProject("source-composition-history-control");
+  const keyboard = await page.context().newCDPSession(page);
+  try {
+    const target = writeProjectFile(
+      project,
+      "source.md",
+      "# Keyboard review\n\nTyping owner: .\n\nRemote owner: old.\n",
+    );
+    const created = await request.post(`${api}/document`, {
+      data: { targetPath: target, autosave: target, handoff: "chat" },
+    });
+    await expect(created).toBeOK();
+    const { id } = await created.json();
+    await page.goto(`/?comparison=${id}`);
+    await expect(richTextEditor(page)).toBeVisible();
+    await page.getByTestId("revision-format").click();
+    const source = page.getByTestId("revision-markdown").locator(".cm-content");
+    await source.focus();
+    await page.keyboard.press("Control+Home");
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("End");
+    await page.keyboard.press("ArrowLeft");
+    await keyboard.send("Input.imeSetComposition", {
+      text: "日本語",
+      selectionStart: 3,
+      selectionEnd: 3,
+    });
+    await expect
+      .poll(() => fs.readFileSync(target, "utf8"))
+      .toContain("Typing owner: 日本語.");
+    // This pause exercises native history grouping, not network readiness.
+    await page.waitForTimeout(600);
+    await keyboard.send("Input.imeSetComposition", {
+      text: "日本語入力",
+      selectionStart: 5,
+      selectionEnd: 5,
+    });
+    await keyboard.send("Input.insertText", { text: "日本語入力" });
+    await expect
+      .poll(() => fs.readFileSync(target, "utf8"))
+      .toContain("Typing owner: 日本語入力.");
+    await page.keyboard.press("Control+z");
+    await expect(source).toContainText("Typing owner: 日本語.");
+    await page.keyboard.press("Control+z");
+    await expect(source).toContainText("Typing owner: .");
+    await expect(source).toContainText("Remote owner: old.");
+    await page.keyboard.press("Control+Shift+Z");
+    await expect(source).toContainText("Typing owner: 日本語.");
+    await page.keyboard.press("Control+Shift+Z");
+    await expect(source).toContainText("Typing owner: 日本語入力.");
   } finally {
     await keyboard.detach();
     removeMarkdownProject(project);
