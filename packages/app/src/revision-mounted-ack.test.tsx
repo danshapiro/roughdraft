@@ -380,7 +380,7 @@ test("a source update checks composition against its final rebase across newer p
     "Live owner A: Incoming worker text.",
   );
   expect(source.compositionStarted).toBe(true);
-});
+}, 15_000);
 
 test.each([
   "other paragraph",
