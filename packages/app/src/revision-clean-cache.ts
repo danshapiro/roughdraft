@@ -1,7 +1,11 @@
+import { cleanRoughdraftMarkdown } from "@roughdraft/rfm";
 import type { Node } from "@tiptap/pm/model";
 import { editorStateToCriticMarkdown } from "./critic-markup";
 import { normalizeBlockSpacing } from "./markdown";
-import { createSourceSpellingPreserver as preserveSourceSpelling } from "./revision-markdown";
+import {
+  needsSourceProjection,
+  createSourceSpellingPreserver as preserveSourceSpelling,
+} from "./revision-markdown";
 import { projectAcceptedDocument } from "./revision-projection";
 import { serializeRevisionNode } from "./revision-review-cache";
 
@@ -105,6 +109,11 @@ export function cleanSourceFromNode(
   comments: Map<string, import("./critic-markup").CriticComment>,
   privateCommentIds?: ReadonlySet<string>,
 ): string {
+  // Ordinary inline review syntax has an exact source projection. Diffing the
+  // annotated serializer against accepted text can consume neighboring syntax
+  // and spelling at a pending proposal's whitespace boundary.
+  if (!needsSourceProjection(doc.toJSON()))
+    return cleanRoughdraftMarkdown(markdown);
   const metadata = doc.attrs.sourceMetadata;
   const canonical = serializeRevisionNode(
     doc,

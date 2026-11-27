@@ -139,7 +139,10 @@ import {
   type RevisionDraft,
   useRevisionSession,
 } from "./revision-session";
-import { RevisionSpellingProof } from "./revision-spelling-proof";
+import {
+  RevisionCanonicalSpellingProof,
+  RevisionSpellingProof,
+} from "./revision-spelling-proof";
 import {
   type CommentDraftState,
   commentDraftMatchesTarget,
@@ -535,6 +538,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     typeof createSourceSpellingPreserver
   > | null>(null);
   const acceptedSpellingProof = useRef(new RevisionSpellingProof());
+  const canonicalSpellingProof = useRef(new RevisionCanonicalSpellingProof());
   const reviewSpellingProof = useRef(new RevisionSpellingProof());
   const [editor, setEditor] = useState<Editor | null>(null);
   const [preferences, setPreferences] = useRevisionPreferences(session.id);
@@ -859,6 +863,12 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                 ),
                 editorState,
               ),
+            ) ||
+            canonicalSpellingProof.current.matches(
+              preserved,
+              canonicalClean,
+              projectCleanRevisionNode(current),
+              editorState,
             )
           )
             cleanMarkdown = preserved;

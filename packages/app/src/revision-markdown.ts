@@ -91,7 +91,10 @@ export function cleanRevisionMarkdown(markdown: string): string {
   return cleanRevisionDocument(doc);
 }
 
-function needsSourceProjection(node: JSONContent, inCode = false): boolean {
+export function needsSourceProjection(
+  node: JSONContent,
+  inCode = false,
+): boolean {
   const code =
     inCode ||
     node.type === "codeBlock" ||
