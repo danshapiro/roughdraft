@@ -5,6 +5,7 @@ import {
   reviewDraftSignature,
   type SyncResult,
   type SyncState,
+  sameReviewDraft,
 } from "@roughdraft/rfm";
 import type { Editor } from "@tiptap/core";
 import { TextSelection } from "@tiptap/pm/state";
@@ -15,14 +16,28 @@ import editingReview from "../../../docs/spec/fixtures/editing-review.md?raw";
 import { ApiBackend } from "./api-backend";
 import type { ComparisonReviewData } from "./comparison-types";
 import { TooltipProvider } from "./components/ui/tooltip";
-import { criticMarkdownToEditorState } from "./critic-markup";
+import {
+  createCriticChange,
+  criticMarkdownToEditorState,
+} from "./critic-markup";
+import { explicitReviewEdit } from "./editor-extensions";
 import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
 import { RichTextEditorSurface } from "./PageCard";
+import { applySuggestionDecisions } from "./review-decisions";
+import { suggestionDetail } from "./revision-bulk";
+import {
+  recordReviewedChange,
+  reopenReviewedChange,
+  reviewedChanges,
+} from "./revision-history";
 import { cleanRevisionSourceMarkdown } from "./revision-markdown";
 import {
   prepareRevisionDraft,
   prepareRevisionEditorDraft,
 } from "./revision-prepare";
+import { suggestionPositions } from "./revision-projection";
+import { documentProposalIdentities } from "./revision-proposal-identities";
+import { serializeRevisionNode } from "./revision-review-cache";
 import {
   type RevisionDraft,
   type RevisionRemoteAdapter,
@@ -347,7 +362,7 @@ test.each([
 test.each([
   "response-first",
   "event-first",
-] as const)("a mounted editor integrates one reserved acknowledgment once when %s paths overlap during a worker merge", async (order) => {
+] as const)("a mounted editor integrates one server-merged acknowledgment once when %s paths overlap during a worker merge", async (order) => {
   let current = state();
   const initial = current;
   let initialWrite = true;
@@ -364,6 +379,7 @@ test.each([
   });
   let holdAcknowledgment = false;
   let heldMerges = 0;
+  const serverAddition = " Server added detail.";
   const api = async <T,>(path: string, body?: object): Promise<T | null> => {
     if (!body) return structuredClone(current) as T;
     if (path.endsWith("/checkpoint")) {
@@ -395,6 +411,16 @@ test.each([
         },
       } as T;
     }
+    if (sent.reservationToken)
+      current = state(
+        draft(
+          current.draft.markdown.replace(
+            `Live owner A: unchanged.${peerSuffix}`,
+            `Live owner A: unchanged.${peerSuffix}${serverAddition}`,
+          ),
+        ),
+        current.revision,
+      );
     current = state(
       merge(
         sent.base as RevisionDraft,
@@ -513,7 +539,7 @@ test.each([
     await pending;
     await vi.advanceTimersByTimeAsync(32);
   });
-  const expectedA = `Live owner A: unchanged.${peerSuffix}`;
+  const expectedA = `Live owner A: unchanged.${peerSuffix}${serverAddition}`;
   const expectedB = `Live owner B: unchanged.${firstSuffix}${newerSuffix}${bufferedSuffix}`;
   const editorText = live.state.doc.textBetween(
     0,
@@ -748,3 +774,359 @@ test.each([
   expect(current.draft.markdown).not.toContain(privateReply);
   expect(requests[0].draft.markdown).not.toContain(privateReply);
 }, 20_000);
+
+for (const kind of [
+  "exact",
+  "server changed",
+  "non-native",
+  "identity serialized",
+  "identity buffered",
+] as const) {
+  test.each([
+    "response-first",
+    "event-first",
+  ] as const)(`a prepared acknowledgment preserves the maintained document and only uses necessary full merges (${kind}, %s)`, async (order) => {
+    const store = privateDrafts();
+    const { live, flush, remote } = await mountEditor(store);
+    const publicComments = criticMarkdownToEditorState(original).comments;
+    const snapshot = (): RevisionDraft => {
+      const metadata = live.state.doc.attrs.sourceMetadata;
+      const markdown = serializeRevisionNode(
+        live.state.doc,
+        publicComments,
+        {
+          frontmatter: metadata?.frontmatter,
+          endmatter: metadata?.endmatter,
+        },
+        store.privateCommentIds(publicComments),
+      );
+      return { ...draft(markdown), reviewed: reviewedChanges(live.state.doc) };
+    };
+    const decide = async (id: string, decision: "accept" | "reject") =>
+      act(async () => {
+        const detail = suggestionDetail(live.state.doc, id);
+        const transaction = live.state.tr;
+        applySuggestionDecisions(transaction, [id], decision);
+        live.view.dispatch(
+          recordReviewedChange(
+            transaction,
+            {
+              decision,
+              oldText: detail.oldText,
+              newText: detail.newText,
+              keptIds: [id],
+            },
+            detail,
+          ).setMeta(explicitReviewEdit, true),
+        );
+      });
+    await decide("s10", "accept");
+    await decide("s11", "reject");
+    const collision = kind.startsWith("identity");
+    const peerId = createCriticChange("addition", undefined, {
+      existingChanges: documentProposalIdentities(live.state.doc),
+    }).changeId;
+    const initial = state(snapshot());
+    let current = initial;
+    const baselineSignature = reviewDraftSignature(initial.draft);
+    let prepared: SyncState<ComparisonReviewData> | undefined;
+    let response:
+      | ((value: SyncResult<ComparisonReviewData>) => void)
+      | undefined;
+    let initialWrite = true;
+    let acknowledging = false;
+    let acknowledgmentMerges = 0;
+    let releaseMerge = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      releaseMerge = resolve;
+    });
+    const submitted: ReconcileRequest[] = [];
+    const api = async <T,>(path: string, body?: object): Promise<T | null> => {
+      if (!body) return structuredClone(current) as T;
+      if (path.endsWith("/checkpoint"))
+        return { checkpointId: "preserved" } as T;
+      if (!path.endsWith("/reconcile")) throw new Error(`Unexpected ${path}`);
+      const sent = body as ReconcileRequest;
+      submitted.push(structuredClone(sent));
+      if (initialWrite) {
+        initialWrite = false;
+        const peer = {
+          ...initial.draft,
+          ...draft(
+            initial.draft.markdown.replace(
+              "Live owner A: unchanged.",
+              `Live owner A: unchanged.${peerSuffix}${collision ? ` {++Peer pending proposal++}{#${peerId}}` : ""}`,
+            ),
+          ),
+          reviewed: initial.draft.reviewed,
+        };
+        current = state(peer, 2);
+        current.originDrafts = { [baselineSignature]: initial.draft };
+        return {
+          status: "client-merge-required",
+          state: structuredClone(current),
+          reservation: {
+            token: "exact-turn",
+            revision: 2,
+            expiresAt: Date.now() + 750,
+          },
+        } as T;
+      }
+      let saved = sent.draft as RevisionDraft;
+      if (!response && kind === "server changed")
+        saved = {
+          ...saved,
+          ...draft(
+            saved.markdown.replace(
+              `Live owner A: unchanged.${peerSuffix}`,
+              `Live owner A: unchanged.${peerSuffix} Additional server text.`,
+            ),
+          ),
+          reviewed: saved.reviewed,
+        };
+      current = state(saved, current.revision + 1);
+      current.review.lastOperation = {
+        id: sent.operationId,
+        pageInstanceId: sent.pageInstanceId,
+        reason: sent.reason,
+      };
+      current.originDrafts = { [baselineSignature]: initial.draft };
+      if (!response) {
+        prepared = structuredClone(current);
+        expect(sameReviewDraft(prepared.draft, sent.draft)).toBe(
+          kind !== "server changed",
+        );
+        return await new Promise<T>((resolve) => {
+          response = (value) => resolve(value as T);
+        });
+      }
+      return { status: "committed", state: structuredClone(current) } as T;
+    };
+    vi.useFakeTimers();
+    const active = new RevisionSessionController(
+      initial.review,
+      initial.draft as RevisionDraft,
+      {
+        request: api,
+        storage: new MemoryStorage(),
+        tabStorage: new MemoryStorage(),
+        merge: async (base, working, incoming, options) => {
+          const result = mergeReviewDrafts(base, working, incoming, {
+            ...options,
+            server: false,
+            budgetMs: 1000,
+          });
+          if (acknowledging) {
+            acknowledgmentMerges++;
+            await barrier;
+          }
+          return result;
+        },
+      },
+    );
+    controller = active;
+    await act(async () => {
+      active.setAdapter({
+        rebasesBufferedDocument: kind !== "non-native",
+        prepare: (value, options) =>
+          prepareRevisionEditorDraft(value, live, options),
+        apply: (value, options) => remote.current?.(value, options) ?? null,
+        adopt: () => null,
+        flush: () => flush.current?.(),
+        readUiDrafts: store.read,
+        restoreUiDrafts: store.restore,
+        subscribeUiDrafts: store.subscribe,
+      });
+      active.start();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const type = async (value: string, serialize: boolean) =>
+      act(async () => {
+        let at = -1;
+        live.state.doc.descendants((node, position) => {
+          if (
+            node.isTextblock &&
+            node.textContent.startsWith("Live owner B:")
+          ) {
+            at = position + node.nodeSize - 1;
+            return false;
+          }
+        });
+        if (at < 0) throw new Error("Missing native owner paragraph");
+        live.view.dispatch(live.state.tr.insertText(value, at));
+        if (serialize) flush.current?.();
+      });
+    await type(firstSuffix, true);
+    let saving: Promise<boolean> | undefined;
+    await act(async () => {
+      saving = active.flush(false);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    if (!prepared || !response)
+      throw new Error("Expected an actual prepared commit");
+    await type(newerSuffix, true);
+    await decide("s2", "reject");
+    await act(async () => {
+      flush.current?.();
+      active.updateDraft((value) => ({
+        ...value,
+        reviewed: reviewedChanges(live.state.doc),
+        reviewComments: [
+          ...value.reviewComments,
+          {
+            id: "c-published-after-prepare",
+            changeId: "document",
+            parentCommentId: "c2",
+            content: "A submitted reply after preparing the candidate.",
+            createdAt: "2026-11-26T12:01:00.000Z",
+            authorType: "user",
+          },
+        ],
+      }));
+    });
+    if (collision)
+      await act(async () => {
+        let at = -1;
+        live.state.doc.descendants((node, position) => {
+          if (node.isText && node.text?.startsWith("Live owner B:"))
+            at = position + node.nodeSize;
+        });
+        if (at < 0) throw new Error("Missing local proposal target");
+        const change = createCriticChange("addition", undefined, {
+          existingChanges: documentProposalIdentities(live.state.doc),
+        });
+        expect(change.changeId).toBe(peerId);
+        const text = " Local pending proposal";
+        live.view.dispatch(
+          live.state.tr
+            .insertText(text, at)
+            .addMark(
+              at,
+              at + text.length,
+              live.schema.marks.criticChange.create(change),
+            ),
+        );
+        store.setComment("c-new-proposal-reply", {
+          value: "Private reply follows the local proposal",
+          original: "",
+          editing: true,
+          target: {
+            id: "c-new-proposal-reply",
+            parentCommentId: peerId,
+            content: "",
+            createdAt: "2026-11-26T12:02:00.000Z",
+            authorType: "user",
+          },
+        });
+        if (kind === "identity serialized") flush.current?.();
+      });
+    await type(bufferedSuffix, false);
+    const expectedA = `Live owner A: unchanged.${peerSuffix}${kind === "server changed" ? " Additional server text." : collision ? " Peer pending proposal" : ""}`;
+    const expectedB = `Live owner B: unchanged.${firstSuffix}${newerSuffix}${collision ? " Local pending proposal" : ""}${bufferedSuffix}`;
+    const notify = () => {
+      for (const listener of listeners)
+        listener({ reason: "changed", state: structuredClone(prepared) });
+    };
+    acknowledging = true;
+    await act(async () => {
+      if (order === "response-first")
+        response?.({ status: "committed", state: prepared });
+      else notify();
+      await vi.advanceTimersByTimeAsync(0);
+      if (order === "response-first") notify();
+      else response?.({ status: "committed", state: prepared });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const initialAcknowledgmentMerges = acknowledgmentMerges;
+    try {
+      if (!collision)
+        expect(acknowledgmentMerges).toBe(kind === "exact" ? 0 : 1);
+    } finally {
+      acknowledging = false;
+      await act(async () => {
+        releaseMerge();
+        await vi.advanceTimersByTimeAsync(0);
+      });
+    }
+    await act(async () => {
+      await saving;
+      await vi.advanceTimersByTimeAsync(
+        kind === "identity buffered" ? 500 : 32,
+      );
+    });
+    const text = live.state.doc.textBetween(
+      0,
+      live.state.doc.content.size,
+      "\n",
+    );
+    expect(text.match(/Live owner A:[^\n]*/)?.[0]).toBe(expectedA);
+    expect(text.match(/Live owner B:[^\n]*/)?.[0]).toBe(expectedB);
+    expect(active.readDraft().reviewComments).toContainEqual(
+      expect.objectContaining({
+        id: "c-published-after-prepare",
+        content: "A submitted reply after preparing the candidate.",
+      }),
+    );
+    expect(store.getSnapshot().comments.c1.value).toBe(privateComment);
+    expect(store.getSnapshot().comments.c99.value).toBe(privateReply);
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        '[data-testid$="-c1-editor"]',
+      )?.value,
+    ).toBe(privateComment);
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        '[data-testid$="-c99-editor"]',
+      )?.value,
+    ).toBe(privateReply);
+    expect(active.getSnapshot().conflict).toBeNull();
+    if (collision) {
+      const ids: string[][] = [];
+      live.state.doc.descendants((node) => {
+        if (
+          node.type.name !== "paragraph" ||
+          !/^Live owner [AB]:/.test(node.textContent)
+        )
+          return;
+        const owned = new Set<string>();
+        node.descendants((child) => {
+          for (const mark of child.marks)
+            if (mark.type.name === "criticChange")
+              owned.add(mark.attrs.changeId);
+        });
+        ids.push([...owned]);
+      });
+      expect(ids).toHaveLength(2);
+      expect(ids[0]).toEqual([peerId]);
+      expect(ids[1]).toHaveLength(1);
+      expect(ids[1][0]).not.toBe(peerId);
+      expect(
+        store.getSnapshot().comments["c-new-proposal-reply"].target
+          ?.parentCommentId,
+      ).toBe(ids[1][0]);
+      expect(store.getSnapshot().comments["c-new-proposal-reply"].value).toBe(
+        "Private reply follows the local proposal",
+      );
+      expect(initialAcknowledgmentMerges).toBe(
+        kind === "identity buffered" ? 0 : 1,
+      );
+      await act(async () => live.commands.rejectCriticChange(ids[1][0]));
+      expect(suggestionPositions(live.state.doc).has(peerId)).toBe(true);
+    }
+    const history = reviewedChanges(live.state.doc);
+    expect(history).toHaveLength(3);
+    await act(async () => {
+      for (const entry of history) {
+        const reopened = reopenReviewedChange(live.state, entry.id);
+        expect(reopened).not.toBeNull();
+        if (!reopened)
+          throw new Error("Every maintained History example must reopen");
+        live.view.dispatch(reopened.setMeta(explicitReviewEdit, true));
+      }
+    });
+    for (const id of ["s10", "s11", "s2"])
+      expect(suggestionPositions(live.state.doc).has(id)).toBe(true);
+    expect(JSON.stringify(submitted)).not.toContain(privateReply);
+    expect(JSON.stringify(submitted)).not.toContain(privateComment);
+  }, 25_000);
+}

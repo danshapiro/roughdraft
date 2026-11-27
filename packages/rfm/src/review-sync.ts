@@ -127,6 +127,11 @@ export interface ReconcileRequest extends SyncOperation {
   } | null;
   writeFile: boolean;
   localGeneration: number;
+  coveredCheckpoint?: {
+    recoveryId: string;
+    pageInstanceId: string;
+    generation: number;
+  };
   reason: "sync" | "adopt" | "resolve" | "send" | "recreate";
   resolution?: {
     signature: string;

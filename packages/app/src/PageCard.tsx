@@ -2211,6 +2211,28 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           schema: editor.schema,
           doc: baseDoc,
         });
+        // A proposal can be created in the native buffer after the worker's
+        // snapshot. Defer its ID collision before any document/UI mutation;
+        // the coalesced source will resume browser renumbering automatically.
+        const originalIds = new Set(
+          documentProposalIdentities(baseDoc).map((item) => item.changeId),
+        );
+        const liveIds = new Set(
+          documentProposalIdentities(identityState.doc).map(
+            (item) => item.changeId,
+          ),
+        );
+        const incomingDoc = parsed.doc.type.create(
+          { ...parsed.doc.attrs, reviewed: draft.reviewed ?? [] },
+          parsed.doc.content,
+        );
+        if (
+          documentProposalIdentities(incomingDoc).some(
+            (item) =>
+              !originalIds.has(item.changeId) && liveIds.has(item.changeId),
+          )
+        )
+          return blocked("new-proposal-identity");
         const newerLocal = !baseDoc.content.eq(identityState.doc.content);
         const transaction = rebaseRemoteTransaction(
           baseState,

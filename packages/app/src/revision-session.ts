@@ -17,19 +17,20 @@ import {
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { browserNavigationUrl, browserPath } from "./browser-base-path";
 import type { ComparisonReviewData, EditorDraft } from "./comparison-types";
+import type { RecoverySnapshot } from "./RevisionRecoveryDialog";
 import {
   decodeBrowserRecovery,
   encodeBrowserRecovery,
 } from "./revision-browser-recovery";
-import type { RecoverySnapshot } from "./RevisionRecoveryDialog";
 import { subscribeReviewChanges } from "./revision-live-transport";
 import { measureRevision } from "./revision-performance";
-import { receiveSyncResponse } from "./revision-sync-transfer";
+import { hasPreparedIdentityClash } from "./revision-prepared-identities";
 import {
   disposeReviewMergeWorker,
   mergeReviewDraftsAsync,
   prepareReviewMergeWorker,
 } from "./revision-reconciliation";
+import { receiveSyncResponse } from "./revision-sync-transfer";
 import { privateReplyTarget, privateRootTarget } from "./revision-ui-drafts";
 
 export interface InspectedDestination {
@@ -98,6 +99,16 @@ interface PreparedRevisionCommit {
   generation: number;
   state: SyncState<ComparisonReviewData>;
 }
+interface CheckpointEpisode {
+  recoveryId: string;
+  pageInstanceId: string;
+  generation: number;
+  checkpointId?: string;
+  waitOnly: boolean;
+  protectedUi: boolean;
+  coveragePending: boolean;
+  coveredGeneration?: number;
+}
 export interface BrowserRecovery {
   version: 2;
   pageInstanceId: string;
@@ -109,6 +120,7 @@ export interface BrowserRecovery {
   operation?: PendingOperation | null;
   copyOperation?: PendingOperation | null;
   uiDrafts?: Record<string, unknown>;
+  checkpointEpisode?: CheckpointEpisode;
   copyPath?: string;
   copyResult?: Pick<
     SyncResult<ComparisonReviewData>,
@@ -286,6 +298,7 @@ export class RevisionSessionController {
   private autosaveRequested = false;
   private autosaveDueAt = 0;
   private retryNotBefore = 0;
+  private retryRevision: number | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private publicationTimer: ReturnType<typeof setTimeout> | null = null;
   private unsubscribe: (() => void) | null = null;
@@ -293,6 +306,8 @@ export class RevisionSessionController {
   private stopped = false;
   private started = false;
   private refreshPromise: Promise<void> | null = null;
+  private refreshReviewId: string | null = null;
+  private refreshRequested = false;
   private lastRecord: string | null = null;
   private recoveryInputs: unknown[] = [];
   private recoveryRecord: string | null = null;
@@ -328,6 +343,7 @@ export class RevisionSessionController {
   private checkpointTimer: ReturnType<typeof setTimeout> | null = null;
   private checkpointEntryId: string | undefined;
   private checkpointRecoveryId: string | undefined;
+  private checkpointEpisode: CheckpointEpisode | undefined;
   private diskProjections = new Map<string, string>();
   private observedOverwriteId: string | undefined;
 
@@ -383,6 +399,35 @@ export class RevisionSessionController {
       this.copyPath = recovered.copyPath ?? this.copyOperation?.copyPath;
       this.deferredCopy = recovered.copyResult ?? null;
       this.recoveredUiDrafts = recovered.uiDrafts ?? null;
+      const episode = recovered.checkpointEpisode;
+      if (
+        episode &&
+        typeof episode.recoveryId === "string" &&
+        typeof episode.pageInstanceId === "string" &&
+        Number.isSafeInteger(episode.generation) &&
+        episode.generation >= 0 &&
+        typeof episode.waitOnly === "boolean" &&
+        typeof episode.protectedUi === "boolean"
+      ) {
+        this.checkpointEpisode = { ...episode, coveragePending: true };
+        this.checkpointRecoveryId = episode.recoveryId;
+        this.checkpointEntryId = episode.checkpointId;
+      }
+      this.generation = Math.max(
+        0,
+        ...[
+          recovered.generation,
+          recovered.operation?.generation,
+          recovered.copyOperation?.generation,
+          this.checkpointEpisode?.generation,
+          this.checkpointEpisode?.coveredGeneration,
+        ].filter(
+          (value): value is number =>
+            typeof value === "number" &&
+            Number.isSafeInteger(value) &&
+            value >= 0,
+        ),
+      );
     }
     // Persisted and recovered drafts carry exact accepted Markdown spelling.
     // Only a new seed needs projection; reprojecting a saved draft on opening
@@ -553,6 +598,7 @@ export class RevisionSessionController {
       Boolean(this.snapshot.conflict),
       uiDrafts.comments,
       uiDrafts.suggestion,
+      this.checkpointEpisode,
     ];
     const changed = inputs.some(
       (value, index) => value !== this.recoveryInputs[index],
@@ -566,6 +612,7 @@ export class RevisionSessionController {
         this.deferredCopy ||
         !sameReviewDraft(this.current, this.base) ||
         this.snapshot.conflict ||
+        this.checkpointEpisode ||
         hasUiDrafts(uiDrafts);
       this.recoveryRecord = useful
         ? encodeBrowserRecovery({
@@ -593,6 +640,9 @@ export class RevisionSessionController {
                 }
               : {}),
             uiDrafts,
+            ...(this.checkpointEpisode
+              ? { checkpointEpisode: this.checkpointEpisode }
+              : {}),
           })
         : null;
     }
@@ -992,24 +1042,26 @@ export class RevisionSessionController {
       });
       return { restored, skipped };
     });
+  private subscribeToReview(reviewId: string) {
+    this.unsubscribe?.();
+    this.unsubscribe = subscribeReviewChanges(reviewId, (notice) => {
+      if (this.stopped || this.snapshot.session.id !== reviewId) return;
+      if (notice.operationContext && this.state)
+        this.state = {
+          ...this.state,
+          operationContext: notice.operationContext,
+        };
+      if (notice.reason === "heartbeat") return;
+      if (notice.state) void this.observe(notice.state);
+      else void this.refresh();
+    });
+  }
   start() {
     if (this.started) return;
     this.started = true;
     this.stopped = false;
     prepareReviewMergeWorker(this.current.markdown);
-    this.unsubscribe = subscribeReviewChanges(
-      this.snapshot.session.id,
-      (notice) => {
-        if (notice.operationContext && this.state)
-          this.state = {
-            ...this.state,
-            operationContext: notice.operationContext,
-          };
-        if (notice.reason === "heartbeat") return;
-        if (notice.state) void this.observe(notice.state);
-        else void this.refresh();
-      },
-    );
+    this.subscribeToReview(this.snapshot.session.id);
     this.heartbeat = setInterval(() => {
       this.persist();
       this.findOrphans();
@@ -1020,6 +1072,9 @@ export class RevisionSessionController {
   stop() {
     this.stopped = true;
     this.started = false;
+    this.refreshPromise = null;
+    this.refreshReviewId = null;
+    this.refreshRequested = false;
     this.unsubscribe?.();
     this.unsubscribe = null;
     this.unsubscribeUi?.();
@@ -1051,6 +1106,17 @@ export class RevisionSessionController {
           this.emit({
             conflict: { ...this.snapshot.conflict, checkpointSaved: false },
           });
+        if (this.checkpointEpisode) {
+          this.checkpointEpisode = {
+            ...this.checkpointEpisode,
+            generation: this.generation,
+            protectedUi:
+              this.checkpointEpisode.protectedUi ||
+              hasUiDrafts(adapter.readUiDrafts()),
+            coveragePending: true,
+          };
+          this.scheduleCheckpoint();
+        }
         this.persist();
         if (this.snapshot.conflict) this.schedule();
       }) ?? null;
@@ -1130,6 +1196,7 @@ export class RevisionSessionController {
     }, wait);
   }
   private deferAutosave(delay: number) {
+    this.retryRevision = this.state?.revision ?? this.baseRevision;
     this.retryNotBefore =
       performance.now() + Math.max(20, Math.min(750, delay));
     this.schedule(0);
@@ -1176,10 +1243,55 @@ export class RevisionSessionController {
   private finishAcknowledgment(pending: PendingOperation) {
     if (this.operation?.operation.operationId !== pending.operation.operationId)
       return false;
+    const episode = this.checkpointEpisode;
+    if (episode && pending.generation >= episode.generation) {
+      this.checkpointEpisode = {
+        ...episode,
+        coveragePending: false,
+        coveredGeneration: pending.generation,
+      };
+      if (this.state) this.confirmCheckpointResolution(this.state);
+      if (
+        this.checkpointEpisode?.waitOnly &&
+        !this.checkpointEpisode.protectedUi &&
+        !hasUiDrafts(this.adapter?.readUiDrafts() ?? {})
+      )
+        queueMicrotask(() => {
+          if (!this.stopped) void this.refresh();
+        });
+    }
     this.operation = null;
     this.persist();
     this.resumeIncoming();
     return true;
+  }
+  private confirmCheckpointResolution(state: SyncState<ComparisonReviewData>) {
+    const episode = this.checkpointEpisode;
+    if (
+      !episode ||
+      episode.coveredGeneration === undefined ||
+      episode.generation > episode.coveredGeneration ||
+      episode.protectedUi ||
+      hasUiDrafts(this.adapter?.readUiDrafts() ?? {})
+    )
+      return;
+    const saved = state.review.recoveryCheckpoints?.find(
+      (entry) =>
+        entry.id === episode.checkpointId ||
+        (entry.pageInstanceId === episode.pageInstanceId &&
+          entry.recoveryId === episode.recoveryId),
+    );
+    if (
+      !saved?.resolvedAt ||
+      (saved.generation ?? 0) > episode.coveredGeneration
+    )
+      return;
+    this.checkpointEpisode = undefined;
+    this.checkpointRecoveryId = undefined;
+    this.checkpointEntryId = undefined;
+    this.checkpointGeneration = -1;
+    this.checkpointSignature = "";
+    this.persist();
   }
   private async resolvePending() {
     const pending = this.operation;
@@ -1223,35 +1335,60 @@ export class RevisionSessionController {
     return false;
   }
   refresh = async (force = false): Promise<void> => {
-    if (this.refreshPromise && !force) return this.refreshPromise;
-    const work = (async () => {
+    if (this.stopped) return;
+    const reviewId = this.snapshot.session.id;
+    if (this.refreshPromise && this.refreshReviewId === reviewId && !force) {
+      this.refreshRequested = true;
+      return this.refreshPromise;
+    }
+    this.refreshRequested = false;
+    const current = () =>
+      !this.stopped &&
+      this.snapshot.session.id === reviewId &&
+      this.refreshPromise === work;
+    const work: Promise<void> = (async () => {
       try {
         const state = await this.api<SyncState<ComparisonReviewData>>(
-          `/${encodeURIComponent(this.snapshot.session.id)}/state`,
+          `/${encodeURIComponent(reviewId)}/state`,
           undefined,
           force ? undefined : this.state?.registryGeneration,
         );
+        if (!current()) return;
         if (state) await this.observe(state);
+        if (!current()) return;
         if (this.operation)
           await this.serialize(async () => {
-            if (await this.resolvePending()) this.schedule(0);
+            if (current() && (await this.resolvePending()) && current())
+              this.schedule(0);
           });
         if (
+          current() &&
           this.copyOperation &&
           !this.activeOperations.has(this.copyOperation.operation.operationId)
         )
           await this.checkCopyStatus();
       } catch (error) {
+        if (!current()) return;
         this.emit({
           recoveryError: `Updates are temporarily unavailable. Your work remains in this tab. ${errorMessage(error)}`,
         });
       }
     })();
+    this.refreshReviewId = reviewId;
     this.refreshPromise = work;
     try {
       await work;
     } finally {
-      if (this.refreshPromise === work) this.refreshPromise = null;
+      if (this.refreshPromise === work) {
+        const trailing = this.refreshRequested;
+        this.refreshPromise = null;
+        this.refreshReviewId = null;
+        this.refreshRequested = false;
+        // One follow-up covers the whole burst of hints received during this
+        // read. Further reads require another hint; a read cannot queue itself.
+        if (trailing && !this.stopped && this.snapshot.session.id === reviewId)
+          await this.refresh();
+      }
     }
   };
   private wait(
@@ -1260,11 +1397,30 @@ export class RevisionSessionController {
     state: SyncState<ComparisonReviewData> | null,
     merge?: SyncMerge,
   ) {
-    if (!this.snapshot.conflict) {
+    const uiDrafts =
+      this.adapter?.readUiDrafts() ?? this.recoveredUiDrafts ?? {};
+    if (!this.checkpointEpisode) {
       this.checkpointRecoveryId = randomId();
       this.checkpointSignature = "";
       this.checkpointGeneration = -1;
       this.checkpointEntryId = undefined;
+      this.checkpointEpisode = {
+        recoveryId: this.checkpointRecoveryId,
+        pageInstanceId: this.pageId,
+        generation: this.generation,
+        waitOnly: kind !== "conflict",
+        protectedUi: hasUiDrafts(uiDrafts),
+        coveragePending: true,
+      };
+    } else {
+      this.checkpointEpisode = {
+        ...this.checkpointEpisode,
+        generation: this.generation,
+        waitOnly: this.checkpointEpisode.waitOnly && kind !== "conflict",
+        protectedUi:
+          this.checkpointEpisode.protectedUi || hasUiDrafts(uiDrafts),
+        coveragePending: true,
+      };
     }
     const conflict: RevisionConflictState = {
       kind,
@@ -1420,16 +1576,29 @@ export class RevisionSessionController {
       if (!this.adapter?.rebasesBufferedDocument) this.adapter?.flush?.();
       const localBase = this.current;
       const acknowledgmentBase = pending.editorBase ?? pending.draft;
-      const merged: SyncMerge = sameReviewDraft(acknowledgmentBase, localBase)
-        ? {
-            status: "merged",
-            draft: state.draft,
-            conflicts: [],
-            signature: state.signature,
-          }
-        : await this.merge(acknowledgmentBase, localBase, state.draft, {
-            server: false,
-          });
+      const unchangedEditor = sameReviewDraft(acknowledgmentBase, localBase);
+      const nativePrepared = Boolean(
+        pending.editorBase &&
+          this.adapter?.rebasesBufferedDocument &&
+          sameReviewDraft(state.draft, pending.draft) &&
+          (unchangedEditor ||
+            !hasPreparedIdentityClash(
+              acknowledgmentBase,
+              localBase,
+              state.draft,
+            )),
+      );
+      const merged: SyncMerge =
+        unchangedEditor || nativePrepared
+          ? {
+              status: "merged",
+              draft: state.draft,
+              conflicts: [],
+              signature: state.signature,
+            }
+          : await this.merge(acknowledgmentBase, localBase, state.draft, {
+              server: false,
+            });
       if (this.acknowledged.includes(pending.operation.operationId))
         return true;
       if (merged.status !== "merged") {
@@ -1443,7 +1612,14 @@ export class RevisionSessionController {
         return false;
       }
       next = merged.draft as RevisionDraft;
-      if (!(await this.applyDraft(next, merged, state, localBase)))
+      if (
+        !(await this.applyDraft(
+          next,
+          merged,
+          state,
+          nativePrepared ? acknowledgmentBase : localBase,
+        ))
+      )
         return false;
       if (this.acknowledged.includes(pending.operation.operationId))
         return true;
@@ -1560,6 +1736,17 @@ export class RevisionSessionController {
       return true;
     };
     if (stale()) return;
+    this.confirmCheckpointResolution(state);
+    if (
+      !state.publishing &&
+      this.retryRevision !== null &&
+      state.revision > this.retryRevision
+    ) {
+      // A newer committed revision has released the turn that deferred us.
+      // Any newly acquired turn is still enforced by the next server request.
+      this.retryNotBefore = 0;
+      this.retryRevision = null;
+    }
     this.observeOverwrite(state.review);
     if (this.publicationTimer) clearTimeout(this.publicationTimer);
     this.publicationTimer = null;
@@ -1658,7 +1845,29 @@ export class RevisionSessionController {
       if (sameReviewDraft(incoming, this.base)) {
         this.base = state.draft as RevisionDraft;
         this.baseRevision = state.revision;
-        this.emit({ session: state.review, recoveryError: "" });
+        const waiting = this.snapshot.conflict;
+        const resumed =
+          waiting &&
+          (waiting.kind === "file" || waiting.kind === "waiting") &&
+          !waiting.conflicts.length &&
+          !waiting.storagePressure &&
+          !this.operation &&
+          !this.copyOperation &&
+          !this.snapshot.copyLocked;
+        this.emit({
+          session: state.review,
+          recoveryError: "",
+          ...(resumed
+            ? {
+                conflict: null,
+                writePaused: false,
+                reviewChanged: false,
+                recoveryPending:
+                  diskChanged || !sameReviewDraft(this.current, this.base),
+              }
+            : {}),
+        });
+        if (resumed) this.persist();
         if (
           diskChanged ||
           !sameReviewDraft(this.current, this.base) ||
@@ -1769,6 +1978,23 @@ export class RevisionSessionController {
       JSON.stringify(this.adapter?.readUiDrafts() ?? {})
     );
   }
+  private coveredWaitCheckpoint(generation: number) {
+    const episode = this.checkpointEpisode;
+    if (
+      !episode?.waitOnly ||
+      episode.protectedUi ||
+      generation < episode.generation ||
+      hasUiDrafts(this.adapter?.readUiDrafts() ?? {})
+    )
+      return {};
+    return {
+      coveredCheckpoint: {
+        recoveryId: episode.recoveryId,
+        pageInstanceId: episode.pageInstanceId,
+        generation: episode.generation,
+      },
+    };
+  }
   private scheduleCheckpoint() {
     if (this.checkpointTimer || this.stopped) return;
     this.checkpointTimer = setTimeout(() => {
@@ -1777,10 +2003,10 @@ export class RevisionSessionController {
     }, 300);
   }
   private async checkpoint(latest = false): Promise<void> {
-    if (!this.snapshot.conflict) return;
+    if (!this.snapshot.conflict && !this.checkpointEpisode) return;
     if (this.checkpointPromise) {
       await this.checkpointPromise;
-      if (!this.snapshot.conflict) return;
+      if (!this.snapshot.conflict && !this.checkpointEpisode) return;
       if (latest) return this.checkpoint(true);
       if (
         this.checkpointSignature !== this.checkpointContentSignature() ||
@@ -1795,22 +2021,33 @@ export class RevisionSessionController {
       signature === this.checkpointSignature &&
       generation === this.checkpointGeneration
     ) {
-      this.emit({
-        conflict: {
-          ...this.snapshot.conflict,
-          checkpointId: this.checkpointEntryId,
-          checkpointSaved: true,
-        },
-      });
+      if (this.snapshot.conflict)
+        this.emit({
+          conflict: {
+            ...this.snapshot.conflict,
+            checkpointId: this.checkpointEntryId,
+            checkpointSaved: true,
+          },
+        });
       return;
     }
     const workingDraft = this.current;
     const uiDrafts = this.adapter?.readUiDrafts() ?? {};
     this.checkpointRecoveryId ??= randomId();
     const recoveryId = this.checkpointRecoveryId;
-    this.emit({
-      conflict: { ...this.snapshot.conflict, checkpointSaved: false },
-    });
+    if (this.checkpointEpisode)
+      this.checkpointEpisode = {
+        ...this.checkpointEpisode,
+        generation,
+        protectedUi:
+          this.checkpointEpisode.protectedUi || hasUiDrafts(uiDrafts),
+        coveragePending: true,
+      };
+    this.persist();
+    if (this.snapshot.conflict)
+      this.emit({
+        conflict: { ...this.snapshot.conflict, checkpointSaved: false },
+      });
     let succeeded = false;
     this.checkpointPromise = (async () => {
       try {
@@ -1819,9 +2056,10 @@ export class RevisionSessionController {
           storagePressure?: boolean;
         }>(`/${encodeURIComponent(this.snapshot.session.id)}/checkpoint`, {
           operationId: randomId(),
-          pageInstanceId: this.pageId,
+          pageInstanceId: this.checkpointEpisode?.pageInstanceId ?? this.pageId,
           conflictId: this.snapshot.conflict?.signature,
           recoveryId,
+          automaticWait: this.checkpointEpisode?.waitOnly === true,
           generation,
           workingDraft,
           uiDrafts,
@@ -1830,11 +2068,29 @@ export class RevisionSessionController {
             disk: this.state?.disk,
           },
         });
-        if (result && this.checkpointRecoveryId === recoveryId) {
+        if (
+          result &&
+          !this.stopped &&
+          this.checkpointRecoveryId === recoveryId
+        ) {
           succeeded = true;
           this.checkpointSignature = signature;
           this.checkpointGeneration = generation;
           this.checkpointEntryId = result.checkpointId;
+          if (this.checkpointEpisode)
+            this.checkpointEpisode = {
+              ...this.checkpointEpisode,
+              checkpointId: result.checkpointId,
+              coveragePending: true,
+            };
+          this.persist();
+          if (
+            !this.snapshot.conflict &&
+            this.checkpointEpisode?.waitOnly &&
+            !this.checkpointEpisode.protectedUi &&
+            !hasUiDrafts(this.adapter?.readUiDrafts() ?? {})
+          )
+            this.schedule(0);
           if (this.snapshot.conflict)
             this.emit({
               recoveryError: this.snapshot.recoveryError.startsWith(
@@ -1863,7 +2119,7 @@ export class RevisionSessionController {
     await this.checkpointPromise;
     if (
       succeeded &&
-      this.snapshot.conflict &&
+      (this.snapshot.conflict || this.checkpointEpisode) &&
       (signature !== this.checkpointContentSignature() ||
         generation !== this.generation)
     ) {
@@ -1900,6 +2156,13 @@ export class RevisionSessionController {
         this.projectionReady = true;
         this.emit({ draft: normalized });
       }
+      if (
+        this.snapshot.writePaused &&
+        this.snapshot.conflict?.kind === "conflict"
+      ) {
+        await this.checkpoint();
+        return false;
+      }
       if (this.operation && !(await this.resolvePending())) return false;
       if (this.snapshot.writePaused || this.snapshot.copyLocked) {
         await this.checkpoint();
@@ -1910,7 +2173,11 @@ export class RevisionSessionController {
         sameReviewDraft(this.current, this.base) &&
         !this.needsFileWrite(this.state) &&
         !this.state.review.targetChanged &&
-        !this.state.review.liveSourceChanged
+        !this.state.review.liveSourceChanged &&
+        !(
+          this.checkpointEpisode?.coveragePending &&
+          "coveredCheckpoint" in this.coveredWaitCheckpoint(this.generation)
+        )
       ) {
         this.emit({ recoveryPending: false });
         return true;
@@ -1976,6 +2243,7 @@ export class RevisionSessionController {
           (!adoptedDisk || reason === "resolve" || reason === "recreate") &&
           (reason === "recreate" || this.needsFileWrite(state, snapshot)),
         localGeneration: generation,
+        ...this.coveredWaitCheckpoint(generation),
         reason: requestReason,
         resolution,
         comment,
@@ -2317,6 +2585,14 @@ export class RevisionSessionController {
       this.adapter?.flush?.();
       const conflict = this.snapshot.conflict;
       if (!conflict || conflict.kind !== "conflict") return false;
+      const ownResult =
+        this.operation &&
+        conflict.state?.review.lastOperation?.id ===
+          this.operation.operation.operationId
+          ? this.operation
+          : null;
+      const resolutionBase =
+        ownResult?.editorBase ?? ownResult?.draft ?? this.base;
       if (conflict.signature !== inspectedSignature)
         throw new Error(
           "The overlapping changes changed. Inspect the refreshed comparison before confirming.",
@@ -2339,7 +2615,7 @@ export class RevisionSessionController {
         );
         return false;
       }
-      const check = await this.merge(this.base, this.current, incoming, {
+      const check = await this.merge(resolutionBase, this.current, incoming, {
         server: false,
       });
       if (
@@ -2371,7 +2647,7 @@ export class RevisionSessionController {
         throw new Error(
           "The incoming recovery copy must be saved before replacing overlapping changes.",
         );
-      const merged = await this.merge(this.base, this.current, incoming, {
+      const merged = await this.merge(resolutionBase, this.current, incoming, {
         server: false,
         resolution: choice,
       });
@@ -2381,6 +2657,19 @@ export class RevisionSessionController {
         !(await this.applyDraft(merged.draft as RevisionDraft, merged, fresh))
       )
         return false;
+      if (ownResult) {
+        // The committed own result is now represented in the resolved editor.
+        // Keep every retry based on this inspected authoritative version.
+        this.base = fresh.draft as RevisionDraft;
+        this.baseRevision = fresh.revision;
+        this.acknowledge(ownResult.operation.operationId);
+        if (
+          this.operation?.operation.operationId ===
+          ownResult.operation.operationId
+        )
+          this.operation = null;
+        this.persist();
+      }
       this.emit({ writePaused: false });
       const result = await this.commit("resolve", {
         signature: inspectedSignature,
@@ -2637,7 +2926,11 @@ export class RevisionSessionController {
       if (result.status === "committed" && result.state) {
         this.acknowledge(identity.operationId);
         this.copyOperation = null;
-        if (this.snapshot.copyLocked && generation === this.generation)
+        if (
+          this.snapshot.copyLocked &&
+          generation === this.generation &&
+          sameReviewDraft(this.current, snapshot)
+        )
           this.switchToCopy(result, snapshot);
         else {
           this.deferredCopy = result;
@@ -2680,6 +2973,8 @@ export class RevisionSessionController {
     this.checkpointEntryId = undefined;
     this.checkpointSignature = "";
     this.checkpointGeneration = -1;
+    this.checkpointRecoveryId = undefined;
+    this.checkpointEpisode = undefined;
     this.copyPath = undefined;
     this.emit({
       session: state.review,
@@ -2713,13 +3008,7 @@ export class RevisionSessionController {
           ).href;
       window.history.replaceState(null, "", url);
     }
-    if (this.started) {
-      this.unsubscribe?.();
-      this.unsubscribe = subscribeReviewChanges(state.review.id, (notice) => {
-        if (notice.state) void this.observe(notice.state);
-        else if (notice.reason !== "heartbeat") void this.refresh();
-      });
-    }
+    if (this.started) this.subscribeToReview(state.review.id);
     void captured;
   }
   run = async (

@@ -1,4 +1,5 @@
 import {
+  mergeReviewDrafts,
   type ReconcileRequest,
   reviewDraftSignature,
   type SyncResult,
@@ -300,4 +301,77 @@ test("an unknown copy remains the same recoverable operation across reload and b
   expect(copies).toHaveLength(1);
   expect(resolved.length).toBeGreaterThan(0);
   expect(resolved.every((id) => id === copies[0].operationId)).toBe(true);
+});
+
+test("a queued copy cannot replace a newer incoming document that did not change the local generation", async () => {
+  const initial = state();
+  let server = initial;
+  const merging = gate<void>();
+  const released = gate<void>();
+  let held = false;
+  const copies: Array<{ workingDraft: RevisionDraft; operationId: string }> =
+    [];
+  const controller = new RevisionSessionController(
+    initial.review,
+    initial.draft as RevisionDraft,
+    {
+      request: async <T>(path: string, body?: object) => {
+        if (path.endsWith("/copy")) {
+          const captured = body as {
+            workingDraft: RevisionDraft;
+            operationId: string;
+          };
+          copies.push(captured);
+          return copyResult(captured.workingDraft, captured.operationId) as T;
+        }
+        if (!body) return structuredClone(server) as T;
+        if (path.endsWith("/checkpoint"))
+          return { checkpointId: "checkpoint" } as T;
+        throw new Error(`Unexpected ${path}`);
+      },
+      merge: async (base, local, incoming, options) => {
+        const result = mergeReviewDrafts(base, local, incoming, options);
+        if (!held) {
+          held = true;
+          merging.resolve();
+          await released.promise;
+        }
+        return result;
+      },
+      storage: new MemoryStorage(),
+      tabStorage: new MemoryStorage(),
+    },
+  );
+  active.push(controller);
+  controller.setAdapter({
+    apply: (value) => ({
+      ...value,
+      cleanMarkdown: value.cleanMarkdown ?? value.markdown,
+    }),
+    adopt: () => null,
+    readUiDrafts: () => ({}),
+    restoreUiDrafts: () => {},
+  });
+  controller.start();
+  await vi.advanceTimersByTimeAsync(0);
+  server = state(
+    draft("The saved review.\n\nNew peer paragraph.\n"),
+    "original",
+    2,
+  );
+  const refreshing = controller.refresh(true);
+  await merging.promise;
+  const copied = controller.copy("/saved-copy.md", true);
+  released.resolve();
+  await refreshing;
+  await copied;
+  expect(copies).toHaveLength(1);
+  expect(copies[0].workingDraft.markdown).toBe(initial.draft.markdown);
+  expect(controller.getSnapshot().session.id).toBe("original");
+  expect(controller.readDraft().markdown).toContain("New peer paragraph.");
+  expect(await controller.checkCopyStatus()).toMatchObject({
+    status: "committed",
+    savedPath: "/saved-copy.md",
+    state: { draft: { markdown: initial.draft.markdown } },
+  });
 });

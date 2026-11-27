@@ -36,9 +36,9 @@ import {
   ReviewBaseCache,
   ReviewReservations,
 } from "./comparison-sync-cache.js";
+import { transferSyncResponse } from "./comparison-sync-transfer.js";
 import { logServerEvent } from "./diagnostics.js";
 import { DocumentWatcherRegistry } from "./document-watchers.js";
-import { transferSyncResponse } from "./comparison-sync-transfer.js";
 
 export type ComparisonMode = "proposal" | "applied" | "compare" | "document";
 export type ComparisonDecision = "pending" | "before" | "after";
@@ -158,6 +158,8 @@ export interface Comparison {
   recoveryCheckpoints?: Array<{
     id: string;
     generation: number;
+    pageInstanceId?: string;
+    recoveryId?: string;
     reason: string;
     kind?: "copy-feedback" | "automatic";
     bytes?: number;
@@ -171,6 +173,7 @@ export interface Comparison {
 interface StoredComparison
   extends Omit<Comparison, "targetChanged" | "recoveredReviews"> {
   targetVersion: string | null;
+  abandonedCopy?: { checkpointId: string };
   lastOperation?: { id: string; pageInstanceId: string; reason: string };
   operationOutcomes?: Record<
     string,
@@ -1216,6 +1219,7 @@ export class ComparisonStore {
             return true;
           throw error;
         }
+        if (review.abandonedCopy) return this.pruneAbandonedCopy(review);
         const outcomes = review.operationOutcomes;
         const marker = outcomes?.[record.operation.pageInstanceId];
         if (
@@ -1237,6 +1241,60 @@ export class ComparisonStore {
         });
       return false;
     }
+  }
+  private pruneAbandonedCopy(review: StoredComparison): boolean {
+    const parent = review.recoveredFrom;
+    const checkpointId = review.abandonedCopy?.checkpointId;
+    if (
+      !parent ||
+      !checkpointId ||
+      review.pendingPublication ||
+      review.pendingSave ||
+      review.pendingApply ||
+      review.feedback
+    )
+      return false;
+    const preserved = this.readCheckpoint(parent, checkpointId) as {
+      workingDraft: SyncDraft;
+      uiDrafts?: Record<string, unknown>;
+    };
+    if (!sameReviewDraft(this.syncDraft(review), preserved.workingDraft))
+      return false;
+    const privateFeedback = JSON.stringify(preserved.uiDrafts ?? {});
+    for (const entry of this.checkpoints(review.id)) {
+      const owned = this.readCheckpoint(review.id, entry.id) as {
+        entryDraft: SyncDraft;
+        workingDraft: SyncDraft;
+        uiDrafts?: Record<string, unknown>;
+        entryUiDrafts?: Record<string, unknown>;
+      };
+      if (
+        !sameReviewDraft(owned.entryDraft, preserved.workingDraft) ||
+        !sameReviewDraft(owned.workingDraft, preserved.workingDraft) ||
+        JSON.stringify(owned.uiDrafts ?? {}) !== privateFeedback ||
+        JSON.stringify(owned.entryUiDrafts ?? {}) !== privateFeedback
+      )
+        return false;
+    }
+    // Exact prune coverage is already durable. The original review's existing
+    // recovery system retains every candidate byte and private draft first.
+    fs.rmSync(path.join(this.watchChildren(parent), review.id), {
+      force: true,
+    });
+    syncDirectory(this.watchChildren(parent));
+    fs.rmSync(path.join(this.directory, "checkpoints", review.id), {
+      recursive: true,
+      force: true,
+    });
+    syncDirectory(path.join(this.directory, "checkpoints"));
+    fs.rmSync(this.checkpointIndex(review.id), { force: true });
+    fs.rmSync(this.filename(review.id), { force: true });
+    this.ownRecords.delete(review.id);
+    this.checkpointLists.delete(review.id);
+    this.watchers.invalidate(this.filename(review.id));
+    syncDirectory(this.directory);
+    log("abandoned-copy-pruned", { id: review.id, parent, checkpointId });
+    return true;
   }
   private outcome(
     review: StoredComparison,
@@ -1991,6 +2049,44 @@ export class ComparisonStore {
               });
             }
         }
+        const covered =
+          body.coveredCheckpoint &&
+          typeof body.coveredCheckpoint === "object" &&
+          !Array.isArray(body.coveredCheckpoint)
+            ? (body.coveredCheckpoint as Record<string, unknown>)
+            : {};
+        if (
+          typeof covered.recoveryId === "string" &&
+          typeof covered.pageInstanceId === "string" &&
+          typeof covered.generation === "number" &&
+          Number.isSafeInteger(covered.generation) &&
+          covered.generation >= 0 &&
+          covered.generation <= request.localGeneration
+        ) {
+          const checkpointId = hash(
+            `${id}:${covered.pageInstanceId}:${covered.recoveryId}`,
+          );
+          try {
+            const checkpoint = this.readCheckpoint(id, checkpointId) as {
+              automaticWait?: boolean;
+              pageInstanceId?: string;
+              conflictId?: string;
+            };
+            if (
+              checkpoint.automaticWait === true &&
+              checkpoint.pageInstanceId === covered.pageInstanceId &&
+              checkpoint.conflictId === covered.recoveryId
+            )
+              this.resolveCheckpoint(id, checkpointId, covered.generation);
+          } catch (error) {
+            if (!(error instanceof ComparisonError && error.status === 404))
+              log("checkpoint-resolution-deferred", {
+                id,
+                checkpointId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+          }
+        }
         log("sync-committed", {
           id,
           operationId: operation.operationId,
@@ -2102,6 +2198,9 @@ export class ComparisonStore {
         pageInstanceId: page,
         conflictId: conflict,
         generation,
+        automaticWait:
+          body.automaticWait === true &&
+          (!previous || previous.automaticWait === true),
         reason: stringField(body, "reason") ?? "Unsaved conflict recovery",
         kind:
           body.kind === "copy-feedback"
@@ -2129,6 +2228,8 @@ export class ComparisonStore {
       list.push({
         id: checkpointId,
         generation,
+        pageInstanceId: page,
+        ...(recoveryId ? { recoveryId } : {}),
         reason: snapshot.reason,
         ...(snapshot.kind ? { kind: snapshot.kind } : {}),
         bytes: Buffer.byteLength(serialized),
@@ -2513,6 +2614,7 @@ export class ComparisonStore {
       delete copy.operationOutcomes;
       delete copy.lastOperation;
       delete copy.lastOverwrite;
+      delete copy.abandonedCopy;
       this.installDraft(copy, draft);
       const record = this.operations.begin(operation, copy.id);
       // The accepted operation already names the new review. Persist its intent
@@ -2613,8 +2715,35 @@ export class ComparisonStore {
           error instanceof FileChangedError ||
           (error instanceof ComparisonError && error.status === 409)
         ) {
+          const preserved = this.checkpoint(id, {
+            pageInstanceId: operation.pageInstanceId,
+            conflictId: `failed-copy-${operation.operationId}`,
+            generation:
+              typeof body.generation === "number" ? body.generation : 0,
+            workingDraft: draft,
+            uiDrafts: body.uiDrafts ?? {},
+            kind: "copy-feedback",
+            reason: "Unfinished feedback from a failed separate save",
+          });
           delete copy.pendingPublication;
+          // Retain the candidate and private feedback for operation recovery,
+          // but a definite failure owns no saved copy or autosave destination.
+          copy.abandonedCopy = { checkpointId: preserved.checkpointId };
+          copy.destinationPath = null;
+          copy.destinationVersion = null;
+          copy.liveSourcePath = undefined;
+          copy.liveSourceVersion = null;
+          copy.savedPath = null;
+          copy.savedText = null;
+          copy.autosave = "none";
           this.save(copy);
+          log("copy-abandoned", {
+            id,
+            copyId: copy.id,
+            operationId: operation.operationId,
+            destinationPath: destination.path,
+            message: error instanceof Error ? error.message : String(error),
+          });
           this.operations.prepare(record, {
             status: "rejected",
             state: this.state(id, original),
@@ -2968,6 +3097,13 @@ export class ComparisonStore {
       syncDirectory(this.directory);
     atomicWrite(path.join(children, child), "");
   }
+  private isVisibleRecovery(review: StoredComparison): boolean {
+    return (
+      !review.abandonedCopy &&
+      !review.pendingPublication &&
+      (!review.destinationPath || Boolean(review.savedPath))
+    );
+  }
   watch(id: string): StoredComparison {
     const root = this.readReview(id);
     if (root.editor !== "unified") return root;
@@ -2980,6 +3116,7 @@ export class ComparisonStore {
       const review = next === id ? root : this.loadIndexedReview(next);
       if (!review) continue;
       if (
+        this.isVisibleRecovery(review) &&
         review.feedback &&
         review.feedback.sentAt > (latest.feedback?.sentAt ?? "")
       )
@@ -3166,6 +3303,7 @@ export class ComparisonStore {
       pendingApply: _pendingApply,
       pendingSave: _pendingSave,
       pendingPublication: _pendingPublication,
+      abandonedCopy: _abandonedCopy,
       operationOutcomes: _operationOutcomes,
       ...result
     } = review;
@@ -3211,7 +3349,7 @@ export class ComparisonStore {
           const child = this.loadIndexedReview(id);
           if (!child) continue;
           pending.push(child.id);
-          if (child.recoveredFrom === parent)
+          if (child.recoveredFrom === parent && this.isVisibleRecovery(child))
             recoveredReviews.push(
               this.view(child, false, false, includeRecoveryFeedback),
             );

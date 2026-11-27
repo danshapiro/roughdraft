@@ -26,12 +26,12 @@ import {
   containsReviewIdentity,
   resolvePrivateCommentAnchor,
 } from "./revision-private-anchors";
+import { rebaseRemoteTransaction } from "./revision-remote-steps";
 import {
   type RevisionDraft,
   RevisionSessionController,
 } from "./revision-session";
 import { RevisionSource } from "./revision-source";
-import { rebaseRemoteTransaction } from "./revision-remote-steps";
 import { RevisionUiDraftStore } from "./revision-ui-drafts";
 
 const notifications = vi.hoisted(
@@ -278,7 +278,7 @@ for (const newerNotice of [false, true]) {
   test.each([
     "response-first",
     "echo-first",
-  ] as const)(`simultaneous own %s acknowledgment applies one native delta while typing stays buffered (newer notice: ${newerNotice})`, async (order) => {
+  ] as const)(`simultaneous server-merged own %s acknowledgment applies one native delta while typing stays buffered (newer notice: ${newerNotice})`, async (order) => {
     const schema = getSchema([...createEditorExtensions(""), RevisionSource]);
     const native = (markdown: string) =>
       EditorState.create({
@@ -322,6 +322,17 @@ for (const newerNotice of [false, true]) {
       }
       server = commit(server, sent);
       if (!release) {
+        // Exact prepared results use the native path; retain a server-merged
+        // result here so the asynchronous acknowledgment race stays covered.
+        const changed = draft(
+          server.draft.markdown.replace("Peer: ", "Peer: server "),
+        );
+        server = {
+          ...server,
+          draft: changed,
+          signature: reviewDraftSignature(changed),
+          review: { ...server.review, draft: changed },
+        };
         committed = structuredClone(server);
         holdMerges = true;
         return await new Promise<T>((resolve) => {
@@ -449,7 +460,7 @@ for (const newerNotice of [false, true]) {
     releaseTrailing?.();
     await vi.advanceTimersByTimeAsync(0);
     expect(editor.doc.firstChild?.textContent).toBe(
-      `${newerNotice ? "Latest peer" : "Peer"}: abcdefghijabcdefghijabcd.`,
+      `${newerNotice ? "Latest peer" : "Peer"}: server abcdefghijabcdefghijabcd.`,
     );
     expect(editor.doc.lastChild?.textContent).toBe(
       "Mine: ready. One. Two. Three.",
@@ -526,7 +537,22 @@ for (const reserved of [false, true]) {
     controller.setAdapter({
       rebasesBufferedDocument: true,
       prepare: (value) => ({ ...value, cleanMarkdown: value.markdown }),
-      apply: (value) => ({ ...value, cleanMarkdown: value.markdown }),
+      apply: (value, options) => {
+        const merged = options?.localBase
+          ? mergeReviewDrafts(
+              options.localBase,
+              controller.readDraft(),
+              value,
+              { server: false, budgetMs: 1000 },
+            )
+          : { status: "merged", draft: value };
+        return merged.status === "merged"
+          ? ({
+              ...merged.draft,
+              cleanMarkdown: merged.draft.markdown,
+            } as RevisionDraft)
+          : null;
+      },
       adopt: () => null,
       readUiDrafts: ui.read,
       restoreUiDrafts: ui.restore,

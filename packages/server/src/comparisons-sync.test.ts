@@ -1227,13 +1227,19 @@ describe("guarded live review reconciliation", () => {
     ).toEqual([]);
   });
 
-  it("does not report a separate copy saved when a newer file edit arrives after publication", async () => {
+  it.each([
+    "before-link",
+    "after-link",
+  ])("does not report a separate copy saved when a newer file edit arrives %s", async (arrival) => {
     const base = await open();
     const destination = path.join(root, "copy-d2.md");
     const link = fs.linkSync.bind(fs);
     vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      if (to === destination && arrival === "before-link")
+        fs.writeFileSync(destination, "New agent D2");
       link(from, to);
-      if (to === destination) fs.writeFileSync(destination, "New agent D2");
+      if (to === destination && arrival === "after-link")
+        fs.writeFileSync(destination, "New agent D2");
     });
     const copied = await api()
       .post(`/api/comparisons/${base.review.id}/copy`)
@@ -1243,10 +1249,246 @@ describe("guarded live review reconciliation", () => {
         workingDraft: draft(base, "Browser D1"),
         path: destination,
         relativeLinksAcknowledged: true,
+        uiDrafts: { reply: "Unsent private copy feedback" },
       });
     expect(copied.body.status).toBe("rejected");
     expect(fs.readFileSync(destination, "utf8")).toBe("New agent D2");
     expect(fs.readFileSync(target, "utf8")).toBe(original);
+    const originalReview = await api().get(
+      `/api/comparisons/${base.review.id}`,
+    );
+    expect(originalReview.body.recoveredReviews ?? []).toEqual([]);
+    const record = JSON.parse(
+      fs.readFileSync(
+        path.join(root, "comparisons", "operations", "copy-d2.json"),
+        "utf8",
+      ),
+    );
+    const abandoned = await api().get(`/api/comparisons/${record.reviewId}`);
+    expect(abandoned.body).toMatchObject({
+      destinationPath: null,
+      savedPath: null,
+      autosave: "none",
+      draft: { markdown: "Browser D1", cleanMarkdown: "Browser D1" },
+    });
+    expect(abandoned.body.recoveryCheckpoints).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          uiDrafts: { reply: "Unsent private copy feedback" },
+        }),
+      ]),
+    );
+    host.dispose();
+    host = freshHost();
+    expect(
+      (await api().get(`/api/comparisons/${base.review.id}`)).body
+        .recoveredReviews ?? [],
+    ).toEqual([]);
+    expect(
+      (await api().get("/api/comparisons/operations/copy-d2")).body.status,
+    ).toBe("rejected");
+    expect(fs.readFileSync(destination, "utf8")).toBe("New agent D2");
+    const kept = (
+      await api().get(`/api/comparisons/${base.review.id}`)
+    ).body.recoveryCheckpoints.find(
+      (entry: { reason: string }) =>
+        entry.reason === "Unfinished feedback from a failed separate save",
+    );
+    expect(kept).toBeTruthy();
+    const journal = path.join(
+      root,
+      "comparisons",
+      "operations",
+      "copy-d2.json",
+    );
+    const expired = JSON.parse(fs.readFileSync(journal, "utf8"));
+    expired.createdAt = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    fs.writeFileSync(journal, JSON.stringify(expired));
+    const latest = (await api().get(`/api/comparisons/${base.review.id}/state`))
+      .body;
+    await api()
+      .post(`/api/comparisons/${base.review.id}/reconcile`)
+      .send({
+        ...payload(latest, latest.draft, "after-retention", "another-page"),
+        writeFile: false,
+      });
+    expect(fs.existsSync(journal)).toBe(false);
+    expect(
+      fs.existsSync(path.join(root, "comparisons", `${record.reviewId}.json`)),
+    ).toBe(false);
+    expect(
+      fs.existsSync(
+        path.join(
+          root,
+          "comparisons",
+          `watch-${base.review.id}`,
+          record.reviewId,
+        ),
+      ),
+    ).toBe(false);
+    const preserved = await api().get(
+      `/api/comparisons/${base.review.id}/checkpoints/${kept.id}`,
+    );
+    expect(preserved.body).toMatchObject({
+      workingDraft: { markdown: "Browser D1" },
+      uiDrafts: { reply: "Unsent private copy feedback" },
+    });
+    expect(
+      (await api().get("/api/comparisons/operations/copy-d2")).body.status,
+    ).toBe("indeterminate");
+    expect(fs.readFileSync(destination, "utf8")).toBe("New agent D2");
+  });
+
+  it("retains a failed copy privately if preserving its original recovery checkpoint fails", async () => {
+    const base = await open();
+    const destination = path.join(root, "copy-no-space.md");
+    const link = fs.linkSync.bind(fs);
+    const rename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      link(from, to);
+      if (to === destination) fs.writeFileSync(destination, "New agent D2");
+    });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (
+        path.dirname(String(to)) ===
+        path.join(root, "comparisons", "checkpoints", base.review.id)
+      )
+        throw Object.assign(new Error("Recovery storage full"), {
+          code: "ENOSPC",
+        });
+      rename(from, to);
+    });
+    const failed = await api()
+      .post(`/api/comparisons/${base.review.id}/copy`)
+      .send({
+        ...operation(base, "copy-no-space"),
+        generation: 1,
+        workingDraft: draft(base, "Unique failed candidate"),
+        path: destination,
+        relativeLinksAcknowledged: true,
+        uiDrafts: { reply: "Unique private feedback" },
+      });
+    expect(failed.status).toBe(500);
+    vi.restoreAllMocks();
+    const record = JSON.parse(
+      fs.readFileSync(
+        path.join(root, "comparisons", "operations", "copy-no-space.json"),
+        "utf8",
+      ),
+    );
+    expect(
+      fs.existsSync(path.join(root, "comparisons", `${record.reviewId}.json`)),
+    ).toBe(true);
+    expect(
+      (await api().get(`/api/comparisons/${base.review.id}`)).body
+        .recoveredReviews ?? [],
+    ).toEqual([]);
+    expect(
+      (await api().get("/api/comparisons/operations/copy-no-space")).body
+        .status,
+    ).not.toBe("committed");
+    await api().post(`/api/comparisons/${record.reviewId}/recover`).send({});
+    expect(
+      (await api().get(`/api/comparisons/${base.review.id}`)).body
+        .recoveredReviews ?? [],
+    ).toEqual([]);
+    expect(fs.readFileSync(destination, "utf8")).toBe("New agent D2");
+    const retained = await api().get(`/api/comparisons/${record.reviewId}`);
+    expect(retained.body.draft.markdown).toBe("Unique failed candidate");
+    expect(retained.body.recoveryCheckpoints).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          uiDrafts: { reply: "Unique private feedback" },
+        }),
+      ]),
+    );
+  });
+
+  it.each([
+    "document",
+    "private feedback",
+  ])("abandoned-copy retention preserves later unique %s", async (changed) => {
+    const base = await open();
+    const destination = path.join(root, "copy-retained.md");
+    const link = fs.linkSync.bind(fs);
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      link(from, to);
+      if (to === destination) fs.writeFileSync(destination, "New agent D2");
+    });
+    await api()
+      .post(`/api/comparisons/${base.review.id}/copy`)
+      .send({
+        ...operation(base, "retained-copy"),
+        generation: 1,
+        workingDraft: draft(base, "Initial failed candidate"),
+        path: destination,
+        relativeLinksAcknowledged: true,
+        uiDrafts: { reply: "Initial private feedback" },
+      });
+    vi.restoreAllMocks();
+    const journal = path.join(
+      root,
+      "comparisons",
+      "operations",
+      "retained-copy.json",
+    );
+    const record = JSON.parse(fs.readFileSync(journal, "utf8"));
+    const reviewFile = path.join(
+      root,
+      "comparisons",
+      `${record.reviewId}.json`,
+    );
+    const copy = JSON.parse(fs.readFileSync(reviewFile, "utf8"));
+    let privateFile: string | undefined;
+    if (changed === "document") {
+      copy.draft.markdown = copy.draft.cleanMarkdown = "Later unique candidate";
+      fs.writeFileSync(reviewFile, JSON.stringify(copy));
+    } else {
+      const entries = JSON.parse(
+        fs.readFileSync(
+          path.join(root, "comparisons", `recovery-${copy.id}.json`),
+          "utf8",
+        ),
+      );
+      privateFile = path.join(
+        root,
+        "comparisons",
+        "checkpoints",
+        copy.id,
+        `${entries[0].id}.json`,
+      );
+      const value = JSON.parse(fs.readFileSync(privateFile, "utf8"));
+      value.uiDrafts.reply = "Later unique private feedback";
+      fs.writeFileSync(privateFile, JSON.stringify(value));
+    }
+    record.createdAt = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    fs.writeFileSync(journal, JSON.stringify(record));
+    host.dispose();
+    host = freshHost();
+    const latest = (await api().get(`/api/comparisons/${base.review.id}/state`))
+      .body;
+    await api()
+      .post(`/api/comparisons/${base.review.id}/reconcile`)
+      .send({
+        ...payload(latest, latest.draft, "cleanup-attempt", "another-page"),
+        writeFile: false,
+      });
+    expect(fs.existsSync(journal)).toBe(true);
+    expect(fs.existsSync(reviewFile)).toBe(true);
+    if (changed === "document")
+      expect(
+        JSON.parse(fs.readFileSync(reviewFile, "utf8")).draft.markdown,
+      ).toBe("Later unique candidate");
+    else
+      expect(
+        JSON.parse(fs.readFileSync(privateFile as string, "utf8")).uiDrafts
+          .reply,
+      ).toBe("Later unique private feedback");
+    expect(
+      (await api().get("/api/comparisons/operations/retained-copy")).body
+        .status,
+    ).toBe("rejected");
+    expect(fs.readFileSync(destination, "utf8")).toBe("New agent D2");
   });
 
   it("keeps History remapping and detached-comment fields through ordinary sync and old-client omission", async () => {

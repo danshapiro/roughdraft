@@ -8,8 +8,8 @@ import {
 } from "@roughdraft/rfm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { ComparisonReviewData } from "./comparison-types";
-import { cleanRevisionSourceMarkdown } from "./revision-markdown";
 import { decodeBrowserRecovery } from "./revision-browser-recovery";
+import { cleanRevisionSourceMarkdown } from "./revision-markdown";
 import {
   type RevisionDraft,
   type RevisionRemoteAdapter,
@@ -367,16 +367,16 @@ test("an idle peer update reflects normally without preparing or publishing a ca
   expect(testbed.controller.readDraft().markdown).toBe(peer);
 });
 
-test("an active peer wait keeps its deadline while a fresh peer update reflects", async () => {
+test("an active peer wait keeps its deadline on an unchanged saved state", async () => {
   const testbed = install({ rejectFirst: true });
   await vi.advanceTimersByTimeAsync(0);
   testbed.type(local);
   expect(await testbed.controller.flush(false)).toBe(false);
   await vi.advanceTimersByTimeAsync(100);
   testbed.events.length = 0;
-  testbed.incoming(peer, 2);
+  testbed.incoming(source, 1);
   await vi.advanceTimersByTimeAsync(0);
-  expect(testbed.events).toEqual(["reflect"]);
+  expect(testbed.events).toEqual([]);
   expect(testbed.sent).toHaveLength(1);
   await vi.advanceTimersByTimeAsync(649);
   expect(testbed.sent).toHaveLength(1);

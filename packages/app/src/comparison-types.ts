@@ -101,6 +101,10 @@ export interface ComparisonReviewData {
   operationContext?: SyncContext;
   recoveryCheckpoints?: Array<{
     id: string;
+    generation?: number;
+    pageInstanceId?: string;
+    recoveryId?: string;
+    resolvedAt?: string;
     reason: string;
     updatedAt: string;
     draft?: SyncDraft;
