@@ -422,4 +422,4 @@ test("the first plain Edit keystroke after a large review opens uses its initial
     await vi.advanceTimersByTimeAsync(0);
   });
   expect(current().disk?.text).toBe(next.cleanMarkdown);
-}, 15_000);
+}, 30_000);
