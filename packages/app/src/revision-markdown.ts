@@ -209,6 +209,19 @@ export function createSourceSpellingPreserver(
       let end = removed
         ? (sourceIndices[at + removed.length - 1] ?? -1) + 1
         : start;
+      if (!removed && before[at - 1] === "\n" && before[at] !== "\n") {
+        const next = sourceIndices[at];
+        if (
+          next > start &&
+          /^[\r\n]+$/.test(original.slice(start, next)) &&
+          !/^[\r\n]/.test(added)
+        ) {
+          // Opening text belongs to the following line, after any blank lines
+          // preserved from source. Closing text before a newline stays before it.
+          start = next;
+          end = next;
+        }
+      }
       if (!removed && /[ \t]$/.test(added)) {
         const next = sourceIndices[at];
         if (next > start && /^[ \t]+$/.test(original.slice(start, next)))

@@ -81,7 +81,11 @@ import {
   type ReviewDecision,
   reviewShortcut,
 } from "./review-decisions";
-import { cleanRevisionNode, cleanSourceFromNode } from "./revision-clean-cache";
+import {
+  cleanRevisionNode,
+  cleanSourceFromNode,
+  projectCleanRevisionNode,
+} from "./revision-clean-cache";
 import {
   createReviewedChangesPlugin,
   mapRemoteReviewedChanges,
@@ -2348,7 +2352,15 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
               id,
               comment as (typeof draft.reviewComments)[number],
             );
-        const nextMarkdown = newerLocal
+        // History, private anchors and the final typing paragraph can differ
+        // from the serialized base without adding public review content.
+        const newerPublicContent =
+          newerLocal &&
+          !sameSourceContent(
+            publicRevisionNode(transaction.doc, nextPrivateIds),
+            parsed.doc,
+          );
+        const nextMarkdown = newerPublicContent
           ? (createSourceSpellingPreserver(
               previousMarkdown,
               serializeRevisionNode(
@@ -2406,7 +2418,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
                 nextPrivateIds,
               ),
             )
-          : newerLocal || draft.cleanMarkdown === undefined
+          : draft.cleanMarkdown === undefined ||
+              (newerPublicContent &&
+                !sameSourceContent(
+                  projectCleanRevisionNode(transaction.doc),
+                  projectCleanRevisionNode(parsed.doc),
+                ))
             ? (createSourceSpellingPreserver(
                 options?.currentCleanMarkdown ??
                   editableReviewRef.current?.cleanMarkdown ??

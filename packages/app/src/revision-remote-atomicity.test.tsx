@@ -518,6 +518,104 @@ test("remote application rebases buffered native typing with its selection, Undo
 });
 
 test.each([
+  ["prose", "Local paragraph.", "Local paragraph. Buffered."],
+  ["formatting", "Local paragraph.", "**Local paragraph.**"],
+  ["code", "const original = true;", "const original = true; Buffered."],
+  ["endnote", "Local note.", "Local note. Buffered."],
+] as const)("incoming clean spelling cannot replace buffered native %s changes", async (kind, target, expected) => {
+  const markdown =
+    "# Review\n\nLocal paragraph.\n\nRemote paragraph.\n\n```js\nconst original = true;\n```\n\nRead the note[^n].\n\n[^n]: Local note.\n";
+  const base: RevisionDraft = {
+    markdown,
+    cleanMarkdown: markdown,
+    decisions: {},
+    reviewComments: [],
+  };
+  const flush = { current: null as (() => void) | null };
+  const remote = { current: null as RevisionRemoteAdapter["apply"] | null };
+  const changed = vi.fn();
+  let editor: Editor | null = null;
+  await act(async () =>
+    root.render(
+      <TooltipProvider>
+        <RichTextEditorSurface
+          page={{
+            id: `buffered-${kind}`,
+            title: "Buffered changes",
+            content: markdown,
+          }}
+          activeDocumentPath="practice.md"
+          selected
+          layout="default"
+          focusRequestKey={null}
+          sourceMarkdown={markdown}
+          onMarkdownChange={changed}
+          interactionMode="editing"
+          backend={
+            new ApiBackend({
+              kind: "local-files",
+              label: "Files",
+              detail: "/practice.md",
+              projectPath: "/",
+            })
+          }
+          onEditorReady={(value) => {
+            editor = value;
+          }}
+          editableReview={{
+            suggestions: [],
+            decisions: [],
+            comments: new Map(),
+            onCommentsChange: () => {},
+            onAccept: () => true,
+            onReject: () => true,
+            onBlockedSuggestionEdit: () => {},
+            markdownFlushRef: flush,
+            remoteUpdateRef: remote,
+          }}
+        />
+      </TooltipProvider>,
+    ),
+  );
+  if (!editor || !remote.current)
+    throw new Error("Expected the real editor adapter");
+  const live = editor as Editor;
+  let from = -1;
+  live.state.doc.descendants((node, pos) => {
+    if (node.isText && node.text === target) from = pos;
+  });
+  expect(from).toBeGreaterThan(0);
+  changed.mockClear();
+  vi.useFakeTimers();
+  await act(async () => {
+    const tr = live.state.tr;
+    if (kind === "formatting")
+      tr.addMark(from, from + target.length, live.schema.marks.bold.create());
+    else tr.insertText(" Buffered.", from + target.length);
+    live.view.dispatch(tr);
+  });
+  expect(changed).not.toHaveBeenCalled();
+  const incoming = markdown.replace(
+    "Remote paragraph.",
+    "Remote paragraph updated.",
+  );
+  let applied: RevisionDraft | null = null;
+  await act(async () => {
+    applied =
+      remote.current?.(
+        { ...base, markdown: incoming, cleanMarkdown: incoming },
+        { localBase: base, currentCleanMarkdown: markdown },
+      ) ?? null;
+  });
+  const result = applied as RevisionDraft | null;
+  expect(result).not.toBeNull();
+  expect(result?.markdown).toContain(expected);
+  expect(result?.cleanMarkdown).toContain(expected);
+  expect(result?.cleanMarkdown).toContain("Remote paragraph updated.");
+  expect(result?.cleanMarkdown).not.toBe(incoming);
+});
+
+test.each([
   true,
   false,
 ])("a private restored reply appears only under its existing model suggestion: %s", async (present) => {
