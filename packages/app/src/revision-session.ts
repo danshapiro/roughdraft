@@ -1823,7 +1823,7 @@ export class RevisionSessionController {
     comment?: string,
   ) {
     let includeBase = false;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    attempts: for (let attempt = 0; attempt < 3; attempt++) {
       const state = this.state;
       if (!state) return false;
       const snapshot = this.current;
@@ -1872,7 +1872,7 @@ export class RevisionSessionController {
         comment,
       };
       try {
-        const result = await this.postOperation(
+        let result = await this.postOperation(
           `/${encodeURIComponent(state.review.id)}/${reason === "send" ? "send" : "reconcile"}`,
           body,
         );
@@ -1932,7 +1932,8 @@ export class RevisionSessionController {
           );
           return false;
         }
-        if (
+        let reservationRenewals = 0;
+        while (
           [
             "client-merge-required",
             "base-unavailable",
@@ -2103,6 +2104,20 @@ export class RevisionSessionController {
             this.acknowledge(reservedIdentity.operationId);
             this.operation = null;
             if (
+              committed.status === "client-merge-required" &&
+              committed.state &&
+              committed.reservation
+            ) {
+              // A late reserved save can receive a fresh turn. An ordinary
+              // retry would omit its token and wait against our own lease.
+              if (reservationRenewals++ < 2) {
+                result = committed;
+                continue;
+              }
+              this.deferAutosave(committed.reservation.expiresAt - Date.now());
+              return false;
+            }
+            if (
               reason === "recreate" &&
               (committed.status === "incoming-changed" ||
                 committed.status === "binding-changed")
@@ -2142,7 +2157,7 @@ export class RevisionSessionController {
               }
             }
           }
-          continue;
+          continue attempts;
         }
         if (result.status === "retry-later") {
           if (

@@ -270,6 +270,163 @@ test("a reserved candidate is prepared and posted before reflection, then its ac
 });
 
 test.each([
+  false,
+  true,
+])("a stale reserved submission consumes its replacement turn and respects a subsequent peer turn (%s)", async (peerTurn) => {
+  let server = state();
+  const requests: ReconcileRequest[] = [];
+  const sentAt: number[] = [];
+  let controller: RevisionSessionController;
+  const api = async <T>(path: string, body?: object): Promise<T | null> => {
+    if (!body) return structuredClone(server) as T;
+    if (!path.endsWith("/reconcile")) throw new Error(`Unexpected ${path}`);
+    const sent = body as ReconcileRequest;
+    requests.push(structuredClone(sent));
+    sentAt.push(performance.now());
+    if (requests.length <= 2) {
+      if (requests.length === 1) {
+        server = state("First.\n\nPeer last.\n");
+        server.revision = server.review.revision = 2;
+      } else {
+        expect(sent.reservationToken).toBe("initial-turn");
+        controller.updateDraft(() =>
+          draft("My first. Newer typing.\n\nLast.\n"),
+        );
+        server = state("First.\n\nPeer changed last.\n");
+        server.revision = server.review.revision = 3;
+      }
+      return {
+        status: "client-merge-required",
+        state: structuredClone(server),
+        reservation: {
+          token: requests.length === 1 ? "initial-turn" : "replacement-turn",
+          revision: server.revision,
+          expiresAt: Date.now() + 750,
+        },
+      } as T;
+    }
+    if (requests.length === 3) {
+      // An ordinary save here would wait against this page's own reservation.
+      expect(sent.reservationToken).toBe("replacement-turn");
+      expect(sent.expectedRevision).toBe(3);
+      expect(sent.draft.markdown).toContain("Newer typing.");
+      expect(sent.draft.markdown).toContain("Peer changed last.");
+      if (peerTurn)
+        return {
+          status: "retry-later",
+          state: structuredClone(server),
+          retryAfter: 241,
+        } as T;
+    } else {
+      expect(sent.reservationToken).toBeUndefined();
+      expect(sentAt[3] - sentAt[2]).toBeGreaterThanOrEqual(241);
+    }
+    server = commit(server, sent);
+    return { status: "committed", state: structuredClone(server) } as T;
+  };
+  controller = new RevisionSessionController(
+    server.review,
+    server.draft as RevisionDraft,
+    {
+      request: api,
+      storage: new MemoryStorage(),
+      tabStorage: new MemoryStorage(),
+    },
+  );
+  controllers.push(controller);
+  controller.setAdapter({
+    rebasesBufferedDocument: true,
+    prepare: (value) => ({ ...value, cleanMarkdown: value.markdown }),
+    apply: (value) => ({ ...value, cleanMarkdown: value.markdown }),
+    adopt: () => null,
+    readUiDrafts: () => ({}),
+    restoreUiDrafts: () => {},
+  });
+  controller.start();
+  await vi.advanceTimersByTimeAsync(0);
+  controller.updateDraft(() => draft("My first.\n\nLast.\n"));
+  const saved = await controller.flush(false);
+  expect(requests).toHaveLength(3);
+  expect(requests.map((request) => request.reservationToken)).toEqual([
+    undefined,
+    "initial-turn",
+    "replacement-turn",
+  ]);
+  if (peerTurn) {
+    expect(saved).toBe(false);
+    await vi.advanceTimersByTimeAsync(240);
+    expect(requests).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests).toHaveLength(4);
+  } else expect(saved).toBe(true);
+  expect(new Set(requests.map((request) => request.operationId)).size).toBe(
+    requests.length,
+  );
+  expect(requests.at(-1)?.acknowledgedOperationIds).toEqual(
+    expect.arrayContaining(
+      requests.slice(0, -1).map((request) => request.operationId),
+    ),
+  );
+  expect(controller.readDraft().markdown).toBe(
+    "My first. Newer typing.\n\nPeer changed last.\n",
+  );
+  expect(controller.getSnapshot().conflict).toBeNull();
+  expect(controller.getSnapshot().writePaused).toBe(false);
+});
+
+test("repeated replacement turns remain bounded and preserve typing until a later autosave", async () => {
+  let server = state();
+  const requests: ReconcileRequest[] = [];
+  const controller = new RevisionSessionController(
+    server.review,
+    server.draft as RevisionDraft,
+    {
+      storage: new MemoryStorage(),
+      tabStorage: new MemoryStorage(),
+      request: async <T>(_path: string, body?: object): Promise<T | null> => {
+        if (!body) return structuredClone(server) as T;
+        const sent = body as ReconcileRequest;
+        requests.push(structuredClone(sent));
+        server = state("First.\n\nPeer last.\n");
+        server.revision = server.review.revision = 2;
+        return {
+          status: "client-merge-required",
+          state: structuredClone(server),
+          reservation: {
+            token: `turn-${requests.length}`,
+            revision: server.revision,
+            expiresAt: Date.now() + 750,
+          },
+        } as T;
+      },
+    },
+  );
+  controllers.push(controller);
+  controller.setAdapter({
+    prepare: (value) => ({ ...value, cleanMarkdown: value.markdown }),
+    apply: (value) => ({ ...value, cleanMarkdown: value.markdown }),
+    adopt: () => null,
+    readUiDrafts: () => ({}),
+    restoreUiDrafts: () => {},
+  });
+  controller.start();
+  await vi.advanceTimersByTimeAsync(0);
+  controller.updateDraft(() => draft("My first.\n\nLast.\n"));
+  expect(await controller.flush(false)).toBe(false);
+  expect(requests.map((request) => request.reservationToken)).toEqual([
+    undefined,
+    "turn-1",
+    "turn-2",
+    "turn-3",
+  ]);
+  await vi.advanceTimersByTimeAsync(749);
+  expect(requests).toHaveLength(4);
+  expect(controller.readDraft().markdown).toContain("My first.");
+  expect(controller.getSnapshot().writePaused).toBe(false);
+  expect(controller.getSnapshot().conflict).toBeNull();
+});
+
+test.each([
   "peer",
   "self",
   "historical",
