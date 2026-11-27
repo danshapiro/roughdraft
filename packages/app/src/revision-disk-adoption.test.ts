@@ -1,11 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import {
-  extractRoughdraftReviewIndex,
-  mergeReviewDrafts,
-} from "@roughdraft/rfm";
+import * as rfm from "@roughdraft/rfm";
 import { getSchema } from "@tiptap/core";
-import { expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { criticMarkdownToEditorState } from "./critic-markup";
 import { createEditorExtensions } from "./editor-extensions";
 import { adoptRevisionDisk } from "./revision-disk-adoption";
@@ -14,6 +11,25 @@ import { suggestionPositions } from "./revision-projection";
 import { RevisionSource } from "./revision-source";
 
 const schema = getSchema([...createEditorExtensions(""), RevisionSource]);
+
+// These synchronous cases protect merge semantics independently of how long a
+// busy test worker is descheduled. Deadline cases below advance this clock
+// explicitly. Only the actual merge gets a fixed Date.now for its internal
+// diff timeout; source-spelling comparisons retain their bounded fallback.
+beforeEach(() => {
+  vi.spyOn(performance, "now").mockReturnValue(0);
+  const merge = rfm.mergeReviewDrafts;
+  vi.spyOn(rfm, "mergeReviewDrafts").mockImplementation((...args) => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    try {
+      return merge(...args);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+});
+afterEach(() => vi.restoreAllMocks());
+
 function draft(markdown: string) {
   const parsed = criticMarkdownToEditorState(markdown);
   return {
@@ -67,7 +83,7 @@ suggestions:
   const adopted = adoptRevisionDisk(base, incoming, schema);
   expect(adopted).not.toBeNull();
   if (!adopted) throw new Error("Independent disk feedback must be adoptable");
-  const items = extractRoughdraftReviewIndex(adopted.markdown).items;
+  const items = rfm.extractRoughdraftReviewIndex(adopted.markdown).items;
   expect(
     items
       .filter((item) => item.kind === "suggestion")
@@ -94,7 +110,7 @@ suggestions:
         'suggestions:\n  s2:\n    by: user\n    at: "2026-11-26T20:34:49.865Z"\n',
       ),
   );
-  const merged = mergeReviewDrafts(base, local, adopted, {
+  const merged = rfm.mergeReviewDrafts(base, local, adopted, {
     server: false,
     budgetMs: 100,
   });
@@ -103,7 +119,8 @@ suggestions:
   if (merged.status !== "merged")
     throw new Error("Distinct new proposals must merge independently");
   expect(
-    extractRoughdraftReviewIndex(merged.draft.markdown)
+    rfm
+      .extractRoughdraftReviewIndex(merged.draft.markdown)
       .items.filter((item) => item.kind === "suggestion")
       .map((item) => ({
         id: item.id,
@@ -225,7 +242,7 @@ test("an annotated maintained file accepts independent disk prose edits while re
   const local = draft(
     markdown.replace("planting schedule", "orchard schedule"),
   );
-  const merged = mergeReviewDrafts(base, local, result, {
+  const merged = rfm.mergeReviewDrafts(base, local, result, {
     server: false,
     budgetMs: 250,
   });
@@ -239,4 +256,53 @@ test("an annotated maintained file accepts independent disk prose edits while re
       }),
     ]),
   );
+});
+
+test.each([
+  { elapsedMs: 99, accepts: true },
+  { elapsedMs: 100, accepts: false },
+  { elapsedMs: 101, accepts: false },
+])("annotated disk adoption respects its 100 ms budget at $elapsedMs ms without losing feedback", ({
+  elapsedMs,
+  accepts,
+}) => {
+  const markdown =
+    'Alpha ready.\n\nKeep {==this quote==}{>>Saved feedback.<<}{id="c1" by="AI" at="2026-01-01T12:00:00.000Z"}.\n\nRetain {++this proposal++}{id="s1" by="AI" at="2026-01-01T12:00:00.000Z"}.\n';
+  const base = draft(markdown);
+  const unchanged = structuredClone(base);
+  const disk = markdown.replace("Alpha ready.", "Alpha updated on disk.");
+  const clock = vi
+    .mocked(performance.now)
+    .mockReturnValueOnce(0)
+    .mockReturnValue(elapsedMs);
+
+  let adopted = adoptRevisionDisk(base, disk, schema);
+  expect(base).toEqual(unchanged);
+  expect(clock).toHaveBeenCalled();
+  if (!accepts) {
+    expect(adopted).toBeNull();
+    // A later attempt must start from the intact saved review, not a partial
+    // first result or feedback whose IDs were lost when time ran out.
+    clock.mockReturnValue(0);
+    adopted = adoptRevisionDisk(base, disk, schema);
+  }
+  expect(adopted).not.toBeNull();
+  expect(adopted?.markdown).toContain("Alpha updated on disk.");
+  expect(adopted?.cleanMarkdown).toBe(cleanRevisionSourceMarkdown(disk));
+  expect(adopted?.reviewComments).toEqual(base.reviewComments);
+  expect(adopted?.outdatedSuggestions ?? []).toEqual([]);
+  expect(
+    rfm
+      .extractRoughdraftReviewIndex(adopted?.markdown ?? "")
+      .items.map(({ id, kind, text }) => ({ id, kind, text })),
+  ).toEqual(
+    rfm
+      .extractRoughdraftReviewIndex(markdown)
+      .items.map(({ id, kind, text }) => ({
+        id,
+        kind,
+        text,
+      })),
+  );
+  expect(base).toEqual(unchanged);
 });
