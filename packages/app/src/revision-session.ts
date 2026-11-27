@@ -303,6 +303,10 @@ export class RevisionSessionController {
   >();
   private inspectedOrphans = new Map<string, string>();
   private pendingIncoming: SyncState<ComparisonReviewData> | null = null;
+  private acknowledgmentFlights = new Map<
+    string,
+    { state: SyncState<ComparisonReviewData>; promise: Promise<boolean> }
+  >();
   private acknowledged: string[] = [];
   private recoveredUiDrafts: Record<string, unknown> | null = null;
   private deferredCopy: SyncResult<ComparisonReviewData> | null = null;
@@ -1152,6 +1156,21 @@ export class RevisionSessionController {
     this.pendingIncoming = null;
     if (incoming) queueMicrotask(() => void this.observe(incoming));
   }
+  private retainIncoming(state: SyncState<ComparisonReviewData> | null) {
+    if (
+      state &&
+      (!this.pendingIncoming || state.revision >= this.pendingIncoming.revision)
+    )
+      this.pendingIncoming = state;
+  }
+  private finishAcknowledgment(pending: PendingOperation) {
+    if (this.operation?.operation.operationId !== pending.operation.operationId)
+      return false;
+    this.operation = null;
+    this.persist();
+    this.resumeIncoming();
+    return true;
+  }
   private async resolvePending() {
     const pending = this.operation;
     if (!pending) return true;
@@ -1164,9 +1183,7 @@ export class RevisionSessionController {
     if (result.status === "committed" && result.state) {
       if (!(await this.applyAcknowledgment(result.state, pending)))
         return false;
-      this.operation = null;
-      this.persist();
-      this.resumeIncoming();
+      this.finishAcknowledgment(pending);
       return true;
     }
     if (
@@ -1319,7 +1336,7 @@ export class RevisionSessionController {
         this.applyingRemote = false;
       }
       if (!result) {
-        this.pendingIncoming = state;
+        this.retainIncoming(state);
         this.wait(
           "waiting",
           "An outside update is waiting while you finish this word or source edit.",
@@ -1330,7 +1347,7 @@ export class RevisionSessionController {
       applied = result;
       this.projectionReady = true;
     } else if (input.markdown !== this.current.markdown) {
-      this.pendingIncoming = state;
+      this.retainIncoming(state);
       return false;
     }
     this.current = applied;
@@ -1351,7 +1368,38 @@ export class RevisionSessionController {
     }
     return true;
   }
-  private async applyAcknowledgment(
+  private applyAcknowledgment(
+    state: SyncState<ComparisonReviewData>,
+    pending: PendingOperation,
+  ): Promise<boolean> {
+    const id = pending.operation.operationId;
+    const flight = this.acknowledgmentFlights.get(id);
+    const acknowledged = this.acknowledged.includes(id);
+    const basis = flight?.state ?? (acknowledged ? this.state : null);
+    if (
+      basis &&
+      (state.revision > basis.revision ||
+        (state.revision === basis.revision &&
+          (state.signature !== basis.signature ||
+            state.registryGeneration !== basis.registryGeneration ||
+            this.diskKey(state) !== this.diskKey(basis) ||
+            state.disk?.availability !== basis.disk?.availability)))
+    )
+      this.retainIncoming(state);
+    if (flight) return flight.promise;
+    if (acknowledged) return Promise.resolve(true);
+    // Register before any merge or native adapter work. The HTTP response and
+    // own live-state echo can arrive while the same worker result is pending.
+    const promise: Promise<boolean> = Promise.resolve()
+      .then(() => this.applyAcknowledgmentOnce(state, pending))
+      .finally(() => {
+        if (this.acknowledgmentFlights.get(id)?.promise === promise)
+          this.acknowledgmentFlights.delete(id);
+      });
+    this.acknowledgmentFlights.set(id, { state, promise });
+    return promise;
+  }
+  private async applyAcknowledgmentOnce(
     state: SyncState<ComparisonReviewData>,
     pending: PendingOperation,
   ) {
@@ -1372,6 +1420,8 @@ export class RevisionSessionController {
         : await this.merge(acknowledgmentBase, localBase, state.draft, {
             server: false,
           });
+      if (this.acknowledged.includes(pending.operation.operationId))
+        return true;
       if (merged.status !== "merged") {
         this.wait(
           merged.status === "conflict" ? "conflict" : "waiting",
@@ -1385,6 +1435,8 @@ export class RevisionSessionController {
       next = merged.draft as RevisionDraft;
       if (!(await this.applyDraft(next, merged, state, localBase)))
         return false;
+      if (this.acknowledged.includes(pending.operation.operationId))
+        return true;
     }
     this.state = state;
     this.base = state.draft as RevisionDraft;
@@ -1527,21 +1579,19 @@ export class RevisionSessionController {
       own.kind !== "copy"
     ) {
       if (await this.applyAcknowledgment(state, own)) {
-        this.operation = null;
-        this.persist();
-        this.schedule(0);
+        if (this.finishAcknowledgment(own)) this.schedule(0);
       }
       return;
     }
     if (own) {
-      this.pendingIncoming = state;
+      this.retainIncoming(state);
       return;
     }
     if (
       this.copyOperation &&
       this.activeOperations.has(this.copyOperation.operation.operationId)
     ) {
-      this.pendingIncoming = state;
+      this.retainIncoming(state);
       return;
     }
     await this.serialize(async () => {
@@ -1575,7 +1625,7 @@ export class RevisionSessionController {
       );
       if (!incoming) {
         if (!this.adapter) {
-          this.pendingIncoming = state;
+          this.retainIncoming(state);
           return;
         }
         this.wait(
@@ -1880,9 +1930,7 @@ export class RevisionSessionController {
         if (result.status === "committed" && result.state) {
           if (!(await this.applyAcknowledgment(result.state, pending)))
             return false;
-          this.operation = null;
-          this.persist();
-          this.resumeIncoming();
+          this.finishAcknowledgment(pending);
           this.emit({
             recoveryPending: !sameReviewDraft(this.current, this.base),
           });
@@ -2070,9 +2118,7 @@ export class RevisionSessionController {
             );
             if (committed?.status === "committed" && committed.state) {
               if (await this.applyAcknowledgment(committed.state, submitted)) {
-                this.operation = null;
-                this.persist();
-                this.resumeIncoming();
+                this.finishAcknowledgment(submitted);
                 if (
                   !sameReviewDraft(this.current, this.base) ||
                   (reason !== "send" && this.needsFileWrite(committed.state))

@@ -8,9 +8,13 @@ import {
   type SyncState,
 } from "@roughdraft/rfm";
 import { getSchema } from "@tiptap/core";
+import { EditorState } from "@tiptap/pm/state";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { ComparisonReviewData } from "./comparison-types";
-import { criticMarkdownToEditorState } from "./critic-markup";
+import {
+  criticMarkdownToEditorState,
+  editorStateToCriticMarkdown,
+} from "./critic-markup";
 import { createEditorExtensions } from "./editor-extensions";
 import { cleanSourceFromNode } from "./revision-clean-cache";
 import {
@@ -27,6 +31,7 @@ import {
   RevisionSessionController,
 } from "./revision-session";
 import { RevisionSource } from "./revision-source";
+import { rebaseRemoteTransaction } from "./revision-remote-steps";
 import { RevisionUiDraftStore } from "./revision-ui-drafts";
 
 const notifications = vi.hoisted(
@@ -268,6 +273,194 @@ test("a reserved candidate is prepared and posted before reflection, then its ac
   expect(editorText).toContain("Peer last.");
   expect(controller.readDraft().markdown).toBe(editorText);
 });
+
+for (const newerNotice of [false, true]) {
+  test.each([
+    "response-first",
+    "echo-first",
+  ] as const)(`simultaneous own %s acknowledgment applies one native delta while typing stays buffered (newer notice: ${newerNotice})`, async (order) => {
+    const schema = getSchema([...createEditorExtensions(""), RevisionSource]);
+    const native = (markdown: string) =>
+      EditorState.create({
+        schema,
+        doc: schema.nodeFromJSON(criticMarkdownToEditorState(markdown).doc),
+      });
+    const source = "Peer: abcdefghijabcd.\n\nMine: ready.\n";
+    let editor = native(source);
+    const readEditor = () =>
+      draft(editorStateToCriticMarkdown(editor.doc.toJSON(), new Map()));
+    let server = state(source);
+    let committed: SyncState<ComparisonReviewData> | undefined;
+    let release:
+      | ((value: SyncResult<ComparisonReviewData>) => void)
+      | undefined;
+    let releaseTrailing: (() => void) | undefined;
+    let holdMerges = false;
+    const merges: Array<() => void> = [];
+    const applied: string[] = [];
+    const writes: ReconcileRequest[] = [];
+    const recovery = new MemoryStorage();
+    const api = async <T>(path: string, body?: object): Promise<T | null> => {
+      if (!body) return structuredClone(server) as T;
+      if (!path.endsWith("/reconcile")) throw new Error(`Unexpected ${path}`);
+      const sent = body as ReconcileRequest;
+      writes.push(structuredClone(sent));
+      if (!sent.reservationToken && !release) {
+        server = state(
+          source.replace("abcdefghijabcd", "abcdefghijabcdefghijabcd"),
+        );
+        server.revision = server.review.revision = 2;
+        return {
+          status: "client-merge-required",
+          state: structuredClone(server),
+          reservation: {
+            token: "turn",
+            revision: 2,
+            expiresAt: Date.now() + 750,
+          },
+        } as T;
+      }
+      server = commit(server, sent);
+      if (!release) {
+        committed = structuredClone(server);
+        holdMerges = true;
+        return await new Promise<T>((resolve) => {
+          release = resolve;
+        });
+      }
+      const trailing = structuredClone(server);
+      return await new Promise<T>((resolve) => {
+        releaseTrailing = () =>
+          resolve({ status: "committed", state: trailing } as T);
+      });
+    };
+    const controller = new RevisionSessionController(
+      server.review,
+      server.draft as RevisionDraft,
+      {
+        request: api,
+        storage: recovery,
+        tabStorage: new MemoryStorage(),
+        merge: async (base, local, incoming, options) => {
+          const result = mergeReviewDrafts(base, local, incoming, {
+            ...options,
+            budgetMs: 1000,
+          });
+          if (holdMerges)
+            return await new Promise((resolve) => {
+              merges.push(() => resolve(result));
+            });
+          return result;
+        },
+      },
+    );
+    controllers.push(controller);
+    controller.setAdapter({
+      rebasesBufferedDocument: true,
+      prepare: (value) => ({ ...value, cleanMarkdown: value.markdown }),
+      apply: (value, options) => {
+        if (options?.localBase) applied.push(value.markdown);
+        const origin = options?.localBase
+          ? native(options.localBase.markdown)
+          : editor;
+        const transaction = rebaseRemoteTransaction(
+          origin,
+          editor,
+          native(value.markdown).doc,
+        );
+        if (!transaction) return null;
+        editor = editor.apply(transaction);
+        return readEditor();
+      },
+      adopt: () => null,
+      readUiDrafts: () => ({}),
+      restoreUiDrafts: () => {},
+    });
+    controller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    editor = native(source.replace("ready.", "ready. One."));
+    controller.updateDraft(readEditor);
+    const saving = controller.flush(false);
+    await vi.advanceTimersByTimeAsync(0);
+    editor = native(source.replace("ready.", "ready. One. Two."));
+    controller.updateDraft(readEditor);
+    const echo = () => {
+      let notice = structuredClone(required(committed));
+      if (newerNotice) {
+        const next = draft(
+          notice.draft.markdown.replace("Peer: ", "Latest peer: "),
+        );
+        notice = {
+          ...notice,
+          revision: notice.revision + 1,
+          signature: reviewDraftSignature(next),
+          registryGeneration: String(notice.revision + 1),
+          draft: next,
+          review: {
+            ...notice.review,
+            revision: notice.revision + 1,
+            draft: next,
+          },
+        };
+        server = notice;
+      }
+      notifications.get("review")?.({ reason: "changed", state: notice });
+    };
+    if (order === "response-first")
+      release?.({ status: "committed", state: required(committed) });
+    else echo();
+    await vi.advanceTimersByTimeAsync(0);
+    if (order === "response-first") echo();
+    else release?.({ status: "committed", state: required(committed) });
+    await vi.advanceTimersByTimeAsync(0);
+    if (newerNotice) {
+      const older = state(
+        source.replace("abcdefghijabcd", "abcdefghijabcdefghijabcd"),
+      );
+      older.revision = older.review.revision = 2;
+      notifications.get("review")?.({ reason: "changed", state: older });
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    // One more native input has not yet reached the coalesced controller draft.
+    editor = native(source.replace("ready.", "ready. One. Two. Three."));
+    holdMerges = false;
+    for (const finish of merges) {
+      finish();
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(await saving).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(editor.doc.firstChild?.textContent).toBe(
+      `${newerNotice ? "Latest peer" : "Peer"}: abcdefghijabcdefghijabcd.`,
+    );
+    expect(editor.doc.lastChild?.textContent).toBe(
+      "Mine: ready. One. Two. Three.",
+    );
+    expect(applied).toHaveLength(
+      newerNotice && order === "response-first" ? 2 : 1,
+    );
+    expect(writes.at(-1)?.expectedRevision).toBe(newerNotice ? 4 : 3);
+    expect(releaseTrailing).toBeDefined();
+    const activeId = writes.at(-1)?.operationId;
+    notifications.get("review")?.({
+      reason: "changed",
+      state: structuredClone(required(committed)),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const unfinished = [...recovery.records.entries()]
+      .filter(([key]) => key.startsWith("roughdraft-draft:"))
+      .map(([, raw]) => JSON.parse(raw));
+    expect(
+      unfinished.some(
+        (entry) => entry.operation?.operation?.operationId === activeId,
+      ),
+    ).toBe(true);
+    releaseTrailing?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(controller.getSnapshot().conflict).toBeNull();
+    expect(controller.getSnapshot().writePaused).toBe(false);
+  });
+}
 
 for (const reserved of [false, true]) {
   test.each([
