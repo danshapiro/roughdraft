@@ -1561,6 +1561,30 @@ export class ComparisonStore {
           state: this.state(id, review),
           message: "Refresh the save context and retry your queued changes.",
         });
+      const request = body as unknown as ReconcileRequest;
+      const admission = () => ({
+        revision: review.revision,
+        blocked: this.reservations.blocked(
+          id,
+          operation.pageInstanceId,
+          request.reservationToken,
+        ),
+        reserved: this.reservations.valid(
+          id,
+          operation.pageInstanceId,
+          request.reservationToken,
+          review.revision,
+        ),
+      });
+      // These locks already exclude another review/file mutation. Journal I/O
+      // must not turn an admitted holder into a late request, or a denied peer
+      // into a writer, merely because the same request's flushes take time.
+      const admitted =
+        !review.pendingPublication &&
+        !review.pendingSave &&
+        !review.pendingApply
+          ? admission()
+          : null;
       const record = this.operations.begin(operation, id);
       const reject = (
         result: SyncResult<Comparison>,
@@ -1608,7 +1632,8 @@ export class ComparisonStore {
           },
           false,
         );
-      const request = body as unknown as ReconcileRequest;
+      const turn =
+        admitted?.revision === review.revision ? admitted : admission();
       const resolutionCheckpoints = new Map<string, number>();
       if (Array.isArray(request.resolution?.checkpointIds))
         for (const checkpointId of request.resolution.checkpointIds) {
@@ -1622,13 +1647,7 @@ export class ComparisonStore {
               : request.localGeneration,
           );
         }
-      if (
-        this.reservations.blocked(
-          id,
-          operation.pageInstanceId,
-          request.reservationToken,
-        )
-      ) {
+      if (turn.blocked) {
         return reject({
           status: "retry-later",
           retryAfter: this.reservations.remaining(id) || 25,
@@ -1740,12 +1759,7 @@ export class ComparisonStore {
           state: this.state(id, review, freshDisk),
         });
       let candidate = submitted;
-      const reserved = this.reservations.valid(
-        id,
-        operation.pageInstanceId,
-        request.reservationToken,
-        review.revision,
-      );
+      const reserved = turn.reserved;
       if (
         request.baseRevision !== review.revision ||
         body.baseSignature !== reviewDraftSignature(latest)

@@ -8,6 +8,7 @@ import {
 import {
   extractRoughdraftReviewIndex,
   type ReconcileRequest,
+  reviewDraftSignature,
   type SyncResult,
 } from "@roughdraft/rfm";
 import type { ComparisonReviewData } from "../src/comparison-types";
@@ -228,6 +229,25 @@ for (const { peer, arrival } of [
         const response = await route.fetch();
         const result =
           (await response.json()) as SyncResult<ComparisonReviewData>;
+        // Inspect the same text the real client receives after reconstructing
+        // an explicitly verified request-text reference. Fulfill the untouched
+        // wire response below so the browser still exercises its own decoder.
+        const returned = result.state as
+          | (NonNullable<typeof result.state> & {
+              draftTextFromRequest?: boolean;
+            })
+          | undefined;
+        if (returned?.draftTextFromRequest) {
+          expect(
+            route.request().headers()["x-roughdraft-draft-reference"],
+          ).toBe(reviewDraftSignature(sent.draft));
+          returned.draft = {
+            ...returned.draft,
+            markdown: sent.draft.markdown,
+            cleanMarkdown: sent.draft.cleanMarkdown,
+          };
+          expect(reviewDraftSignature(returned.draft)).toBe(returned.signature);
+        }
         wire.push({
           operationId: sent.operationId,
           status: result.status,

@@ -557,3 +557,199 @@ test("a malformed opted-in request still receives the complete authoritative rej
   expect(rejected.body.state.draftTextFromRequest).toBeUndefined();
   expect(rejected.body.state.draft).toEqual(current.draft);
 });
+
+function delayOperationJournal(operationId: string, duringFlush?: () => void) {
+  const write = fs.writeFileSync.bind(fs);
+  const flush = fs.fsyncSync.bind(fs);
+  const delay = { triggered: false };
+  let running = false;
+  vi.spyOn(fs, "writeFileSync").mockImplementation(
+    (...args: Parameters<typeof fs.writeFileSync>) => {
+      if (typeof args[1] === "string") {
+        try {
+          const value = JSON.parse(args[1]);
+          if (
+            value.phase === "running" &&
+            value.operation?.operationId === operationId
+          )
+            running = true;
+        } catch {
+          /* Non-journal writes never activate the controlled flush delay. */
+        }
+      }
+      return write(...args);
+    },
+  );
+  vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+    if (running && !delay.triggered) {
+      delay.triggered = true;
+      clock += 600;
+      duringFlush?.();
+    }
+    return flush(fd);
+  });
+  return delay;
+}
+
+test("journal flushes cannot turn a writer blocked at entry into an owner after another page's merge turn expires", async () => {
+  const { state, route, target } = await open();
+  const seedText = original.replace("A: old", "A: seeded");
+  const seed = await request(host.app)
+    .post(route)
+    .send(body(state, "seed-before-turn", "seed", seedText));
+  expect(seed.body.status).toBe("committed");
+  const holder = await request(host.app)
+    .post(route)
+    .send(
+      body(
+        state,
+        "turn-holder",
+        "holder",
+        original.replace("B: old", "B: holder"),
+      ),
+    );
+  expect(holder.body.status).toBe("client-merge-required");
+  const turn = holder.body.reservation;
+  clock += 200;
+  const atEntry = clock;
+  const delay = delayOperationJournal("blocked-slow-journal");
+  const peerText = seedText.replace("C: old", "C: peer");
+  const blocked = await request(host.app)
+    .post(route)
+    .send(body(seed.body.state, "blocked-slow-journal", "peer", peerText));
+  expect(delay.triggered).toBe(true);
+  expect(clock - atEntry).toBeCloseTo(600, 6);
+  expect(blocked.body.status).toBe("retry-later");
+  expect(blocked.body.retryAfter).toBe(25);
+  expect(blocked.body.state.revision).toBe(seed.body.state.revision);
+  expect(fs.readFileSync(target, "utf8")).toBe(seedText);
+  const replay = await request(host.app).get(
+    "/api/comparisons/operations/blocked-slow-journal",
+  );
+  expect(replay.body.status).toBe("retry-later");
+  // The old token really expired; denying the earlier peer must not extend it.
+  const oldHolder = await request(host.app)
+    .post(route)
+    .send({
+      ...body(
+        state,
+        "expired-holder",
+        "holder",
+        seedText.replace("B: old", "B: holder"),
+        2,
+      ),
+      expectedRevision: seed.body.state.revision,
+      expectedDisk: seed.body.state.disk,
+      reservationToken: turn.token,
+    });
+  expect(oldHolder.body.status).toBe("retry-later");
+  const next = await request(host.app)
+    .post(route)
+    .send(
+      body(
+        state,
+        "queued-peer-next",
+        "peer",
+        original.replace("C: old", "C: peer"),
+        2,
+      ),
+    );
+  expect(next.body.status).toBe("client-merge-required");
+  const final = await request(host.app)
+    .post(route)
+    .send({
+      ...body(seed.body.state, "queued-peer-commit", "peer", peerText, 3),
+      reservationToken: next.body.reservation.token,
+    });
+  expect(final.body.status).toBe("committed");
+  expect(fs.readFileSync(target, "utf8")).toBe(peerText);
+});
+
+test.each([
+  "current",
+  "older",
+])("a valid holder admitted inside the mutation lock keeps its %s base request when its own journal flush passes the turn deadline", async (baseVersion) => {
+  const { state, route, target } = await open();
+  const seedText = original.replace("A: old", "A: seeded");
+  const seed = await request(host.app)
+    .post(route)
+    .send(body(state, "holder-seed", "seed", seedText));
+  expect(seed.body.status).toBe("committed");
+  const held = await request(host.app)
+    .post(route)
+    .send(
+      body(
+        state,
+        "holder-admission",
+        "holder",
+        original.replace("B: old", "B: holder"),
+      ),
+    );
+  expect(held.body.status).toBe("client-merge-required");
+  clock += 200;
+  const atEntry = clock;
+  const delay = delayOperationJournal("admitted-holder-commit");
+  const candidate = seedText.replace("B: old", "B: holder");
+  const committed = await request(host.app)
+    .post(route)
+    .send({
+      ...body(
+        baseVersion === "current" ? seed.body.state : state,
+        "admitted-holder-commit",
+        "holder",
+        candidate,
+        2,
+      ),
+      expectedRevision: seed.body.state.revision,
+      expectedDisk: seed.body.state.disk,
+      reservationToken: held.body.reservation.token,
+    });
+  expect(delay.triggered).toBe(true);
+  expect(clock - atEntry).toBeCloseTo(600, 6);
+  expect(committed.body.status).toBe("committed");
+  expect(committed.body.state.revision).toBe(seed.body.state.revision + 1);
+  expect(fs.readFileSync(target, "utf8")).toBe(candidate);
+});
+
+test("an admitted holder still rejects an outside file edit that arrives during its durable journal write", async () => {
+  const { state, route, target } = await open();
+  const seedText = original.replace("A: old", "A: seeded");
+  const seed = await request(host.app)
+    .post(route)
+    .send(body(state, "disk-guard-seed", "seed", seedText));
+  expect(seed.body.status).toBe("committed");
+  const held = await request(host.app)
+    .post(route)
+    .send(
+      body(
+        state,
+        "disk-guard-holder",
+        "holder",
+        original.replace("B: old", "B: holder"),
+      ),
+    );
+  expect(held.body.status).toBe("client-merge-required");
+  clock += 200;
+  const write = fs.writeFileSync.bind(fs);
+  const delay = delayOperationJournal("guarded-admitted-holder", () =>
+    write(target, "New outside file D2\n"),
+  );
+  const result = await request(host.app)
+    .post(route)
+    .send({
+      ...body(
+        state,
+        "guarded-admitted-holder",
+        "holder",
+        seedText.replace("B: old", "B: holder"),
+        2,
+      ),
+      expectedRevision: seed.body.state.revision,
+      expectedDisk: seed.body.state.disk,
+      reservationToken: held.body.reservation.token,
+    });
+  expect(delay.triggered).toBe(true);
+  expect(result.body.status).toBe("incoming-changed");
+  expect(fs.readFileSync(target, "utf8")).toBe("New outside file D2\n");
+  expect(result.body.state.revision).toBe(seed.body.state.revision);
+});
