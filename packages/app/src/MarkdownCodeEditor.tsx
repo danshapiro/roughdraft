@@ -17,6 +17,7 @@ import { cn } from "./lib/utils";
 interface MarkdownCodeEditorProps {
   value: string;
   onChange: (value: string) => void;
+  onCompositionEnd?: () => void;
   autoFocus?: boolean;
   readOnly?: boolean;
   className?: string;
@@ -183,6 +184,7 @@ export function createMarkdownCodeEditorExtensions(
 export function MarkdownCodeEditor({
   value,
   onChange,
+  onCompositionEnd,
   autoFocus = false,
   readOnly = false,
   className,
@@ -193,6 +195,8 @@ export function MarkdownCodeEditor({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const editorViewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
+  const onCompositionEndRef = useRef(onCompositionEnd);
+  onCompositionEndRef.current = onCompositionEnd;
   const sourceHistoryRef = useRef(sourceHistory);
   sourceHistoryRef.current = sourceHistory;
   const initialValueRef = useRef(value);
@@ -265,8 +269,32 @@ export function MarkdownCodeEditor({
 
     editorViewRef.current = view;
     lastValueRef.current = view.state.sliceDoc();
+    let compositionTimer: ReturnType<typeof setTimeout> | undefined;
+    const cancelCompositionEnd = () => {
+      if (compositionTimer !== undefined) clearTimeout(compositionTimer);
+      compositionTimer = undefined;
+    };
+    const finishComposition = () => {
+      cancelCompositionEnd();
+      if (!onCompositionEndRef.current) return;
+      // CodeMirror flushes trailing Android composition mutations separately.
+      // Match its own 50 ms composition cleanup before resuming an update.
+      compositionTimer = setTimeout(() => {
+        compositionTimer = undefined;
+        if (!view.composing && !view.compositionStarted)
+          onCompositionEndRef.current?.();
+      }, 50);
+    };
+    view.contentDOM.addEventListener("compositionstart", cancelCompositionEnd);
+    view.contentDOM.addEventListener("compositionend", finishComposition);
 
     return () => {
+      cancelCompositionEnd();
+      view.contentDOM.removeEventListener(
+        "compositionstart",
+        cancelCompositionEnd,
+      );
+      view.contentDOM.removeEventListener("compositionend", finishComposition);
       editorViewRef.current = null;
       view.destroy();
     };

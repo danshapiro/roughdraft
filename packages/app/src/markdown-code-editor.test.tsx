@@ -39,6 +39,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await act(async () => root.unmount());
+  vi.useRealTimers();
   container.remove();
   vi.unstubAllGlobals();
   for (const [name, descriptor] of [
@@ -56,6 +57,78 @@ function editor() {
   if (!view) throw new Error("Expected the CodeMirror view");
   return view;
 }
+
+test("source composition completion uses the latest callback without another document change", async () => {
+  const previous = vi.fn();
+  const current = vi.fn();
+  const onChange = vi.fn();
+  await act(async () =>
+    root.render(
+      <MarkdownCodeEditor
+        value={"Stable source.\n"}
+        onChange={onChange}
+        onCompositionEnd={previous}
+      />,
+    ),
+  );
+  const view = editor();
+  vi.useFakeTimers();
+  await act(async () => {
+    view.focus();
+    view.contentDOM.dispatchEvent(
+      new CompositionEvent("compositionstart", { bubbles: true, data: "日" }),
+    );
+    view.contentDOM.dispatchEvent(
+      new CompositionEvent("compositionend", { bubbles: true, data: "日本語" }),
+    );
+    root.render(
+      <MarkdownCodeEditor
+        value={"Stable source.\n"}
+        onChange={onChange}
+        onCompositionEnd={current}
+      />,
+    );
+  });
+  await act(async () => vi.advanceTimersByTimeAsync(60));
+  expect(previous).not.toHaveBeenCalled();
+  expect(current).toHaveBeenCalledOnce();
+  expect(onChange).not.toHaveBeenCalled();
+  expect(view.state.sliceDoc()).toBe("Stable source.\n");
+});
+
+test("resumed source composition and unmount cancel a pending completion callback", async () => {
+  const completed = vi.fn();
+  await act(async () =>
+    root.render(
+      <MarkdownCodeEditor
+        value={"Stable source.\n"}
+        onChange={() => {}}
+        onCompositionEnd={completed}
+      />,
+    ),
+  );
+  const view = editor();
+  vi.useFakeTimers();
+  const composition = (type: "compositionstart" | "compositionend") =>
+    view.contentDOM.dispatchEvent(
+      new CompositionEvent(type, { bubbles: true }),
+    );
+  await act(async () => {
+    view.focus();
+    composition("compositionstart");
+    composition("compositionend");
+    await vi.advanceTimersByTimeAsync(25);
+    composition("compositionstart");
+    await vi.advanceTimersByTimeAsync(100);
+  });
+  expect(completed).not.toHaveBeenCalled();
+  await act(async () => {
+    composition("compositionend");
+    root.render(null);
+  });
+  await act(async () => vi.advanceTimersByTimeAsync(100));
+  expect(completed).not.toHaveBeenCalled();
+});
 
 test("distant incoming source edits retain a caret in unchanged middle text", async () => {
   const original = "First paragraph.\n\nMiddle paragraph.\n\nLast paragraph.\n";

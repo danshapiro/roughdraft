@@ -1,3 +1,4 @@
+import { EditorView as CodeMirrorView } from "@codemirror/view";
 import { reviewHistoryProposalIds } from "@roughdraft/rfm";
 import { Extension, type JSONContent } from "@tiptap/core";
 import { closeHistory, isHistoryTransaction } from "@tiptap/pm/history";
@@ -2102,6 +2103,14 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       };
       if (editor.isDestroyed) return blocked("destroyed");
       const active = document.activeElement;
+      const sourceHost =
+        active instanceof HTMLElement ? active.closest(".cm-editor") : null;
+      const source =
+        sourceHost instanceof HTMLElement
+          ? CodeMirrorView.findFromDOM(sourceHost)
+          : null;
+      if (source?.composing || source?.compositionStarted)
+        return blocked("source-composing");
       if (
         options?.idRemap &&
         (compositionSessionRef.current ||

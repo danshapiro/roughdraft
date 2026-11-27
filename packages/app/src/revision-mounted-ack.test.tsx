@@ -225,9 +225,13 @@ async function mountEditor(
   store: RevisionUiDraftStore,
   markdown = original,
   withSource = false,
+  onSourceCompositionEnd?: () => void,
 ) {
   const flush = { current: null as (() => void) | null };
   const remote = { current: null as RevisionRemoteAdapter["apply"] | null };
+  const source = {
+    current: null as ((value: string, previous?: string) => void) | null,
+  };
   let editor: Editor | null = null;
   await act(async () =>
     root.render(
@@ -276,11 +280,18 @@ async function mountEditor(
               onBlockedSuggestionEdit: () => {},
               markdownFlushRef: flush,
               remoteUpdateRef: remote,
+              sourceUpdateRef: source,
               uiDraftStore: store,
             }}
           />
           {withSource && (
-            <MarkdownCodeEditor value={markdown} onChange={() => {}} />
+            <MarkdownCodeEditor
+              value={markdown}
+              onChange={(next) =>
+                source.current?.(next, controller?.readDraft().markdown)
+              }
+              onCompositionEnd={onSourceCompositionEnd}
+            />
           )}
         </RevisionUiDraftContext.Provider>
       </TooltipProvider>,
@@ -300,6 +311,147 @@ async function mountEditor(
   );
   return { live, flush, remote };
 }
+
+test("outside updates wait for actual source composition and drain its latest version even without a final text change", async () => {
+  const store = privateDrafts();
+  let compositionEnded = 0;
+  let draining: Promise<boolean> | undefined;
+  const { live, remote } = await mountEditor(store, original, true, () => {
+    compositionEnded++;
+    draining = controller?.retry();
+  });
+  const host = container.querySelector<HTMLElement>(".cm-editor");
+  const source = host && CodeMirrorView.findFromDOM(host);
+  if (!source) throw new Error("Expected the actual Markdown source editor");
+  let server = state();
+  const api = async <T,>(path: string, body?: object): Promise<T | null> => {
+    if (!body) return structuredClone(server) as T;
+    if (path.endsWith("/checkpoint"))
+      return { checkpointId: "composition-recovery" } as T;
+    if (!path.endsWith("/reconcile")) throw new Error(`Unexpected ${path}`);
+    const sent = body as ReconcileRequest;
+    server = state(sent.draft as RevisionDraft, server.revision + 1);
+    server.review.lastOperation = {
+      id: sent.operationId,
+      pageInstanceId: sent.pageInstanceId,
+      reason: sent.reason,
+    };
+    return { status: "committed", state: structuredClone(server) } as T;
+  };
+  vi.useFakeTimers();
+  const active = new RevisionSessionController(
+    server.review,
+    server.draft as RevisionDraft,
+    {
+      request: api,
+      storage: new MemoryStorage(),
+      tabStorage: new MemoryStorage(),
+      merge: async (base, local, incoming, options) =>
+        mergeReviewDrafts(base, local, incoming, {
+          ...options,
+          server: false,
+          budgetMs: 1000,
+        }),
+    },
+  );
+  controller = active;
+  await act(async () => {
+    active.setAdapter({
+      rebasesBufferedDocument: true,
+      prepare: (value, options) =>
+        prepareRevisionEditorDraft(value, live, options),
+      apply: (value, options) => remote.current?.(value, options) ?? null,
+      adopt: () => null,
+      readUiDrafts: store.read,
+      restoreUiDrafts: store.restore,
+      subscribeUiDrafts: store.subscribe,
+    });
+    active.start();
+    await vi.advanceTimersByTimeAsync(0);
+    source.focus();
+    source.contentDOM.dispatchEvent(
+      new CompositionEvent("compositionstart", { bubbles: true, data: "日" }),
+    );
+    const at =
+      source.state.doc.toString().indexOf("Live owner B: unchanged.") +
+      "Live owner B: unchanged.".length;
+    source.dispatch({
+      changes: { from: at, insert: " 日本語" },
+      selection: { anchor: at + 4 },
+    });
+  });
+  expect(source.compositionStarted).toBe(true);
+  const localText = source.state.sliceDoc();
+  const caret = source.state.selection.main.anchor;
+  for (const [index, addition] of [
+    " Earlier outside text.",
+    " Latest outside text.",
+  ].entries()) {
+    server = state(
+      draft(
+        original.replace(
+          "Live owner A: unchanged.",
+          `Live owner A: unchanged.${addition}`,
+        ),
+      ),
+      index + 2,
+    );
+    await act(async () => {
+      for (const listener of listeners)
+        listener({ reason: "changed", state: structuredClone(server) });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(active.getSnapshot().conflict?.kind).toBe("waiting");
+    expect(live.state.doc.textContent).not.toContain(addition.trim());
+    expect(source.state.sliceDoc()).toBe(localText);
+    expect(source.state.selection.main.anchor).toBe(caret);
+  }
+  const changesBeforeEnd = active.readDraft().markdown;
+  await act(async () => {
+    source.contentDOM.dispatchEvent(
+      new CompositionEvent("compositionend", { bubbles: true, data: "日本語" }),
+    );
+    await vi.advanceTimersByTimeAsync(60);
+    await draining;
+  });
+  expect(compositionEnded).toBe(1);
+  expect(changesBeforeEnd).toContain("日本語");
+  expect(live.state.doc.textContent).toContain("Latest outside text.");
+  expect(live.state.doc.textContent).not.toContain("Earlier outside text.");
+  expect(live.state.doc.textContent).toContain("日本語");
+  expect(active.getSnapshot().conflict).toBeNull();
+  expect(server.draft.markdown).toContain("Latest outside text.");
+  expect(server.draft.markdown).toContain("日本語");
+  expect(
+    server.draft.reviewComments.map(({ id, content, parentCommentId }) => ({
+      id,
+      content,
+      parentCommentId,
+    })),
+  ).toEqual(
+    draft(original).reviewComments.map(({ id, content, parentCommentId }) => ({
+      id,
+      content,
+      parentCommentId,
+    })),
+  );
+  await act(async () => {
+    live.commands.undo();
+  });
+  expect(live.state.doc.textContent).not.toContain(
+    "Live owner B: unchanged. 日本語",
+  );
+  expect(live.state.doc.textContent).toContain("Latest outside text.");
+  await act(async () => {
+    live.commands.redo();
+  });
+  expect(live.state.doc.textContent).toContain(
+    "Live owner B: unchanged. 日本語",
+  );
+  expect(live.state.doc.textContent).toContain("Latest outside text.");
+  expect(store.getSnapshot().comments.c1.value).toBe(privateComment);
+  expect(store.getSnapshot().comments.c99.value).toBe(privateReply);
+}, 20_000);
 
 test.each([
   "outside prose",
