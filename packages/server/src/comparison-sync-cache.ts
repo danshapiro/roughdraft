@@ -66,7 +66,10 @@ export class ReviewBaseCache {
 
 interface Turn {
   owner: string;
-  reservation: SyncReservation;
+  token: string;
+  expiresAt: number;
+  /** A queued handoff binds its revision when the selected page requests it. */
+  reservation?: SyncReservation;
 }
 const MAX_REVIEW_RESERVATION_MS = 750;
 export class ReviewReservations {
@@ -77,7 +80,7 @@ export class ReviewReservations {
 
   private clean(id: string): void {
     const turn = this.turns.get(id);
-    if (turn && turn.reservation.expiresAt <= this.now()) this.turns.delete(id);
+    if (turn && turn.expiresAt <= this.now()) this.turns.delete(id);
     const queue = this.waiting.get(id);
     if (queue)
       for (const [page, since] of queue)
@@ -87,11 +90,30 @@ export class ReviewReservations {
 
   blocked(id: string, page: string, token?: string): boolean {
     this.clean(id);
-    const turn = this.turns.get(id);
+    let turn = this.turns.get(id);
+    if (!turn) {
+      const first = this.waiting.get(id)?.keys().next().value;
+      if (first && first !== page) {
+        // A current-base save must not pass a page already preparing its next
+        // merge. The handoff uses the same bounded, non-renewable turn.
+        this.waiting.get(id)?.delete(first);
+        turn = {
+          owner: first,
+          token: crypto.randomUUID(),
+          expiresAt: this.now() + MAX_REVIEW_RESERVATION_MS,
+        };
+        this.turns.set(id, turn);
+      }
+    }
     if (!turn) return false;
-    if (turn.owner === page && turn.reservation.token === token) return false;
+    if (turn.owner === page && turn.token === token) return false;
     if (turn.owner !== page) this.enqueue(id, page);
     return true;
+  }
+
+  ownedBy(id: string, page: string): boolean {
+    this.clean(id);
+    return this.turns.get(id)?.owner === page;
   }
 
   remaining(id: string): number {
@@ -102,7 +124,7 @@ export class ReviewReservations {
           0,
           Math.min(
             MAX_REVIEW_RESERVATION_MS,
-            Math.ceil(turn.reservation.expiresAt - this.now()),
+            Math.ceil(turn.expiresAt - this.now()),
           ),
         )
       : 0;
@@ -114,15 +136,23 @@ export class ReviewReservations {
     return Boolean(
       token &&
         turn?.owner === page &&
-        turn.reservation.token === token &&
-        turn.reservation.revision === revision,
+        turn.token === token &&
+        turn.reservation?.revision === revision,
     );
   }
 
   request(id: string, page: string, revision: number): SyncReservation | null {
     this.clean(id);
     const active = this.turns.get(id);
-    if (active) return active.owner === page ? active.reservation : null;
+    if (active) {
+      if (active.owner !== page) return null;
+      active.reservation ??= {
+        token: active.token,
+        expiresAt: active.expiresAt,
+        revision,
+      };
+      return active.reservation;
+    }
     this.enqueue(id, page);
     const first = this.waiting.get(id)?.keys().next().value;
     if (first !== page) return null;
@@ -132,7 +162,12 @@ export class ReviewReservations {
       revision,
       expiresAt: this.now() + MAX_REVIEW_RESERVATION_MS,
     };
-    this.turns.set(id, { owner: page, reservation });
+    this.turns.set(id, {
+      owner: page,
+      token: reservation.token,
+      expiresAt: reservation.expiresAt,
+      reservation,
+    });
     return reservation;
   }
 

@@ -1591,20 +1591,27 @@ export class ComparisonStore {
           message: "Refresh the save context and retry your queued changes.",
         });
       const request = body as unknown as ReconcileRequest;
-      const admission = () => ({
-        revision: review.revision,
-        blocked: this.reservations.blocked(
+      const admission = () => {
+        const blocked = this.reservations.blocked(
           id,
           operation.pageInstanceId,
           request.reservationToken,
-        ),
-        reserved: this.reservations.valid(
-          id,
-          operation.pageInstanceId,
-          request.reservationToken,
-          review.revision,
-        ),
-      });
+        );
+        return {
+          revision: review.revision,
+          blocked,
+          recoverToken:
+            blocked &&
+            !request.reservationToken &&
+            this.reservations.ownedBy(id, operation.pageInstanceId),
+          reserved: this.reservations.valid(
+            id,
+            operation.pageInstanceId,
+            request.reservationToken,
+            review.revision,
+          ),
+        };
+      };
       // These locks already exclude another review/file mutation. Journal I/O
       // must not turn an admitted holder into a late request, or a denied peer
       // into a writer, merely because the same request's flushes take time.
@@ -1677,6 +1684,13 @@ export class ComparisonStore {
           );
         }
       if (turn.blocked) {
+        // A page selected from the waiting queue has not received its token
+        // yet. The existing fallback reveals that same turn to its owner;
+        // other pages remain denied and the deadline is never renewed.
+        if (turn.recoverToken)
+          return reject(
+            this.fallback(review, operation, "client-merge-required"),
+          );
         return reject({
           status: "retry-later",
           retryAfter: this.reservations.remaining(id) || 25,
