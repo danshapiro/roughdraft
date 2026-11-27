@@ -28,6 +28,19 @@ export interface ParsedSource {
 }
 const caches = new WeakMap<object, Map<string, ParsedSource>>();
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;
+interface SourceLayout {
+  readonly spans: ReadonlyArray<Readonly<{ from: number; to: number }>>;
+  readonly definitions: string;
+  readonly endnoteDefinitions: ReadonlySet<string>;
+  readonly context: string;
+}
+const layouts = new Map<
+  string,
+  { layout: SourceLayout | null; bytes: number }
+>();
+const MAX_LAYOUTS = 8;
+const MAX_LAYOUT_BYTES = 1024 * 1024;
+let layoutBytes = 0;
 
 /** Reuse only literal prose whose Markdown meaning needs no parser or context. */
 function unchangedPlainParagraph(
@@ -116,7 +129,38 @@ function reviewRanges(body: string) {
   return ranges;
 }
 
-function sourceBlocks(body: string) {
+/** Reuse source-only offsets/context, never a parsed model or live attributes. */
+function sourceBlocks(body: string): SourceLayout | null {
+  const cached = layouts.get(body);
+  if (cached) {
+    layouts.delete(body);
+    layouts.set(body, cached);
+    return cached.layout;
+  }
+  const layout = lexSourceBlocks(body);
+  const bytes =
+    body.length * 2 +
+    (layout
+      ? (layout.definitions.length +
+          layout.context.length +
+          [...layout.endnoteDefinitions].join("").length) *
+          2 +
+        layout.spans.length * 16
+      : 0);
+  if (bytes <= MAX_LAYOUT_BYTES) {
+    layouts.set(body, { layout, bytes });
+    layoutBytes += bytes;
+    while (layouts.size > MAX_LAYOUTS || layoutBytes > MAX_LAYOUT_BYTES) {
+      const oldest = layouts.entries().next().value;
+      if (!oldest) break;
+      layoutBytes -= oldest[1].bytes;
+      layouts.delete(oldest[0]);
+    }
+  }
+  return layout;
+}
+
+function lexSourceBlocks(body: string): SourceLayout | null {
   const normalized = body.replace(/\r\n?/g, "\n");
   const offsets = [0];
   for (let at = 0; at < body.length; at++) {
