@@ -917,7 +917,8 @@ export class ComparisonStore {
       inPlace: identity.inPlace,
       witnessPath,
     };
-    this.save(review);
+    // The operation already durably pins this identity. Recovery reads it
+    // there, avoiding another full pending-review rewrite before publication.
   }
   private publicationWitness(filename: string, operationId: string): string {
     return path.join(
@@ -2674,6 +2675,17 @@ export class ComparisonStore {
         message: "There is no unfinished publication.",
       };
     let record = this.operations.read(intent.operation.operationId);
+    // Capture only the original durable witness. Rebuilding cleanup metadata
+    // below must not turn an unrecorded staging file into publication proof.
+    const recordedWitness =
+      record &&
+      !record.resultUnavailable &&
+      record.reviewId === review.id &&
+      record.operation.operationId === intent.operation.operationId &&
+      record.operation.pageInstanceId === intent.operation.pageInstanceId &&
+      record.operation.operationSequence === intent.operation.operationSequence
+        ? record.publicationWitness
+        : undefined;
     if (!record) record = this.operations.begin(intent.operation, review.id);
     this.preserveCopyFeedback(review);
     const disk = intent.path ? this.diskAt(intent.path) : null;
@@ -2682,6 +2694,11 @@ export class ComparisonStore {
     const witnessPath = intent.path
       ? this.publicationWitness(intent.path, intent.operation.operationId)
       : null;
+    const publishedIdentity =
+      intent.publishedIdentity ??
+      (recordedWitness?.path === witnessPath
+        ? { ...recordedWitness, inPlace: false, witnessPath }
+        : undefined);
     let held: fs.Stats | null = null;
     if (witnessPath) {
       try {
@@ -2699,15 +2716,15 @@ export class ComparisonStore {
     }
     if (
       disk?.availability === "available" &&
-      intent.publishedIdentity &&
+      publishedIdentity &&
       intent.path &&
       held &&
-      intent.publishedIdentity.witnessPath === witnessPath
+      publishedIdentity.witnessPath === witnessPath
     ) {
       const stat = fs.statSync(intent.path);
       ownedFile =
-        stat.dev === intent.publishedIdentity.device &&
-        stat.ino === intent.publishedIdentity.inode &&
+        stat.dev === publishedIdentity.device &&
+        stat.ino === publishedIdentity.inode &&
         held.dev === stat.dev &&
         held.ino === stat.ino;
     }
