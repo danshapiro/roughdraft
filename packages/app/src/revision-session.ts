@@ -311,6 +311,29 @@ function readableResponse<T>(value: T): T {
   return value;
 }
 
+function remainingRetryDelay<T>(value: T, requestedAt: number): T {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !("status" in value) ||
+    value.status !== "retry-later"
+  )
+    return value;
+  const delay =
+    "retryAfter" in value && typeof value.retryAfter === "number"
+      ? value.retryAfter
+      : 100;
+  // Durable bookkeeping and response delivery already consume the backoff.
+  // The server still guards the actual turn if an early retry reaches it.
+  return {
+    ...value,
+    retryAfter: Math.max(
+      20,
+      Math.min(750, delay) - Math.max(0, performance.now() - requestedAt),
+    ),
+  } as T;
+}
+
 /** One coalescing queue owns writes; notifications never replace newer local work. */
 export class RevisionSessionController {
   private snapshot: SessionSnapshot;
@@ -413,13 +436,14 @@ export class RevisionSessionController {
     this.now = dependencies.now ?? Date.now;
     this.api = async <T>(path: string, body?: object, etag?: string) => {
       const previous = this.snapshot?.session ?? initial;
+      const requestedAt = performance.now();
       const value = dependencies.request
         ? receiveSyncResponse(
             await dependencies.request<T>(path, body, etag),
             previous,
           )
         : await requestRevisionSync<T>(path, body, etag, previous);
-      return readableResponse(value);
+      return readableResponse(remainingRetryDelay(value, requestedAt));
     };
     this.merge = dependencies.merge ?? mergeReviewDraftsAsync;
     this.pageId = dependencies.id?.() ?? randomId();

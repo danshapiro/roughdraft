@@ -214,3 +214,106 @@ test("a compact retry uses the server retry revision so its existing turn is not
   expect(posts).toHaveLength(2);
   expect(posts[1] - posts[0]).toBeGreaterThanOrEqual(700);
 });
+
+test.each([
+  { delay: 589, retryAfter: 228, remaining: 20 },
+  { delay: 100, retryAfter: 700, remaining: 600 },
+])("a retry response delayed by $delay ms consumes its $retryAfter ms backoff", async ({
+  delay,
+  retryAfter,
+  remaining,
+}) => {
+  let server = state();
+  const posts: number[] = [];
+  const controller = install(async <T>(route: string, body?: object) => {
+    if (!body) return structuredClone(server) as T;
+    if (route.endsWith("/checkpoint")) return { checkpointId: "recovery" } as T;
+    const request = body as ReconcileRequest;
+    posts.push(performance.now());
+    if (posts.length === 1) {
+      // This is the saved strict-run case: durable result/response delivery
+      // takes longer than the peer's remaining turn, with no fresh notice.
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      return {
+        status: "retry-later",
+        retryAfter,
+        retryRevision: 1,
+        operationContext: server.operationContext,
+      } as T;
+    }
+    server = state(request.draft.markdown, 2);
+    server.review.lastOperation = {
+      id: request.operationId,
+      pageInstanceId: request.pageInstanceId,
+      reason: request.reason,
+    };
+    return { status: "committed", state: server } as T;
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  controller.updateDraft((draft) => ({
+    ...draft,
+    markdown: "Typed text.\n",
+    cleanMarkdown: "Typed text.\n",
+  }));
+  await vi.advanceTimersByTimeAsync(300);
+  expect(posts).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(delay);
+  expect(posts).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(remaining - 1);
+  expect(posts).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(posts).toHaveLength(2);
+  expect(posts[1] - posts[0]).toBe(delay + remaining);
+  expect(server.draft.markdown).toBe("Typed text.\n");
+  expect(controller.readDraft().markdown).toBe("Typed text.\n");
+});
+
+test("an elapsed-aware retry still respects an authoritative turn that remains held", async () => {
+  let server = state();
+  const posts: number[] = [];
+  let turnEnds = 0;
+  const controller = install(async <T>(route: string, body?: object) => {
+    if (!body) return structuredClone(server) as T;
+    if (route.endsWith("/checkpoint")) return { checkpointId: "recovery" } as T;
+    const request = body as ReconcileRequest;
+    posts.push(performance.now());
+    if (posts.length === 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      // This hint was calculated late in request processing. The next request
+      // may arrive before expiry, and the server must retain the actual turn.
+      turnEnds = performance.now() + 700;
+    }
+    if (performance.now() < turnEnds)
+      return {
+        status: "retry-later",
+        retryAfter: turnEnds - performance.now(),
+        retryRevision: 1,
+        operationContext: server.operationContext,
+      } as T;
+    server = state(request.draft.markdown, 2);
+    server.review.lastOperation = {
+      id: request.operationId,
+      pageInstanceId: request.pageInstanceId,
+      reason: request.reason,
+    };
+    return { status: "committed", state: server } as T;
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  controller.updateDraft((draft) => ({
+    ...draft,
+    markdown: "Typed text.\n",
+    cleanMarkdown: "Typed text.\n",
+  }));
+  await vi.advanceTimersByTimeAsync(300 + 100 + 599);
+  expect(posts).toHaveLength(1);
+  expect(server.revision).toBe(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(posts).toHaveLength(2);
+  expect(server.revision).toBe(1);
+  await vi.advanceTimersByTimeAsync(99);
+  expect(posts).toHaveLength(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(posts).toHaveLength(3);
+  expect(posts[2]).toBe(turnEnds);
+  expect(server.draft.markdown).toBe("Typed text.\n");
+});
