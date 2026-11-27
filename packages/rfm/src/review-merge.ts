@@ -775,6 +775,15 @@ export function mergeReviewDrafts(
     });
     const result: SyncDraft = {
       markdown,
+      // Operational disk ancestry follows the side that advanced it. An older
+      // page that omits this optional field cannot erase an acknowledged map.
+      ...(local.diskOrigin || incoming.diskOrigin || base.diskOrigin
+        ? {
+            diskOrigin: same(local.diskOrigin, base.diskOrigin)
+              ? (incoming.diskOrigin ?? local.diskOrigin ?? base.diskOrigin)
+              : (local.diskOrigin ?? incoming.diskOrigin ?? base.diskOrigin),
+          }
+        : {}),
       decisions: value(
         base.decisions,
         local.decisions,

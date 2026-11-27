@@ -354,7 +354,7 @@ test("restoring a file preserves newer local typing and resumes its queued save"
   ).toHaveLength(1);
 });
 
-test("an equal-base notice retains an actual text conflict", async () => {
+test("a newer still-overlapping edit retains the actual text conflict", async () => {
   const { controller } = install();
   await settle();
   controller.updateDraft((draft) => ({
@@ -365,7 +365,7 @@ test("an equal-base notice retains an actual text conflict", async () => {
   push(state("Peer first.\n\nLast.\n", 2));
   await settle();
   expect(controller.getSnapshot().conflict?.kind).toBe("conflict");
-  push(state(text, 2));
+  push(state("Peer revised the first passage again.\n\nLast.\n", 3));
   await settle();
   expect(controller.getSnapshot().conflict?.kind).toBe("conflict");
   expect(controller.getSnapshot().writePaused).toBe(true);

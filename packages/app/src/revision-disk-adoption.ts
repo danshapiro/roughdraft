@@ -1,4 +1,12 @@
-import { mergeReviewDrafts, type SyncDraft } from "@roughdraft/rfm";
+import {
+  contentSignature,
+  extractRoughdraftReviewIndex,
+  mergeReviewDrafts,
+  renumberReviewDraft,
+  reviewDraftSignature,
+  type SyncDraft,
+  type SyncMerge,
+} from "@roughdraft/rfm";
 import { EditorState } from "@tiptap/pm/state";
 import { Mapping } from "@tiptap/pm/transform";
 import type { Node, Schema } from "@tiptap/pm/model";
@@ -10,6 +18,7 @@ import { rejectCriticChangeTransaction } from "./editor-extensions";
 import { suggestionDetail } from "./revision-bulk";
 import {
   cleanRevisionDocument,
+  cleanRevisionSourceMarkdown,
   createSourceSpellingPreserver,
 } from "./revision-markdown";
 import {
@@ -62,13 +71,163 @@ function annotationRanges(doc: Node) {
 }
 
 /** Reconcile disk's accepted text into a detached review state; never mutate the live editor. */
+export interface RevisionDiskBase {
+  path: string;
+  /** Exact disk text acknowledged by the shared review, not its edited draft. */
+  markdown: string;
+  resolution?: "local" | "incoming";
+}
+export type RevisionDiskMerge = SyncMerge & { diskCleanMarkdown?: string };
+export function adoptRevisionDisk(
+  base: SyncDraft,
+  markdown: string,
+  schema: Schema,
+  force?: boolean,
+): SyncDraft | null;
+export function adoptRevisionDisk(
+  base: SyncDraft,
+  markdown: string,
+  schema: Schema,
+  force: boolean | undefined,
+  diskBase: RevisionDiskBase | undefined,
+): SyncDraft | RevisionDiskMerge | null;
 export function adoptRevisionDisk(
   base: SyncDraft,
   markdown: string,
   schema: Schema,
   force = false,
-): SyncDraft | null {
+  diskBase?: RevisionDiskBase,
+): SyncDraft | RevisionDiskMerge | null {
+  if (diskBase) {
+    try {
+      return mergeDisk(base, markdown, schema, force, diskBase);
+    } catch (error) {
+      console.warn(
+        JSON.stringify({
+          severity: "warning",
+          component: "revision-editor",
+          event: "disk-adoption-unavailable",
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      return {
+        status: "client-merge-required",
+        draft: base,
+        conflicts: [],
+        signature: reviewDraftSignature(base),
+        reason: "The outside update could not be mapped safely.",
+      };
+    }
+  }
   return adoptDisk(base, markdown, schema, force);
+}
+
+function diskDraft(markdown: string, schema: Schema): SyncDraft {
+  const parsed = parseRemoteRevision(markdown, EditorState.create({ schema }));
+  const undated = new Set(
+    extractRoughdraftReviewIndex(markdown)
+      .items.filter((item) => item.kind === "comment" && !item.createdAt)
+      .map((item) => item.id),
+  );
+  return {
+    markdown,
+    cleanMarkdown: cleanRevisionSourceMarkdown(markdown),
+    decisions: {},
+    reviewComments: [...parsed.comments.values()].map((comment) => ({
+      ...comment,
+      ...(undated.has(comment.id)
+        ? { createdAt: "1970-01-01T00:00:00.000Z" }
+        : {}),
+      changeId: comment.parentCommentId ?? "document",
+    })),
+  };
+}
+
+/** Disk and browser changes share the last acknowledged annotated disk base. */
+function mergeDisk(
+  review: SyncDraft,
+  markdown: string,
+  schema: Schema,
+  force: boolean,
+  diskBase: RevisionDiskBase,
+): RevisionDiskMerge {
+  const origin = review.diskOrigin;
+  const aliases =
+    origin?.path === diskBase.path &&
+    origin.signature === contentSignature(diskBase.markdown)
+      ? origin.ids
+      : {};
+  const before = renumberReviewDraft(
+    diskDraft(diskBase.markdown, schema),
+    aliases,
+  );
+  const disk = renumberReviewDraft(diskDraft(markdown, schema), aliases);
+  // When outside prose displaces a saved anchor, retain the original feedback
+  // detached from that passage. A deliberately removed annotation on unchanged
+  // prose stays removed. Reuse the editor's existing annotation mapper.
+  const displaced = adoptDisk(
+    before,
+    disk.cleanMarkdown ?? disk.markdown,
+    schema,
+    force,
+  );
+  if (!displaced)
+    return {
+      status: "client-merge-required",
+      draft: review,
+      conflicts: [],
+      signature: reviewDraftSignature(review),
+      reason: "The outside update could not be mapped safely.",
+    };
+  {
+    const ids = new Set(disk.reviewComments.map((comment) => comment.id));
+    disk.reviewComments.push(
+      ...displaced.reviewComments.filter(
+        (comment) => comment.detachedReason && !ids.has(comment.id),
+      ),
+    );
+    if (displaced.outdatedSuggestions?.length)
+      disk.outdatedSuggestions = displaced.outdatedSuggestions;
+  }
+  const merged = mergeReviewDrafts(before, disk, review, {
+    server: false,
+    budgetMs: 100,
+    ...(diskBase.resolution
+      ? { resolution: diskBase.resolution === "local" ? "incoming" : "local" }
+      : {}),
+  });
+  if (merged.status !== "merged")
+    return {
+      ...merged,
+      conflicts: merged.conflicts.map((conflict) => ({
+        ...conflict,
+        local: conflict.incoming,
+        incoming: conflict.local,
+      })),
+    };
+  const ids: Record<string, string> = { ...aliases };
+  for (const item of extractRoughdraftReviewIndex(markdown).items) {
+    const mapped = aliases[item.id] ?? item.id;
+    if (merged.idRemap?.[mapped]) ids[item.id] = merged.idRemap[mapped];
+  }
+  const draft: SyncDraft = {
+    ...merged.draft,
+    cleanMarkdown: cleanRevisionSourceMarkdown(merged.draft.markdown),
+    diskOrigin: {
+      path: diskBase.path,
+      signature: contentSignature(markdown),
+      ids,
+    },
+  };
+  // The remapping belongs to disk's identities. Browser drafts and their UI
+  // references already own their IDs and must not be renamed with this map.
+  return {
+    ...merged,
+    draft,
+    diskCleanMarkdown: disk.cleanMarkdown,
+    idRemap: undefined,
+    signature: reviewDraftSignature(draft),
+  };
 }
 function adoptDisk(
   base: SyncDraft,
@@ -133,9 +292,13 @@ function adoptDisk(
         changeId: comment.parentCommentId ?? "document",
       })),
     };
+    // The detached model may omit a trailing space that exists solely before
+    // a pending proposal. Use its actual accepted spelling as the annotation
+    // merge base; that normalization is not an independent browser deletion.
+    const acceptedSpelling = cleanRevisionSourceMarkdown(adopted.markdown);
     const plain: SyncDraft = {
-      markdown: clean,
-      cleanMarkdown: clean,
+      markdown: acceptedSpelling,
+      cleanMarkdown: acceptedSpelling,
       decisions: {},
       reviewComments: [],
     };

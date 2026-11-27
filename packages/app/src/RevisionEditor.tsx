@@ -766,9 +766,9 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         }
         return result;
       },
-      adopt: (base, markdown, force) =>
+      adopt: (base, markdown, force, diskBase) =>
         measureRevision("disk-adoption", () =>
-          adoptRevisionDisk(base, markdown, editor.schema, force),
+          adoptRevisionDisk(base, markdown, editor.schema, force, diskBase),
         ),
       readUiDrafts: uiDraftStore.read,
       restoreUiDrafts: uiDraftStore.restore,
@@ -2111,6 +2111,10 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                         testId="revision-markdown"
                         className="revision-source-text"
                         value={draft.markdown}
+                        onCompositionEnd={() => {
+                          if (liveConflict?.kind === "waiting")
+                            void retrySync().catch(reportError);
+                        }}
                         readOnly={
                           previewing || interaction !== "editing" || copyLocked
                         }

@@ -2,6 +2,7 @@ import {
   type CopyDestination,
   type CopyRequest,
   extractRoughdraftReviewIndex,
+  hasUnsubmittedReviewFeedback,
   mergeReviewDrafts,
   type ReconcileRequest,
   renumberReviewDraft,
@@ -35,6 +36,10 @@ import {
   type SentDraftReference,
 } from "./revision-sync-transfer";
 import { privateReplyTarget, privateRootTarget } from "./revision-ui-drafts";
+import type {
+  RevisionDiskBase,
+  RevisionDiskMerge,
+} from "./revision-disk-adoption";
 
 export interface InspectedDestination {
   path: string;
@@ -67,7 +72,8 @@ export interface RevisionRemoteAdapter {
     base: RevisionDraft,
     markdown: string,
     force?: boolean,
-  ): RevisionDraft | null;
+    diskBase?: RevisionDiskBase,
+  ): RevisionDraft | RevisionDiskMerge | null;
   readUiDrafts(): Record<string, unknown>;
   restoreUiDrafts(drafts: Record<string, unknown>): void;
   flush?(): void;
@@ -108,6 +114,7 @@ interface CheckpointEpisode {
   generation: number;
   checkpointId?: string;
   waitOnly: boolean;
+  reconciled?: boolean;
   protectedUi: boolean;
   coveragePending: boolean;
   coveredGeneration?: number;
@@ -365,6 +372,11 @@ export class RevisionSessionController {
   private checkpointRecoveryId: string | undefined;
   private checkpointEpisode: CheckpointEpisode | undefined;
   private diskProjections = new Map<string, string>();
+  private reflectedDisk: {
+    path: string;
+    baseSignature: string;
+    draft: RevisionDraft;
+  } | null = null;
   private observedOverwriteId: string | undefined;
 
   constructor(
@@ -1133,9 +1145,10 @@ export class RevisionSessionController {
           this.checkpointEpisode = {
             ...this.checkpointEpisode,
             generation: this.generation,
-            protectedUi:
-              this.checkpointEpisode.protectedUi ||
-              hasUiDrafts(adapter.readUiDrafts()),
+            protectedUi: hasUnsubmittedReviewFeedback(
+              adapter.readUiDrafts(),
+              this.current.reviewComments,
+            ),
             coveragePending: true,
           };
           this.scheduleCheckpoint();
@@ -1174,7 +1187,11 @@ export class RevisionSessionController {
     update: (current: RevisionDraft) => RevisionDraft,
     options?: { readyToSave?: boolean },
   ) => {
-    const next = update(this.current);
+    const updated = update(this.current);
+    const next =
+      updated.diskOrigin || !this.current.diskOrigin
+        ? updated
+        : { ...updated, diskOrigin: this.current.diskOrigin };
     if (sameReviewDraft(next, this.current)) return;
     this.current = next;
     this.generation++;
@@ -1290,8 +1307,10 @@ export class RevisionSessionController {
       if (this.state) this.confirmCheckpointResolution(this.state);
       if (
         this.checkpointEpisode?.waitOnly &&
-        !this.checkpointEpisode.protectedUi &&
-        !hasUiDrafts(this.adapter?.readUiDrafts() ?? {})
+        !hasUnsubmittedReviewFeedback(
+          this.adapter?.readUiDrafts(),
+          this.current.reviewComments,
+        )
       )
         queueMicrotask(() => {
           if (!this.stopped) void this.refresh();
@@ -1308,8 +1327,10 @@ export class RevisionSessionController {
       !episode ||
       episode.coveredGeneration === undefined ||
       episode.generation > episode.coveredGeneration ||
-      episode.protectedUi ||
-      hasUiDrafts(this.adapter?.readUiDrafts() ?? {})
+      hasUnsubmittedReviewFeedback(
+        this.adapter?.readUiDrafts(),
+        this.current.reviewComments,
+      )
     )
       return;
     const saved = state.review.recoveryCheckpoints?.find(
@@ -1448,7 +1469,10 @@ export class RevisionSessionController {
         pageInstanceId: this.pageId,
         generation: this.generation,
         waitOnly: kind !== "conflict",
-        protectedUi: hasUiDrafts(uiDrafts),
+        protectedUi: hasUnsubmittedReviewFeedback(
+          uiDrafts,
+          this.current.reviewComments,
+        ),
         coveragePending: true,
       };
     } else {
@@ -1456,8 +1480,10 @@ export class RevisionSessionController {
         ...this.checkpointEpisode,
         generation: this.generation,
         waitOnly: this.checkpointEpisode.waitOnly && kind !== "conflict",
-        protectedUi:
-          this.checkpointEpisode.protectedUi || hasUiDrafts(uiDrafts),
+        protectedUi: hasUnsubmittedReviewFeedback(
+          uiDrafts,
+          this.current.reviewComments,
+        ),
         coveragePending: true,
       };
     }
@@ -1723,15 +1749,59 @@ export class RevisionSessionController {
   private incomingFor(
     state: SyncState<ComparisonReviewData>,
     force = false,
-  ): RevisionDraft | null {
+    resolution?: "local" | "incoming",
+  ): RevisionDiskMerge | null {
     const disk = state.disk;
     if (!disk || disk.text === null || disk.text === state.review.savedText)
-      return state.draft as RevisionDraft;
+      return {
+        status: "merged",
+        draft: state.draft,
+        conflicts: [],
+        signature: state.signature,
+      };
     const adopted =
-      this.adapter?.adopt(state.draft as RevisionDraft, disk.text, force) ??
-      null;
-    if (adopted) this.rememberDiskProjection(state, adopted.cleanMarkdown);
-    return adopted;
+      this.adapter?.adopt(
+        state.draft as RevisionDraft,
+        disk.text,
+        force,
+        typeof state.review.savedText === "string"
+          ? { path: disk.path, markdown: state.review.savedText, resolution }
+          : undefined,
+      ) ?? null;
+    if (!adopted) return null;
+    const result: RevisionDiskMerge =
+      "status" in adopted
+        ? adopted
+        : {
+            status: "merged",
+            draft: adopted,
+            conflicts: [],
+            signature: reviewDraftSignature(adopted),
+            diskCleanMarkdown: adopted.cleanMarkdown,
+          };
+    if (result.status === "merged")
+      this.rememberDiskProjection(state, result.diskCleanMarkdown);
+    return result;
+  }
+  private incomingMergeBase(state: SyncState<ComparisonReviewData>) {
+    return this.reflectedDisk &&
+      this.reflectedDisk.path === state.disk?.path &&
+      this.reflectedDisk.baseSignature === reviewDraftSignature(this.base)
+      ? this.reflectedDisk.draft
+      : this.base;
+  }
+  private rememberReflectedDisk(
+    state: SyncState<ComparisonReviewData>,
+    incoming: RevisionDraft,
+  ) {
+    this.reflectedDisk =
+      state.disk && state.disk.text !== state.review.savedText
+        ? {
+            path: state.disk.path,
+            baseSignature: reviewDraftSignature(this.base),
+            draft: incoming,
+          }
+        : null;
   }
   private incomingUpdateCause(state: SyncState<ComparisonReviewData>) {
     const disk = state.disk;
@@ -1851,7 +1921,11 @@ export class RevisionSessionController {
         );
         return;
       }
-      const incoming = this.incomingFor(state);
+      const adoption = this.incomingFor(state);
+      const incoming =
+        adoption?.status === "merged"
+          ? (adoption.draft as RevisionDraft)
+          : null;
       const diskChanged = Boolean(
         disk?.text !== null &&
           disk?.text !== undefined &&
@@ -1865,9 +1939,10 @@ export class RevisionSessionController {
           return;
         }
         this.wait(
-          "waiting",
+          adoption?.status === "conflict" ? "conflict" : "waiting",
           `${this.incomingUpdateCause(state)} It could not be mapped safely. Your feedback is preserved.`,
           state,
+          adoption ?? undefined,
         );
         return;
       }
@@ -1887,12 +1962,15 @@ export class RevisionSessionController {
         const waiting = this.snapshot.conflict;
         const resumed =
           waiting &&
-          (waiting.kind === "file" || waiting.kind === "waiting") &&
-          !waiting.conflicts.length &&
+          (waiting.kind === "file" ||
+            waiting.kind === "waiting" ||
+            waiting.kind === "conflict") &&
+          (waiting.kind === "conflict" || !waiting.conflicts.length) &&
           !waiting.storagePressure &&
           !this.operation &&
           !this.copyOperation &&
           !this.snapshot.copyLocked;
+        if (resumed) this.allowAutomaticCheckpointResolution();
         this.emit({
           session: state.review,
           recoveryError: "",
@@ -1910,7 +1988,9 @@ export class RevisionSessionController {
         if (
           diskChanged ||
           !sameReviewDraft(this.current, this.base) ||
-          this.needsFileWrite(state)
+          this.needsFileWrite(state) ||
+          (this.checkpointEpisode?.coveragePending &&
+            "coveredCheckpoint" in this.coveredWaitCheckpoint(this.generation))
         )
           this.schedule(0);
         return;
@@ -1918,9 +1998,14 @@ export class RevisionSessionController {
       if (!this.adapter?.rebasesBufferedDocument) this.adapter?.flush?.();
       const localBase = this.current;
       const mergeGeneration = this.generation;
-      const merged = await this.merge(this.base, localBase, incoming, {
-        server: false,
-      });
+      const merged = await this.merge(
+        this.incomingMergeBase(state),
+        localBase,
+        incoming,
+        {
+          server: false,
+        },
+      );
       if (merged.status !== "merged") {
         this.wait(
           merged.status === "conflict" ? "conflict" : "waiting",
@@ -1983,6 +2068,8 @@ export class RevisionSessionController {
       }
       this.base = state.draft as RevisionDraft;
       this.baseRevision = state.revision;
+      this.rememberReflectedDisk(state, incoming);
+      this.allowAutomaticCheckpointResolution();
       this.emit({
         session: state.review,
         conflict: null,
@@ -1996,7 +2083,9 @@ export class RevisionSessionController {
       if (
         diskChanged ||
         !sameReviewDraft(this.current, this.base) ||
-        this.needsFileWrite(state)
+        this.needsFileWrite(state) ||
+        (this.checkpointEpisode?.coveragePending &&
+          "coveredCheckpoint" in this.coveredWaitCheckpoint(this.generation))
       )
         this.schedule(0);
     });
@@ -2017,13 +2106,25 @@ export class RevisionSessionController {
       JSON.stringify(this.adapter?.readUiDrafts() ?? {})
     );
   }
+  private allowAutomaticCheckpointResolution() {
+    if (!this.checkpointEpisode || !this.snapshot.conflict) return;
+    const previous = this.checkpointEpisode;
+    this.checkpointEpisode = {
+      ...previous,
+      waitOnly: true,
+      reconciled: previous.reconciled || !previous.waitOnly,
+      coveragePending: true,
+    };
+  }
   private coveredWaitCheckpoint(generation: number) {
     const episode = this.checkpointEpisode;
     if (
       !episode?.waitOnly ||
-      episode.protectedUi ||
       generation < episode.generation ||
-      hasUiDrafts(this.adapter?.readUiDrafts() ?? {})
+      hasUnsubmittedReviewFeedback(
+        this.adapter?.readUiDrafts(),
+        this.current.reviewComments,
+      )
     )
       return {};
     return {
@@ -2031,6 +2132,9 @@ export class RevisionSessionController {
         recoveryId: episode.recoveryId,
         pageInstanceId: episode.pageInstanceId,
         generation: episode.generation,
+        ...(episode.reconciled
+          ? { reconciledSignature: reviewDraftSignature(this.current) }
+          : {}),
       },
     };
   }
@@ -2078,8 +2182,10 @@ export class RevisionSessionController {
       this.checkpointEpisode = {
         ...this.checkpointEpisode,
         generation,
-        protectedUi:
-          this.checkpointEpisode.protectedUi || hasUiDrafts(uiDrafts),
+        protectedUi: hasUnsubmittedReviewFeedback(
+          uiDrafts,
+          this.current.reviewComments,
+        ),
         coveragePending: true,
       };
     this.persist();
@@ -2126,8 +2232,10 @@ export class RevisionSessionController {
           if (
             !this.snapshot.conflict &&
             this.checkpointEpisode?.waitOnly &&
-            !this.checkpointEpisode.protectedUi &&
-            !hasUiDrafts(this.adapter?.readUiDrafts() ?? {})
+            !hasUnsubmittedReviewFeedback(
+              this.adapter?.readUiDrafts(),
+              this.current.reviewComments,
+            )
           )
             this.schedule(0);
           if (this.snapshot.conflict)
@@ -2360,20 +2468,30 @@ export class RevisionSessionController {
           result.state
         ) {
           if (result.status === "base-unavailable") includeBase = true;
-          const incoming = this.incomingFor(result.state);
+          const adoption = this.incomingFor(
+            result.state,
+            false,
+            resolution?.choice,
+          );
+          const incoming =
+            adoption?.status === "merged"
+              ? (adoption.draft as RevisionDraft)
+              : null;
           const disk = result.state.disk;
           if (!incoming) {
             this.wait(
-              "waiting",
+              adoption?.status === "conflict" ? "conflict" : "waiting",
               "The outside file update is waiting for safe mapping.",
               result.state,
+              adoption ?? undefined,
             );
             return false;
           }
           if (!this.adapter?.rebasesBufferedDocument) this.adapter?.flush?.();
           const localBase = this.current;
           const mergeGeneration = this.generation;
-          const check = await this.merge(this.base, localBase, incoming, {
+          const mergeBase = this.incomingMergeBase(result.state);
+          const check = await this.merge(mergeBase, localBase, incoming, {
             server: false,
           });
           if (
@@ -2390,7 +2508,7 @@ export class RevisionSessionController {
             return false;
           }
           const merged = resolution
-            ? await this.merge(this.base, localBase, incoming, {
+            ? await this.merge(mergeBase, localBase, incoming, {
                 server: false,
                 resolution: resolution.choice,
               })
@@ -2427,6 +2545,7 @@ export class RevisionSessionController {
               return false;
             this.base = result.state.draft as RevisionDraft;
             this.baseRevision = result.state.revision;
+            this.rememberReflectedDisk(result.state, incoming);
           }
           if (result.reservation) {
             const candidate = prepared ?? this.current;
@@ -2648,8 +2767,8 @@ export class RevisionSessionController {
         `/${encodeURIComponent(this.snapshot.session.id)}/state`,
       );
       if (!fresh) return false;
-      const incoming = this.incomingFor(fresh);
-      if (!incoming) {
+      const adoption = this.incomingFor(fresh);
+      if (!adoption || adoption.status === "client-merge-required") {
         this.wait(
           "waiting",
           "The outside file update is waiting for safe mapping.",
@@ -2657,9 +2776,12 @@ export class RevisionSessionController {
         );
         return false;
       }
-      const check = await this.merge(resolutionBase, this.current, incoming, {
-        server: false,
-      });
+      const check =
+        adoption.status === "conflict"
+          ? adoption
+          : await this.merge(resolutionBase, this.current, adoption.draft, {
+              server: false,
+            });
       if (
         check.status === "conflict" &&
         check.signature !== inspectedSignature
@@ -2673,6 +2795,13 @@ export class RevisionSessionController {
         );
         return false;
       }
+      const resolvedAdoption =
+        adoption.status === "conflict"
+          ? this.incomingFor(fresh, false, choice)
+          : adoption;
+      if (!resolvedAdoption || resolvedAdoption.status !== "merged")
+        return false;
+      const incoming = resolvedAdoption.draft as RevisionDraft;
       const incomingCheckpoint = await this.api<{ checkpointId: string }>(
         `/${encodeURIComponent(this.snapshot.session.id)}/checkpoint`,
         {
@@ -2750,8 +2879,15 @@ export class RevisionSessionController {
         throw new Error(
           "The latest file is unavailable. Your review remains here.",
         );
-      const incoming = this.incomingFor(fresh, true);
-      if (!incoming || !(await this.applyDraft(incoming, undefined, fresh)))
+      const adoption = this.incomingFor(fresh, true, "incoming");
+      const incoming =
+        adoption?.status === "merged"
+          ? (adoption.draft as RevisionDraft)
+          : null;
+      if (
+        !incoming ||
+        !(await this.applyDraft(incoming, adoption ?? undefined, fresh))
+      )
         return false;
       this.state = fresh;
       this.base = fresh.draft as RevisionDraft;

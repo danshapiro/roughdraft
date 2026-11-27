@@ -57,6 +57,7 @@ function normalizedDraft(draft: SyncDraft) {
       metadata: change.metadata ?? null,
     })),
     outdatedSuggestions: draft.outdatedSuggestions ?? [],
+    ...(draft.diskOrigin ? { diskOrigin: draft.diskOrigin } : {}),
   };
 }
 

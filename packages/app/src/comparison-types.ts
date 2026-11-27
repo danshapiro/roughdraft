@@ -27,6 +27,7 @@ export interface EditorDraft {
   decisions: Record<string, "kept">;
   reviewed?: ReviewedChange[];
   outdatedSuggestions?: OutdatedSuggestion[];
+  diskOrigin?: SyncDraft["diskOrigin"];
 }
 export interface DocumentMetadata {
   frontmatter: string | null;

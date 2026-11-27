@@ -189,6 +189,19 @@ export function renumberReviewDraft(
   };
   return {
     ...draft,
+    ...(draft.diskOrigin
+      ? {
+          diskOrigin: {
+            ...draft.diskOrigin,
+            ids: Object.fromEntries(
+              Object.entries(draft.diskOrigin.ids).map(([diskId, reviewId]) => [
+                diskId,
+                ids[reviewId] ?? reviewId,
+              ]),
+            ),
+          },
+        }
+      : {}),
     markdown: renumberMarkdown(draft.markdown, ids),
     decisions: Object.fromEntries(
       Object.entries(draft.decisions).map(([id, value]) => [

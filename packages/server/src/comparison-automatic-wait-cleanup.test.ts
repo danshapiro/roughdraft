@@ -166,6 +166,29 @@ test.each([
   expect(entry).toBeTruthy();
   if (scenario === "covered") expect(entry.resolvedAt).toBeTruthy();
   else expect(entry.resolvedAt).toBeUndefined();
+  if (scenario === "covered") {
+    await checkpoint(generation, true, {});
+    const late = (
+      await request(host.app).get(`${route}/state`)
+    ).body.review.recoveryCheckpoints.find(
+      (value: { id: string }) => value.id === id,
+    );
+    expect(
+      late.resolvedAt,
+      "a delayed covered checkpoint cannot reopen retired work",
+    ).toBe(entry.resolvedAt);
+    await checkpoint(generation + 1, true, privateUi);
+    const newer = (
+      await request(host.app).get(`${route}/state`)
+    ).body.review.recoveryCheckpoints.find(
+      (value: { id: string }) => value.id === id,
+    );
+    expect(
+      newer.resolvedAt,
+      "new private work must remain recoverable",
+    ).toBeUndefined();
+    expect(newer.generation).toBe(generation + 1);
+  }
   const preserved = (await request(host.app).get(`${route}/checkpoints/${id}`))
     .body;
   expect(preserved.workingDraft).toEqual(changed);

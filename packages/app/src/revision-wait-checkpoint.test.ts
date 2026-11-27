@@ -476,3 +476,175 @@ test.each([
   if (race === "unrelated peer")
     expect(f.state().draft.markdown).toContain("Unrelated peer paragraph.");
 });
+
+test("R3: a wait that began with an open comment editor is resolved after the editor closes and later saves cover it", async () => {
+  const f = fixture();
+  const { controller, ui } = f.page("owner");
+  await vi.advanceTimersByTimeAsync(0);
+  // The user merely has a comment editor open (nothing typed) when an update waits.
+  ui.setComment("c9", { value: "", original: "", editing: true });
+  f.local(
+    controller,
+    original.replace("First owner: stable.", "First owner: my typing."),
+  );
+  f.peer(original.replace("Second owner: stable.", "Second owner: incoming."));
+  f.block(true);
+  await controller.refresh(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(controller.getSnapshot().conflict?.kind).toBe("waiting");
+  expect(f.checkpoints()).toHaveLength(1);
+  f.block(false);
+  await controller.refresh(true);
+  await vi.advanceTimersByTimeAsync(0);
+  // The editor closes without posting anything.
+  ui.setComment("c9", null);
+  for (let index = 1; index <= 3; index++) {
+    f.local(
+      controller,
+      controller
+        .readDraft()
+        .markdown.replace(
+          /First owner:[^\n]*/,
+          `First owner: later typing ${index}.`,
+        ),
+    );
+    await controller.flush(false);
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  await controller.refresh(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.state().draft.markdown).toContain("First owner: later typing 3.");
+  expect(controller.getSnapshot().conflict).toBeNull();
+  expect(f.checkpoints()[0].resolvedAt).toEqual(expect.any(String));
+});
+
+test("R3: an overlap that disappears automatically does not leave a permanently unresolved recovery copy", async () => {
+  const f = fixture();
+  const { controller } = f.page("owner");
+  await vi.advanceTimersByTimeAsync(0);
+  f.local(
+    controller,
+    original.replace("Second owner: stable.", "Second owner: my wording."),
+  );
+  f.peer(
+    original.replace("Second owner: stable.", "Second owner: peer wording."),
+  );
+  await controller.refresh(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(controller.getSnapshot().conflict?.kind).toBe("conflict");
+  await vi.advanceTimersByTimeAsync(400);
+  expect(f.checkpoints()).toHaveLength(1);
+  // The peer replaces its overlapping wording with a change elsewhere.
+  f.peer(
+    original.replace("First owner: stable.", "First owner: peer moved here."),
+  );
+  await controller.refresh(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(controller.getSnapshot().conflict).toBeNull();
+  await controller.flush(false);
+  await vi.advanceTimersByTimeAsync(0);
+  f.local(
+    controller,
+    controller
+      .readDraft()
+      .markdown.replace(
+        "Second owner: my wording.",
+        "Second owner: my wording, later typing.",
+      ),
+  );
+  await controller.flush(false);
+  await vi.advanceTimersByTimeAsync(0);
+  await controller.refresh(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.state().draft.markdown).toContain(
+    "Second owner: my wording, later typing.",
+  );
+  expect(f.state().draft.markdown).toContain("First owner: peer moved here.");
+  expect(f.checkpoints()[0].resolvedAt).toEqual(expect.any(String));
+});
+
+test("R3: an overlap whose incoming side is undone back to the base clears without a decision", async () => {
+  const f = fixture();
+  const { controller } = f.page("owner");
+  await vi.advanceTimersByTimeAsync(0);
+  f.local(
+    controller,
+    original.replace("Second owner: stable.", "Second owner: my wording."),
+  );
+  f.peer(
+    original.replace("Second owner: stable.", "Second owner: peer wording."),
+  );
+  await controller.refresh(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(controller.getSnapshot().conflict?.kind).toBe("conflict");
+  // The peer presses Undo: the shared review returns to the common base text.
+  f.peer(original);
+  await controller.refresh(true);
+  await vi.advanceTimersByTimeAsync(0);
+  await controller.flush(false);
+  await vi.advanceTimersByTimeAsync(400);
+  expect(controller.getSnapshot().conflict).toBeNull();
+  expect(f.state().draft.markdown).toContain("Second owner: my wording.");
+});
+
+for (const submitted of [false, true]) {
+  test(
+    submitted
+      ? "a posted private comment no longer pins its covered recovery copy"
+      : "an unsubmitted non-empty comment still pins its recovery copy",
+    async () => {
+      const f = fixture();
+      const { controller, ui } = f.page("owner");
+      await vi.advanceTimersByTimeAsync(0);
+      const text = "Keep this unique unfinished feedback.";
+      ui.setComment("c9", { value: text, original: "", editing: true });
+      f.local(
+        controller,
+        original.replace("First owner: stable.", "First owner: browser edit."),
+      );
+      f.peer(
+        original.replace(
+          "Second owner: stable.",
+          "Second owner: external edit.",
+        ),
+      );
+      f.block(true);
+      await controller.refresh(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.checkpoints()).toHaveLength(1);
+      f.block(false);
+      await controller.refresh(true);
+      if (submitted) {
+        controller.updateDraft((draft) => ({
+          ...draft,
+          reviewComments: [
+            ...draft.reviewComments,
+            {
+              id: "c9",
+              changeId: "document",
+              content: text,
+              createdAt: new Date().toISOString(),
+            },
+          ],
+        }));
+        ui.setComment("c9", null);
+      }
+      await controller.flush(false);
+      await vi.advanceTimersByTimeAsync(400);
+      await controller.refresh(true);
+      expect(f.checkpoints()[0].resolvedAt).toEqual(
+        submitted ? expect.any(String) : undefined,
+      );
+      if (!submitted)
+        expect(
+          (
+            store.readCheckpoint(f.review.id, f.checkpoints()[0].id) as {
+              entryUiDrafts: unknown;
+            }
+          ).entryUiDrafts,
+        ).toEqual({
+          comments: { c9: { value: text, original: "", editing: true } },
+        });
+    },
+  );
+}

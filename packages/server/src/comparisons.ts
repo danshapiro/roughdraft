@@ -4,7 +4,9 @@ import path from "node:path";
 import {
   type CopyDestination,
   cleanRoughdraftMarkdown,
+  contentSignature,
   extractRoughdraftReviewIndex,
+  hasUnsubmittedReviewFeedback,
   mergeReviewDrafts,
   type OutdatedSuggestion,
   type ReconcileRequest,
@@ -97,6 +99,7 @@ export interface EditorDraft {
   cleanMarkdown?: string;
   decisions: Record<string, "kept">;
   reviewed?: ReviewedChange[];
+  diskOrigin?: SyncDraft["diskOrigin"];
 }
 export interface EditorFeedback {
   draft: EditorDraft;
@@ -518,11 +521,35 @@ function draftField(body: Record<string, unknown>): EditorDraft {
   if (entries.some(([key, value]) => !key || value !== "kept"))
     throw new ComparisonError(400, "decisions must map change IDs to kept");
   const reviewed = reviewedField(body.reviewed);
+  let diskOrigin: SyncDraft["diskOrigin"];
+  if (body.diskOrigin !== undefined) {
+    const origin = objectBody(body.diskOrigin);
+    const originPath = stringField(origin, "path");
+    const signature = stringField(origin, "signature");
+    const ids = objectBody(origin.ids);
+    if (
+      !originPath ||
+      !signature ||
+      Object.entries(ids).some(
+        ([id, value]) => !id || typeof value !== "string" || !value,
+      )
+    )
+      throw new ComparisonError(
+        400,
+        "Disk origin needs a path, source signature and identity map",
+      );
+    diskOrigin = {
+      path: originPath,
+      signature,
+      ids: ids as Record<string, string>,
+    };
+  }
   return {
     markdown,
     ...(cleanMarkdown !== undefined ? { cleanMarkdown } : {}),
     decisions: Object.fromEntries(entries.map(([id]) => [id, "kept"] as const)),
     ...(reviewed !== undefined ? { reviewed } : {}),
+    ...(diskOrigin ? { diskOrigin } : {}),
   };
 }
 function cleanDraft(draft: EditorDraft): string {
@@ -773,6 +800,8 @@ export class ComparisonStore {
   private parseSyncDraft(value: unknown, review: StoredComparison): SyncDraft {
     const input = objectBody(value);
     const draft = draftField(input);
+    if (!draft.diskOrigin && review.draft?.diskOrigin)
+      draft.diskOrigin = review.draft.diskOrigin;
     const comments =
       reviewCommentsField(input.reviewComments, review, true) ??
       review.reviewComments;
@@ -1861,6 +1890,21 @@ export class ComparisonStore {
           400,
           "Conflict resolution requires the inspected conflict choice",
         );
+      // A browser's aliases describe exactly the disk snapshot it accepted.
+      // A stale/older page may retain the committed map, but cannot replace it
+      // with aliases for another destination or an unacknowledged source.
+      if (
+        candidate.diskOrigin &&
+        JSON.stringify(candidate.diskOrigin) !==
+          JSON.stringify(latest.diskOrigin) &&
+        (!acceptsDisk ||
+          !freshDisk ||
+          candidate.diskOrigin.path !== freshDisk.path ||
+          candidate.diskOrigin.signature !==
+            contentSignature(freshDisk.text ?? ""))
+      ) {
+        candidate = { ...candidate, diskOrigin: latest.diskOrigin };
+      }
       const changed = !sameReviewDraft(candidate, latest);
       const overwriteNotice: ComparisonOverwriteNotice | undefined =
         request.reason === "resolve" &&
@@ -2104,7 +2148,9 @@ export class ComparisonStore {
               conflictId?: string;
             };
             if (
-              checkpoint.automaticWait === true &&
+              (checkpoint.automaticWait === true ||
+                covered.reconciledSignature ===
+                  reviewDraftSignature(submitted)) &&
               checkpoint.pageInstanceId === covered.pageInstanceId &&
               checkpoint.conflictId === covered.recoveryId
             )
@@ -2207,6 +2253,15 @@ export class ComparisonStore {
           ? body.generation
           : 0;
       const checkpointId = hash(`${id}:${page}:${conflict}`);
+      const completed = this.checkpoints(id).find(
+        (entry) =>
+          entry.id === checkpointId &&
+          entry.resolvedAt &&
+          entry.generation >= generation,
+      );
+      // A delayed snapshot cannot reopen work a durable covering save retired.
+      // A higher generation still represents new work and follows the normal path.
+      if (completed) return { checkpointId, generation: completed.generation };
       const directory = path.join(this.directory, "checkpoints", id);
       fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
       const filename = path.join(directory, `${checkpointId}.json`);
@@ -2352,15 +2407,10 @@ export class ComparisonStore {
         uiDrafts?: Record<string, unknown>;
         entryUiDrafts?: Record<string, unknown>;
       };
-      const hasUnsubmitted = (drafts: Record<string, unknown> | undefined) =>
-        Object.values(drafts ?? {}).some((value) =>
-          value && typeof value === "object"
-            ? Object.keys(value).length > 0
-            : Boolean(value),
-        );
+      const submitted = this.readReview(id).reviewComments;
       if (
-        hasUnsubmitted(snapshot.uiDrafts) ||
-        hasUnsubmitted(snapshot.entryUiDrafts)
+        hasUnsubmittedReviewFeedback(snapshot.uiDrafts, submitted) ||
+        hasUnsubmittedReviewFeedback(snapshot.entryUiDrafts, submitted)
       )
         return;
     }

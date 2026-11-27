@@ -46,6 +46,12 @@ export interface SyncDraft {
   reviewed?: SyncHistory[];
   reviewComments: SyncComment[];
   outdatedSuggestions?: OutdatedSuggestion[];
+  /** Identity aliases for the acknowledged disk source, whose text is savedText. */
+  diskOrigin?: {
+    path: string;
+    signature: string;
+    ids: Record<string, string>;
+  };
 }
 export interface SyncContext {
   owner: string;
@@ -131,6 +137,8 @@ export interface ReconcileRequest extends SyncOperation {
     recoveryId: string;
     pageInstanceId: string;
     generation: number;
+    /** A formerly overlapping episode now agrees with this complete submission. */
+    reconciledSignature?: string;
   };
   reason: "sync" | "adopt" | "resolve" | "send" | "recreate";
   resolution?: {
