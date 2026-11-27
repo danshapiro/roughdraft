@@ -501,10 +501,12 @@ export function ComparisonReview({
     void drain();
   };
 
-  // Only the destination-change flag is refreshed automatically. Versions and
-  // selections stay frozen until an explicit refresh or successful mutation.
+  // Legacy screens refresh only the destination flag. The unified editor owns
+  // its complete update transport and must not also fetch this whole review.
   const pollDestination =
-    review?.status === "open" && Boolean(review.targetPath);
+    review?.editor !== "unified" &&
+    review?.status === "open" &&
+    Boolean(review.targetPath);
   useEffect(() => {
     if (!pollDestination) return;
     const timer = window.setInterval(() => {
@@ -512,7 +514,7 @@ export function ComparisonReview({
         .then((next) => {
           if (mountedRef.current)
             setReview((current) =>
-              current
+              current?.id === id && current.editor !== "unified"
                 ? { ...current, targetChanged: next.targetChanged }
                 : current,
             );
