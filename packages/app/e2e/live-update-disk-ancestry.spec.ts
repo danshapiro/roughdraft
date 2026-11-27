@@ -189,11 +189,11 @@ for (const feedback of ["comment", "suggestion"] as const) {
       expect(fs.readFileSync(target, "utf8")).toBe(original);
       const disk = original.replace(
         "The planting schedule is ready.",
-        "The agent rewrote the planting plan.",
+        "The agent rewrote the garden plan.",
       );
       fs.writeFileSync(target, disk);
       await expect(richTextEditor(page)).toContainText(
-        "The agent rewrote the planting plan.",
+        "The agent rewrote the garden plan.",
       );
       await expect(page.getByTestId("revision-conflict")).toHaveCount(0);
       if (feedback === "comment") {
@@ -209,7 +209,7 @@ for (const feedback of ["comment", "suggestion"] as const) {
           ]);
       } else {
         await expect
-          .poll(async () => (await read()).draft?.outdatedSuggestions)
+          .poll(async () => (await read()).outdatedSuggestions)
           .toEqual([
             expect.objectContaining({
               originalText: "planting",
@@ -221,7 +221,7 @@ for (const feedback of ["comment", "suggestion"] as const) {
       }
       await page.reload();
       await expect(richTextEditor(page)).toContainText(
-        "The agent rewrote the planting plan.",
+        "The agent rewrote the garden plan.",
       );
       await expect(page.getByTestId("revision-conflict")).toHaveCount(0);
       expect(fs.readFileSync(target, "utf8")).toBe(disk);
