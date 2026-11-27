@@ -130,6 +130,80 @@ describe("preserving original Markdown when saving comparison choices", () => {
       )("Alpha new beta.\n"),
     ).toBe("Alpha new beta.\r\n");
   });
+
+  it.each([
+    "\n",
+    "\r\n",
+  ])("keeps opening formatting after a preserved blank line (%j)", (newline) => {
+    const original = ["# Review", "", "Local paragraph.", ""].join(newline);
+    const canonical = "# Review\nLocal paragraph.\n";
+    const updated = "# Review\n**Local paragraph.**\n";
+    expect(createSourceSpellingPreserver(original, canonical)(updated)).toBe(
+      original.replace("Local paragraph.", "**Local paragraph.**"),
+    );
+  });
+
+  it.each([
+    "\n",
+    "\r\n",
+  ])("keeps closing formatting before a heading's following blank line (%j)", (newline) => {
+    const original = ["# Review", "", "Local paragraph.", ""].join(newline);
+    const canonical = "# Review\nLocal paragraph.\n";
+    expect(
+      createSourceSpellingPreserver(
+        original,
+        canonical,
+      )("# **Review**\nLocal paragraph.\n"),
+    ).toBe(original.replace("# Review", "# **Review**"));
+  });
+
+  it.each([
+    "\n",
+    "\r\n",
+  ])("keeps whitespace-only line edits after preserved blank lines (%j)", (newline) => {
+    const original = ["# Review", "", "Local paragraph.", ""].join(newline);
+    const canonical = "# Review\nLocal paragraph.\n";
+    expect(
+      createSourceSpellingPreserver(
+        original,
+        canonical,
+      )("# Review\n  Local paragraph.  \n"),
+    ).toBe(original.replace("Local paragraph.", "  Local paragraph.  "));
+  });
+
+  it.each([
+    "\n",
+    "\r\n",
+  ])("keeps a multiline proposal's opening and closing frames beside their content (%j)", (newline) => {
+    const original = [
+      "# Review",
+      "",
+      "First paragraph.",
+      "",
+      "Second paragraph.",
+      "",
+    ].join(newline);
+    const canonical = "# Review\nFirst paragraph.\n\nSecond paragraph.\n";
+    expect(
+      createSourceSpellingPreserver(
+        original,
+        canonical,
+      )(
+        "# Review\n{~~First paragraph.\n\nSecond paragraph.~>New first paragraph.\n\nNew second paragraph.~~}\n",
+      ),
+    ).toBe(
+      [
+        "# Review",
+        "",
+        "{~~First paragraph.",
+        "",
+        "Second paragraph.~>New first paragraph.",
+        "",
+        "New second paragraph.~~}",
+        "",
+      ].join(newline),
+    );
+  });
 });
 
 it("formatted clean projection uses the live accepted document without turning split review formatting into a file edit", () => {

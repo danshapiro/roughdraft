@@ -157,6 +157,19 @@ Scroll to another section, open History and undo one of these decisions. The doc
 Start editing the phone-draft comment above, leave the textarea open, then resize or unfold. The text, focus and draft should survive. Cancel should restore the original feedback. Try both a narrow screen and a short viewport with the keyboard open. When unfolded, toolbar actions should be visible whenever they fit; fold the screen to check that More appears only when needed.
 
 Switch between Changes, Original, Final and Markdown while reviewing. Copy and Download should match the visible clean outcome; the full Markdown view keeps the discussion and pending suggestions. Refresh should retain your review choices and comments.
+## 16\. Live updates and conflict recovery
+Open this same review in a second tab. Edit the first practice paragraph in one tab and the second in the other. Both edits should appear together without interrupting your typing or resetting Undo.
+
+Practice paragraph one: keep the planting schedule steady while the entrance review continues.
+
+Practice paragraph two: keep the lighting schedule steady while the release review continues.
+
+Next, change the same word in both tabs. Compare changes should show both versions. Discard my changes uses the latest overlapping wording; Overwrite with my changes uses yours. Both keep unrelated edits and discussions.
+
+Try Save separately while viewing Changes, Original and Final. It saves the working draft each time. The dialog starts with an unused path, and the success popup shows the actual saved path and new review link. Keep the copy beside this document to preserve its images and linked notes, or inspect the relative-link warning before choosing another folder.
+
+Have the agent change a practice copy on disk while you read, and again while you type in the other paragraph. Saved comments and displaced suggestions must remain available. Reopen an earlier History decision after the outside edit and verify the restored passage is the one you selected.
+
 ## Footer caret target
 Footer stays unchanged when you click and type inside an earlier comment.
 

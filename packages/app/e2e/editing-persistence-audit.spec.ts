@@ -8,6 +8,7 @@ import {
 } from "@playwright/test";
 import type { ComparisonReviewData } from "../src/comparison-types";
 import {
+  activeCommentDraft,
   removeMarkdownProject,
   richTextEditor,
   selectRichText,
@@ -270,7 +271,7 @@ test("source editing an annotated code block autosaves clean code and preserves 
   const { filename, read } = await open(page, request, markdown);
   await selectRichText(page, code);
   await page.getByTestId("selection-menu-action-comment").click();
-  const comment = page.getByTestId("comment-rail-c1-editor");
+  const { editor: comment } = await activeCommentDraft(page);
   await comment.fill("Check the code marker");
   await comment.press("Control+Enter");
   await expect

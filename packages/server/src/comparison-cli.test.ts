@@ -92,6 +92,39 @@ describe("comparison CLI", () => {
     );
   });
 
+  it.each([
+    "/home/dan/recovery",
+    "Documents/Agent reviews",
+  ])("passes the agent's recovery folder to the selected server unchanged: %s", async (folder) => {
+    const f = fixture();
+    f.fetchImpl.mockResolvedValueOnce(
+      Response.json({ id: "copy-default", status: "open", completion: null }),
+    );
+    expect(
+      await runComparisonCommand(
+        "edit",
+        [
+          "--copy-directory",
+          folder,
+          "--autosave",
+          "none",
+          "--no-open",
+          "--json",
+        ],
+        f.deps,
+        false,
+        f.connect,
+      ),
+    ).toBe(0);
+    const payload = JSON.parse(String(f.fetchImpl.mock.calls[0][1]?.body));
+    expect(payload).toMatchObject({
+      copyDirectory: folder,
+      autosave: "none",
+      handoff: "chat",
+    });
+    expect(f.openUrl).not.toHaveBeenCalled();
+  });
+
   it("creates a proposal with canonical paths and prints the public URL before waiting", async () => {
     const f = fixture();
     const target = file("AGENTS.md", "Original\n");

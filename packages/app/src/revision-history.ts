@@ -2,15 +2,22 @@ import { type Node, Slice } from "@tiptap/pm/model";
 import { EditorState, Plugin, type Transaction } from "@tiptap/pm/state";
 import { ReplaceStep, Step } from "@tiptap/pm/transform";
 import type { ReviewedChange } from "./comparison-types";
+import { criticMarkdownToEditorState } from "./critic-markup";
 import {
   documentMetadata,
   sameMetadata,
   withDocumentMetadata,
 } from "./revision-metadata";
-import { criticMarkdownToEditorState } from "./critic-markup";
 
 export function reviewedChanges(doc: Node): ReviewedChange[] {
   return doc.attrs.reviewed ?? [];
+}
+
+export function createReviewedChangeId() {
+  const value =
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `decision-${value}`;
 }
 
 function matches(doc: Node, change: ReviewedChange) {
@@ -69,6 +76,45 @@ export function mapReviewedChanges(
   });
 }
 
+/** A remote-origin mapping is usable only when its guard and every inverse still apply. */
+export function validateReviewedChange(
+  doc: Node,
+  change: ReviewedChange,
+): boolean {
+  if (!matches(doc, change)) return false;
+  const transaction = EditorState.create({ doc }).tr;
+  try {
+    for (const json of change.inverse)
+      if (transaction.maybeStep(Step.fromJSON(doc.type.schema, json)).failed)
+        return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function mapRemoteReviewedChanges(
+  changes: ReviewedChange[],
+  transaction: Transaction,
+): ReviewedChange[] {
+  return mapReviewedChanges(
+    changes.map((change) =>
+      change.staleReason === "needs-remap"
+        ? { ...change, stale: false }
+        : change,
+    ),
+    transaction,
+  ).map((change) => {
+    if (change.stale || !validateReviewedChange(transaction.doc, change))
+      return { ...change, stale: true };
+    const next = { ...change, stale: false };
+    delete next.staleReason;
+    delete next.unmappedSince;
+    delete next.originSignature;
+    return next;
+  });
+}
+
 export function recordReviewedChange(
   transaction: Transaction,
   detail: Pick<
@@ -96,16 +142,10 @@ export function recordReviewedChange(
       ? [new ReplaceStep(from, to, before.slice(from, end.a)).toJSON()]
       : [];
   const previous = reviewedChanges(before);
-  const sequence =
-    previous.reduce(
-      (max, item) =>
-        Math.max(max, Number(/^decision-(\d+)$/.exec(item.id)?.[1] ?? 0)),
-      0,
-    ) + 1;
   return transaction.setDocAttribute("reviewed", [
     ...mapReviewedChanges(previous, transaction),
     {
-      id: `decision-${sequence}`,
+      id: createReviewedChangeId(),
       ...detail,
       inverse,
       guard: { from, to, slice: transaction.doc.slice(from, to).toJSON() },

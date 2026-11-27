@@ -1,12 +1,14 @@
+import { cleanRoughdraftMarkdown, mergeReviewDrafts } from "@roughdraft/rfm";
 import { Extension, getSchema } from "@tiptap/core";
 import { EditorState } from "@tiptap/pm/state";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   criticMarkdownToEditorState,
   editorStateToCriticMarkdown,
 } from "./critic-markup";
-import { decideReviewChanges, suggestionDetail } from "./revision-bulk";
 import { createEditorExtensions } from "./editor-extensions";
+import { applySuggestionDecisions } from "./review-decisions";
+import { decideReviewChanges, suggestionDetail } from "./revision-bulk";
 import {
   mapReviewedChanges,
   recordReviewedChange,
@@ -14,9 +16,8 @@ import {
   reviewedChanges,
 } from "./revision-history";
 import { outcomeDocument } from "./revision-outcomes";
-import { referenceChanges, revertReferenceChange } from "./revision-reference";
-import { applySuggestionDecisions } from "./review-decisions";
 import { suggestionPositions } from "./revision-projection";
+import { referenceChanges, revertReferenceChange } from "./revision-reference";
 
 const schema = getSchema([
   ...createEditorExtensions(""),
@@ -34,6 +35,128 @@ const doc = (text: string) =>
   schema.nodeFromJSON(criticMarkdownToEditorState(text).doc);
 
 describe("durable review decisions", () => {
+  it.each([
+    false,
+    true,
+  ])("merges two independently produced new decisions without reusing one History identity (server=%s)", (server) => {
+    const original = doc(
+      "Use {~~red~>blue~~}{#s1}.\n\nChoose {~~small~>large~~}{#s2}.",
+    );
+    const snapshot = (state: EditorState) => {
+      const markdown = editorStateToCriticMarkdown(
+        state.doc.toJSON(),
+        new Map(),
+      );
+      return {
+        markdown,
+        cleanMarkdown: cleanRoughdraftMarkdown(markdown),
+        decisions: {},
+        reviewComments: [],
+        reviewed: reviewedChanges(state.doc),
+      };
+    };
+    const decide = (id: string, oldText: string, newText: string) => {
+      const state = EditorState.create({ doc: original });
+      const transaction = state.tr;
+      applySuggestionDecisions(transaction, [id], "accept");
+      return state.apply(
+        recordReviewedChange(
+          transaction,
+          { decision: "accept", oldText, newText },
+          suggestionDetail(original, id),
+        ),
+      );
+    };
+    const first = decide("s1", "red", "blue");
+    const second = decide("s2", "small", "large");
+    const merged = mergeReviewDrafts(
+      snapshot(EditorState.create({ doc: original })),
+      snapshot(first),
+      snapshot(second),
+      { server, budgetMs: 1000 },
+    );
+
+    expect(merged.status).toBe("merged");
+    expect(merged.idRemap).toBeUndefined();
+    expect(merged.conflicts).toEqual([]);
+    expect(merged.draft.cleanMarkdown).toContain("Use blue.");
+    expect(merged.draft.cleanMarkdown).toContain("Choose large.");
+    expect(merged.draft.reviewed).toHaveLength(2);
+    expect(new Set(merged.draft.reviewed?.map((item) => item.id)).size).toBe(2);
+    expect(merged.draft.reviewed?.map((item) => item.newText).sort()).toEqual([
+      "blue",
+      "large",
+    ]);
+  });
+
+  it.each([
+    "single",
+    "bulk",
+  ] as const)("creates independent History identities without secure-context crypto for %s decisions", (producer) => {
+    const original = doc("Use {~~red~>blue~~}{#s1}.");
+    vi.stubGlobal("crypto", undefined);
+    try {
+      const produce = () => {
+        const state = EditorState.create({ doc: original });
+        if (producer === "bulk")
+          return state.apply(
+            decideReviewChanges(state, null, "new", "accept", true),
+          );
+        const transaction = state.tr;
+        applySuggestionDecisions(transaction, ["s1"], "accept");
+        return state.apply(
+          recordReviewedChange(
+            transaction,
+            { decision: "accept", oldText: "red", newText: "blue" },
+            suggestionDetail(original, "s1"),
+          ),
+        );
+      };
+      const first = reviewedChanges(produce().doc);
+      const second = reviewedChanges(produce().doc);
+      expect(first).toHaveLength(1);
+      expect(second).toHaveLength(1);
+      expect(first[0].id).not.toBe(second[0].id);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("preserves and reopens existing numeric identities alongside a newly recorded decision", () => {
+    const original = doc(
+      "Use {~~red~>blue~~}{#s1}.\n\nChoose {~~small~>large~~}{#s2}.",
+    );
+    let state = EditorState.create({ doc: original });
+    const decide = (id: string, oldText: string, newText: string) => {
+      const transaction = state.tr;
+      applySuggestionDecisions(transaction, [id], "accept");
+      state = state.apply(
+        recordReviewedChange(
+          transaction,
+          { decision: "accept", oldText, newText },
+          suggestionDetail(state.doc, id),
+        ),
+      );
+    };
+    decide("s1", "red", "blue");
+    const serialized = state.doc.toJSON();
+    if (!serialized.attrs) throw new Error("The fixture must persist History");
+    serialized.attrs.reviewed[0].id = "decision-7";
+    state = EditorState.create({ doc: schema.nodeFromJSON(serialized) });
+    decide("s2", "small", "large");
+    const [existing, added] = reviewedChanges(state.doc);
+    expect(existing.id).toBe("decision-7");
+    expect(added.id).not.toBe(existing.id);
+
+    for (const entry of [existing, added]) {
+      const reopened = reopenReviewedChange(state, entry.id);
+      if (!reopened) throw new Error("A persisted decision must remain usable");
+      state = state.apply(reopened);
+    }
+    expect(state.doc.content.eq(original.content)).toBe(true);
+    expect(reviewedChanges(state.doc)).toEqual([]);
+  });
+
   it("reopening a group clears every related reference decision and restores its suggestion", () => {
     const current = doc("Use {~~red and small~>green and huge~~}{#s1}.");
     const reference = doc("Use blue and large.");

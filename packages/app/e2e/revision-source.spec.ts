@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { expect, test } from "@playwright/test";
 import type { ComparisonReviewData } from "../src/comparison-types";
 import {
+  activeCommentDraft,
   createMarkdownProject,
   logE2eEvent,
   removeMarkdownProject,
@@ -472,9 +473,7 @@ for (const feedback of ["reply", "edit"] as const) {
       await page.getByTestId("revision-format").click();
       await page.getByTestId("comment-thread-c1").click();
       await page.getByTestId(`comment-rail-c1-action-${feedback}`).click();
-      const editor = page.getByTestId(
-        `comment-rail-${feedback === "reply" ? "c2" : "c1"}-editor`,
-      );
+      const { editor } = await activeCommentDraft(page);
       await editor.fill("Later feedback from the UI");
       await editor.press("Control+Enter");
       await expect.poll(comments).toContain("Later feedback from the UI");

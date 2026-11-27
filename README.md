@@ -43,9 +43,33 @@ Roughdraft starts its local server if needed, checks that the complete review li
 
 - **Read** prevents accidental document edits. **Edit** puts your typing in the document. **Suggest** records proposed wording, formatting, paragraph and list edits for review. The selected mode survives refresh. **Keep** adds a suggestion to the document; **Revert** discards it.
 - The **Changes** dropdown also offers **Original** and **Final**. These are read-only previews of the complete outcomes, including YAML fields, earlier decisions and pending suggestions. Switching views never changes your decisions or writes the preview to a file. Copy and Download export the visible preview while you are in a preview.
-- Your agent chooses the autosave file before opening a review, or chooses `none` to keep edits in the review without writing a Markdown file. **Review details** shows the full source paths and save destination. A quiet check indicates saved work; saving failures remain visible. If a file changes on disk, Roughdraft preserves your draft and pauses file writes. If another browser changes the review, **Preserve this review** saves your complete feedback separately for the agent, without writing a Markdown file.
+- Your agent chooses the autosave file before opening a review, or chooses `none` to keep edits in the review without writing a Markdown file. **Review details** shows the full source paths and save destination. A quiet check indicates saved work; saving failures remain visible. The document follows changes made on disk or in another saved review. Independent edits are combined automatically; overlapping edits show the recovery actions below.
 - In **Changes**, **Copy Markdown** and **Download Markdown** use the same clean Markdown as autosave. Pending suggestions and comments stay in the review. The **Markdown** icon opens the full document source, including inline review markup. Source is editable in Edit; Read, Suggest and outcome previews keep it read-only. Toggle the icon again to return to the formatted document.
-- **Undo** and **Redo** cover document edits and Keep/Revert choices while the editor stays open, including after a save. **History** (inside **More** on smaller screens) lets you inspect and reopen decisions after refreshing. Reopening scrolls to the restored passage. Related overlapping changes are reviewed together. Reopening preserves unrelated later edits; a passage rewritten after its decision cannot be reopened over that newer text. Earlier suggestions may be unavailable in outcome previews after a passage is rewritten. Comment history is separate. Edits and comment drafts save as you type and survive reopening. Cancel restores a comment to its text before editing.
+- **Undo** and **Redo** cover document edits and Keep/Revert choices while the editor stays open, including after a save. **History** (inside **More** on smaller screens) lets you inspect and reopen decisions after refreshing. Reopening scrolls to the restored passage. Related overlapping changes are reviewed together. Reopening preserves unrelated later edits; a passage rewritten after its decision cannot be reopened over that newer text. Earlier suggestions may be unavailable in outcome previews after a passage is rewritten. Comment history is separate. Document edits save as you type. Unfinished comment drafts are preserved; Save or Ctrl/Cmd+Enter publishes the comment. Cancel keeps the previously saved comment.
+
+## When the document changes elsewhere
+
+An agent's file edits and another tab's saved feedback appear in the open review without refreshing. Your selection, reading position and unfinished typing stay in place. Saved comments remain available when their quoted passage changes; a suggestion that no longer fits stays as feedback for the agent. A direct `edit FILE --autosave none` can follow the source without writing to it. Comparisons keep their original version references.
+
+For `edit FILE --autosave none`, `comparison "FULL_REVIEW_URL" --read --json` reports `targetChanged` and `liveSourceChanged` when the source has changed since the saved review. The returned draft is the saved feedback; read the current source file too before making further edits. A file mounted individually may not reveal changes made by its host. Roughdraft shows that limitation while allowing saves with the usual file checks.
+
+If both sides changed the same passage or review item, saving pauses while you keep editing. **Compare changes** shows your version and the latest version before you choose:
+
+1. **Discard my changes** uses the latest version of the overlapping parts. Unrelated edits and feedback from both sides stay.
+2. **Overwrite with my changes** uses your version of the overlapping parts after confirmation. Unrelated incoming work stays.
+3. **Save separately** opens a path dialog for a new Markdown file and its complete Roughdraft review. The suggested file is in the current folder when possible. After saving, the popup shows the actual saved path and a link to the new review. The Markdown file contains clean working text; comments, pending suggestions and History remain in the new review.
+
+These actions use the working draft even while **Original** or **Final** is displayed. Save separately is also available when the file is unavailable, an outside update cannot be applied safely, or a previous save's result cannot be recovered. Changing the copy's folder can affect relative links; the dialog explains the affected links before saving. Paths refer to the server running Roughdraft, with a named Documents folder on installations that restrict file access.
+
+Save separately also preserves unfinished comment and reply drafts. Open **Recovery copies** in Review details to inspect them or restore them to their editors. Changed comment passages stay in the recovery copy for inspection.
+
+**Review update** stays in the header when an update needs attention, including near the end of a long document. It opens the waiting update and its recovery actions in any document view.
+
+If your autosave file was deleted, **Recreate file** asks you to confirm its exact path before creating it from the working draft. Your review feedback stays intact. If a file appears there first, Roughdraft stops without replacing it. Reviews with autosave `none` do not offer this action.
+
+Recovery copies also offers work left by quiet browser tabs. Inspect it, then choose **Restore browser work** to bring its document and unfinished feedback into the editor. Your current unsaved work is preserved first. **Dismiss this copy** asks for confirmation and removes only that browser recovery copy; it does not change the open review or saved file. If a publication did not finish, **Recover** restores the saved review without repeating the file write.
+
+While a connection is unavailable, your work stays in the open tab as Roughdraft reconnects. An uncertain save is checked before retrying so it cannot create duplicate suggestions or files. A mounted file that cannot expose outside changes shows that limitation explicitly.
 
 ## Review file changes
 
@@ -62,6 +86,8 @@ Nearby wording changes within a paragraph share one **Keep**/**Revert** card whe
 Use `roughdraft snapshot AGENTS.md --out AGENTS.before.md` before making changes you plan to review. A snapshot preserves the exact bytes and won't overwrite an existing snapshot. A new autosave output starts from the revised version; use `--autosave-base old` to start from the original. Existing unrelated output files are never replaced implicitly.
 
 Agents should always provide a title understandable to someone new to the project and an explicit `--autosave PATH` or `--autosave none`. Keep the review request in chat. Friendly version labels appear in the header; full paths are available on hover and through keyboard-accessible **Review details**.
+
+An agent can also provide `--copy-directory PATH` to suggest a folder for Save separately. The path is a folder on the selected server, either an absolute local path or a logical path inside a restricted installation's Documents folder. The server validates it; the user does not need to configure a recovery folder.
 
 Keep the complete returned URL unchanged. When the user returns to chat, read the current saved review with `roughdraft comparison "FULL_REVIEW_URL" --read --json`. The URL selects both the review and the server that owns it, even from another checkout. Bare IDs remain available for local workflows. This returns `comparison.read` with the complete review, including its latest `draft`, `reviewComments`, decisions, save destination, and current file state. Preserved copies are included in `recoveredReviews`. It opens no browser, waits for no button, and freezes no snapshot. Reread the destination before any separately authorized changes; reading feedback does not imply approval to apply suggestions.
 

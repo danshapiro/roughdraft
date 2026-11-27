@@ -4,6 +4,16 @@ import path from "node:path";
 import type { Page } from "@playwright/test";
 import { expect } from "@playwright/test";
 
+/** Newly opened drafts have private identities, independent of saved ID order. */
+export async function activeCommentDraft(page: Page) {
+  const editor = page.getByTestId(/^comment-rail-.+-editor$/);
+  await expect(editor).toHaveCount(1);
+  const hook = await editor.getAttribute("data-testid");
+  const match = /^comment-rail-(.+)-editor$/.exec(hook ?? "");
+  if (!match) throw new Error("The active comment has no review identity");
+  return { editor, id: match[1] };
+}
+
 export function createMarkdownProject(label: string) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `roughdraft-${label}-`));
 }

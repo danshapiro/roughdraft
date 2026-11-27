@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { type APIResponse, expect, type Route, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import {
   createMarkdownProject,
   removeMarkdownProject,
@@ -17,6 +17,11 @@ test("reloading during the last draft save acknowledges that same saved snapshot
   request,
 }) => {
   const project = createMarkdownProject("review-reload-sync");
+  let releaseResponse = () => {};
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponse = resolve;
+  });
+  let reloaded = false;
   try {
     const source = writeProjectFile(project, "draft.md", "Original wording\n");
     const created = await request.post(`${api}/document`, {
@@ -35,63 +40,79 @@ test("reloading during the last draft save acknowledges that same saved snapshot
       "Review saved",
     );
 
-    const pendingRoutes: Route[] = [];
-    let pendingDraft: Record<string, unknown> | undefined;
+    const oldSnapshot = await request.get(`${api}/${id}`, { headers });
+    await expect(oldSnapshot).toBeOK();
+    await page.route(`**/api/comparisons/${id}/state**`, async (route) => {
+      if (!reloaded) await responseGate;
+      try {
+        await route.continue();
+      } catch (error) {
+        if (!reloaded) throw error;
+      }
+    });
     let committed = false;
-    await page.route(`**/api/comparisons/${id}/draft`, async (route) => {
-      if (!committed) {
-        pendingRoutes.push(route);
-        pendingDraft = route.request().postDataJSON();
+    let operationId: string | undefined;
+    await page.route(`**/api/comparisons/${id}/reconcile`, async (route) => {
+      const sent = route.request().postDataJSON();
+      if (operationId || sent.draft?.cleanMarkdown !== "Reviewed wording\n") {
+        await route.continue();
         return;
       }
-      await route.continue();
+      // Commit the original request once. Only its acknowledgement is held;
+      // replaying an unreceived operation after reload is correctly fenced.
+      operationId = sent.operationId;
+      const response = await route.fetch();
+      expect((await response.json()).status).toBe("committed");
+      committed = true;
+      await responseGate;
+      try {
+        await route.fulfill({ response });
+      } catch (error) {
+        if (!reloaded) throw error;
+      }
     });
     await selectRichText(page, "Original wording");
     // Hold the complete snapshot this reload is meant to acknowledge. Per-key
     // typing can start an earlier save that blocks the final request behind it.
     await page.keyboard.insertText("Reviewed wording");
-    await expect
-      .poll(() => pendingDraft?.cleanMarkdown)
-      .toBe("Reviewed wording\n");
+    await expect.poll(() => committed).toBe(true);
+    expect(operationId).toBeTruthy();
 
-    // The reload reads revision N just before the old page's pending request
-    // commits N+1. Its new editor must recognize the identical saved draft,
-    // rather than treating its own in-flight work as a conflicting second tab.
-    let transition: Promise<APIResponse> | undefined;
+    // Present revision N to the reloaded page while the real saved state is
+    // N+1. Recovery must recognize the unacknowledged operation, rather than
+    // treating its own saved work as a conflicting second tab.
+    let servedOldSnapshot = false;
     await page.route(`**/api/comparisons/${id}`, async (route) => {
-      if (committed || route.request().method() !== "GET") {
+      if (servedOldSnapshot || route.request().method() !== "GET") {
         await route.continue();
         return;
       }
-      transition ??= (async () => {
-        const oldSnapshot = await route.fetch();
-        const persisted = await request.post(`${api}/${id}/draft`, {
-          headers,
-          data: pendingDraft,
-        });
-        expect(persisted.status()).toBe(200);
-        committed = true;
-        return oldSnapshot;
-      })();
-      const oldSnapshot = await transition;
+      servedOldSnapshot = true;
       await route.fulfill({ response: oldSnapshot });
-      await Promise.all(
-        pendingRoutes.map((pending) => pending.abort().catch(() => {})),
-      );
     });
+    reloaded = true;
     await page.reload();
-    await expect(richTextEditor(page)).toContainText("Reviewed wording");
+    await expect(richTextEditor(page)).toHaveText("Reviewed wording");
     await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
       "aria-label",
       "Review saved",
     );
     await expect(page.getByTestId("revision-conflict")).toHaveCount(0);
+    expect(servedOldSnapshot).toBe(true);
+    // Either the authoritative state or the operation lookup can recognize
+    // this acknowledgement. The original operation must remain committed.
+    const outcome = await request.get(`${api}/operations/${operationId}`, {
+      headers,
+    });
+    await expect(outcome).toBeOK();
+    expect((await outcome.json()).status).toBe("committed");
     const persisted = await request.get(`${api}/${id}`, { headers });
     expect((await persisted.json()).draft.cleanMarkdown).toBe(
       "Reviewed wording\n",
     );
     expect(fs.readFileSync(source, "utf8")).toBe("Original wording\n");
   } finally {
+    releaseResponse();
     removeMarkdownProject(project);
   }
 });

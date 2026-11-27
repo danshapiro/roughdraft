@@ -18,6 +18,10 @@ import { atomicWrite, FileChangedError } from "./atomic-write.js";
 import { comparisonRouter } from "./comparisons.js";
 import { logServerEvent } from "./diagnostics.js";
 import {
+  DocumentWatcherRegistry,
+  type WatchedDocumentSnapshot,
+} from "./document-watchers.js";
+import {
   hasNonLoopbackHost,
   ROUGHDRAFT_DEFAULT_PORT,
   ROUGHDRAFT_PUBLIC_HOST,
@@ -81,11 +85,16 @@ interface CreateAppOptions {
   allowLocalFiles?: boolean;
   comparisonsDir?: string;
   publicUrl?: string | null;
+  processStateDir?: string;
+  displayName?: string;
+  watchers?: DocumentWatcherRegistry;
 }
 
 interface CreateAppResult {
   app: Express;
   port: number;
+  /** Release app-owned watchers/timers when an in-process host shuts down. */
+  dispose(): void;
 }
 
 interface OpenRequestClient {
@@ -465,6 +474,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const staticDirPath = options.staticDirPath ?? staticDir;
   const fetchImpl = options.fetchImpl ?? fetch;
   const allowLocalFiles = options.allowLocalFiles !== false;
+  const watchers = options.watchers ?? new DocumentWatcherRegistry();
   const instanceId = crypto.randomUUID();
   const publicUrl = configuredPublicUrl(
     options.publicUrl !== undefined
@@ -565,6 +575,21 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       {
         allowFileBindMountWrites: options.allowFileBindMountWrites,
         documentRoot: options.assetRoot,
+        homeDir,
+        projectDir: options.projectDir ?? process.cwd(),
+        processStateDir:
+          options.processStateDir ??
+          (options.homeDir !== undefined
+            ? path.join(homeDir, ".roughdraft")
+            : (process.env.ROUGHDRAFT_STATE_DIR ??
+              (process.env.ROUGHDRAFT_STATE_FILE
+                ? path.dirname(process.env.ROUGHDRAFT_STATE_FILE)
+                : path.join(homeDir, ".roughdraft")))),
+        displayName:
+          options.displayName ??
+          (publicUrl ? new URL(publicUrl).hostname : undefined),
+        browserBasePath: options.browserBasePath,
+        watchers,
       },
     ),
   );
@@ -708,34 +733,33 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.flushHeaders?.();
     res.write("retry: 1000\n\n");
 
-    const sendChange = (stats: fs.Stats) => {
-      const exists = stats.nlink > 0;
+    const sendChange = (snapshot: WatchedDocumentSnapshot) => {
+      // Keep the legacy endpoint's version contract while reusing the shared read/hash.
+      const version =
+        snapshot.exists &&
+        snapshot.hash &&
+        snapshot.mtimeMs !== undefined &&
+        snapshot.size !== undefined
+          ? `${snapshot.mtimeMs}:${snapshot.size}:${snapshot.hash}`
+          : null;
       res.write(
-        `event: change\ndata: ${JSON.stringify({
-          path: relativePath,
-          exists,
-          version: exists ? fileVersionFromFile(absolutePath) : null,
-        })}\n\n`,
+        `event: change\ndata: ${JSON.stringify({ path: relativePath, exists: snapshot.exists, version, availability: snapshot.availability })}\n\n`,
       );
     };
-
-    const listener = (current: fs.Stats, previous: fs.Stats) => {
-      if (
-        current.mtimeMs === previous.mtimeMs &&
-        current.size === previous.size &&
-        current.nlink === previous.nlink
-      ) {
-        return;
-      }
-
-      sendChange(current);
+    const unsubscribe = watchers.subscribe([absolutePath], (event) =>
+      sendChange(event.snapshot),
+    );
+    const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 15_000);
+    heartbeat.unref?.();
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      unsubscribe();
+      clearInterval(heartbeat);
     };
-
-    fs.watchFile(absolutePath, { interval: 500 }, listener);
-
-    req.on("close", () => {
-      fs.unwatchFile(absolutePath, listener);
-    });
+    req.once("close", close);
+    res.once("close", close);
   });
 
   app.get("/api/review-index", (req, res) => {
@@ -1422,7 +1446,14 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   app.use(express.static(staticDirPath, { index: false }));
   app.get("/{*splat}", sendIndex);
 
-  return { app, port };
+  return {
+    app,
+    port,
+    dispose: () => {
+      if (!options.watchers) watchers.close();
+      clearInterval(remoteSessionSweeper);
+    },
+  };
 }
 
 export const ROUGHDRAFT_TOKEN_ENV = "ROUGHDRAFT_TOKEN";

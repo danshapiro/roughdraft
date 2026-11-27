@@ -23,6 +23,7 @@ import {
   suggestionPositions,
 } from "./revision-projection";
 import { documentMetadata, sameMetadata } from "./revision-metadata";
+import { documentProposalIdentities } from "./revision-proposal-identities";
 
 function sameAcceptedDocument(left: Node, right: Node) {
   if (left.type !== right.type || !left.content.eq(right.content)) return false;
@@ -152,11 +153,11 @@ export function structuralSuggestion(before: EditorState, after: EditorState) {
     after.doc.content.cut(from, to),
     true,
   );
-  const existing = changesIn(before.doc);
+  const existing = documentProposalIdentities(before.doc);
   const change =
     merged.values().next().value ??
     createCriticChange("substitution-old", undefined, {
-      existingChanges: existing.values(),
+      existingChanges: existing,
     });
   const oldBlocks = markedBlocks(original.doc, {
     ...change,
