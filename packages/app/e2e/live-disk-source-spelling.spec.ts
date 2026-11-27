@@ -154,3 +154,124 @@ for (const bound of [true, false]) {
     }
   });
 }
+
+test("explicit Reload from file completes when exact mixed metadata prevents automatic adoption", async ({
+  page,
+  request,
+}, testInfo) => {
+  const original =
+    '# Plan\r\n\r\nThe release supports {++offline review++}{#s1} for longer documents.\r\n\r\nBeta paragraph.\r\n\r\n---\r\n# Keep this metadata comment.\r\nstatus: "in progress" # Keep this scalar comment.\r\nsuggestions:\r\n  s1:\r\n    by: AI\r\n    at: "2026-11-22T12:00:00.000Z"\r\n';
+  const incoming = original.replace(
+    "Beta paragraph.",
+    "Beta paragraph, edited.",
+  );
+  const project = createMarkdownProject("explicit-disk-reload");
+  const target = writeProjectFile(project, "practice.md", original);
+  const reconciles: Array<{ reason: string; writeFile: boolean }> = [];
+  let stage = "opening the original file";
+  let latest: ComparisonReviewData | undefined;
+  page.on("request", (request) => {
+    if (!request.url().endsWith("/reconcile") || request.method() !== "POST")
+      return;
+    const body = request.postDataJSON();
+    reconciles.push({ reason: body.reason, writeFile: body.writeFile });
+  });
+  try {
+    const created = await request.post(`${api}/document`, {
+      headers,
+      data: { targetPath: target, autosave: target, handoff: "chat" },
+    });
+    await expect(created).toBeOK();
+    const { id } = await created.json();
+    const read = async (): Promise<ComparisonReviewData> => {
+      const response = await request.get(`${api}/${id}`, { headers });
+      await expect(response).toBeOK();
+      latest = await response.json();
+      return latest as ComparisonReviewData;
+    };
+    const saved = () =>
+      expect(page.getByTestId("revision-file-status")).toHaveAttribute(
+        "aria-label",
+        /^(Review saved|Saved to file)$/,
+      );
+    await page.goto(`/?comparison=${id}`);
+    await expect(richTextEditor(page)).toBeVisible();
+    await expect(page.getByTestId("revision-pending")).toHaveText("1");
+    await saved();
+    await expect.poll(async () => (await read()).savedText).toBe(original);
+    const pending = proposals(latest?.draft?.markdown ?? "");
+    expect(pending).toEqual([{ id: "s1", text: "offline review" }]);
+    expect(fs.readFileSync(target, "utf8")).toBe(original);
+
+    stage = "waiting for the outside update";
+    fs.writeFileSync(target, incoming);
+    const banner = page.getByTestId("revision-conflict");
+    await expect(banner).toBeVisible();
+    await expect(page.getByTestId("revision-reload-file")).toBeVisible();
+    await expect(page.getByTestId("revision-save-separately")).toBeVisible();
+    await expect(page.getByTestId("revision-discard")).toHaveCount(0);
+    await expect(page.getByTestId("revision-overwrite")).toHaveCount(0);
+    expect(fs.readFileSync(target, "utf8")).toBe(incoming);
+
+    stage = "confirming explicit Reload from file";
+    await page.getByTestId("revision-reload-file").click();
+    const dialog = page.getByRole("dialog", {
+      name: "Reload from file and keep feedback?",
+    });
+    await expect(dialog).toBeVisible();
+    await dialog
+      .getByRole("button", {
+        name: "Reload from file, keep feedback",
+        exact: true,
+      })
+      .click();
+    stage = "waiting for explicit Reload to complete";
+    await expect(dialog).toBeHidden();
+    await expect(banner).toHaveCount(0);
+    await expect(richTextEditor(page)).toContainText("Beta paragraph, edited.");
+    await expect(page.getByTestId("revision-pending")).toHaveText("1");
+    await saved();
+    await expect.poll(async () => (await read()).savedText).toBe(incoming);
+    expect(proposals(latest?.draft?.markdown ?? "")).toEqual(pending);
+    expect(fs.readFileSync(target, "utf8")).toBe(incoming);
+    expect(reconciles.filter((value) => value.writeFile)).toEqual([]);
+
+    stage = "reopening the acknowledged raw file";
+    await page.reload();
+    await expect(richTextEditor(page)).toContainText("Beta paragraph, edited.");
+    await expect(richTextEditor(page)).toContainText("offline review");
+    await expect(page.getByTestId("revision-pending")).toHaveText("1");
+    await expect(banner).toHaveCount(0);
+    await saved();
+    const reloaded = await read();
+    expect(reloaded.savedText).toBe(incoming);
+    expect(proposals(reloaded.draft?.markdown ?? "")).toEqual(pending);
+    expect(fs.readFileSync(target, "utf8")).toBe(incoming);
+    expect(reconciles.filter((value) => value.writeFile)).toEqual([]);
+    stage = "complete";
+  } finally {
+    const evidence = testInfo.outputPath("explicit-disk-reload.json");
+    fs.writeFileSync(
+      evidence,
+      JSON.stringify(
+        {
+          stage,
+          latest,
+          reconciles,
+          file: fs.readFileSync(target, "utf8"),
+          banners: await page
+            .getByTestId("revision-conflict")
+            .allTextContents(),
+          dialogs: await page.getByRole("dialog").allTextContents(),
+        },
+        null,
+        2,
+      ),
+    );
+    await testInfo.attach("explicit-disk-reload", {
+      contentType: "application/json",
+      path: evidence,
+    });
+    removeMarkdownProject(project);
+  }
+});
