@@ -70,7 +70,10 @@ import {
 } from "./editor-extensions";
 import { LinkAffordances } from "./LinkAffordances";
 import { cn } from "./lib/utils";
-import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
+import {
+  canApplyMarkdownSourceUpdate,
+  MarkdownCodeEditor,
+} from "./MarkdownCodeEditor";
 import { splitYamlDocumentMetadata, toHtml } from "./markdown";
 import { resolveSuggestionsSource } from "./resolve-suggestion";
 import {
@@ -2109,8 +2112,6 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         sourceHost instanceof HTMLElement
           ? CodeMirrorView.findFromDOM(sourceHost)
           : null;
-      if (source?.composing || source?.compositionStarted)
-        return blocked("source-composing");
       if (
         options?.idRemap &&
         (compositionSessionRef.current ||
@@ -2382,6 +2383,8 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
               nextPrivateIds,
             ))
           : draft.markdown;
+        if (source && !canApplyMarkdownSourceUpdate(source, nextMarkdown))
+          return blocked("source-composing");
         transaction
           .setDocAttribute("kept", Object.keys(draft.decisions))
           .setDocAttribute("reviewed", history)

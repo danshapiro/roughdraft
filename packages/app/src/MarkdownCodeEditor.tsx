@@ -1,18 +1,20 @@
-import { basicSetup } from "codemirror";
-import { markdown } from "@codemirror/lang-markdown";
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { yamlFrontmatter } from "@codemirror/lang-yaml";
 import {
-  Compartment,
   ChangeSet,
+  Compartment,
   EditorState,
-  Prec,
   type Extension,
+  Prec,
   Transaction,
 } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
-import { useEffect, useRef } from "react";
+import { scanRoughdraftReview } from "@roughdraft/rfm";
+import { basicSetup } from "codemirror";
 import { diffChars, diffWordsWithSpace } from "diff";
+import { useEffect, useRef } from "react";
 import { cn } from "./lib/utils";
+import { splitYamlDocumentMetadata } from "./markdown";
 
 interface MarkdownCodeEditorProps {
   value: string;
@@ -103,6 +105,166 @@ function incomingSourceChanges(state: EditorState, value: string): ChangeSet {
     replaceUntil(before.length, after.length);
   }
   return ChangeSet.of(changes, state.doc.length, "\n");
+}
+
+type CompositionRange = { from: number; to: number };
+const sourceCompositions = new WeakMap<EditorView, CompositionRange>();
+function composingWord(view: EditorView): CompositionRange {
+  const selected = view.state.selection.main;
+  const word = view.state.wordAt(selected.head);
+  return {
+    from: Math.min(selected.from, word?.from ?? selected.from),
+    to: Math.max(selected.to, word?.to ?? selected.to),
+  };
+}
+const literalProse = /^[\p{L}\p{M}\p{N}\s.,!?;:'’"()%—–-]*$/u;
+function sourceBlock(text: string, range: CompositionRange) {
+  const metadata = splitYamlDocumentMetadata(text);
+  const bodyFrom = metadata.frontmatter?.length ?? 0;
+  const bodyTo = text.length - (metadata.endmatter?.length ?? 0);
+  if (range.from < bodyFrom)
+    return {
+      from: 0,
+      to: bodyFrom,
+      kind: "Frontmatter",
+      plain: false,
+      references: false,
+    };
+  if (range.to > bodyTo)
+    return {
+      from: bodyTo,
+      to: text.length,
+      kind: "Endmatter",
+      plain: false,
+      references: false,
+    };
+  const tree = markdownLanguage.parser.parse(metadata.body);
+  let node = tree.resolveInner(Math.max(0, range.from - bodyFrom), 1);
+  while (node.parent?.parent) node = node.parent;
+  const from = node.from + bodyFrom;
+  const to = Math.max(node.to + bodyFrom, range.to);
+  return {
+    from,
+    to,
+    kind: node.name,
+    plain:
+      node.name === "Paragraph" &&
+      literalProse.test(text.slice(from, to)) &&
+      !/\bwww\./i.test(text.slice(from, to)),
+    references:
+      node.name !== "FencedCode" &&
+      node.name !== "CodeBlock" &&
+      text.slice(from, to).includes("["),
+  };
+}
+
+/** CodeMirror preserves its composing DOM when a remote transaction misses it. */
+function sourceChangesDuringComposition(
+  view: EditorView,
+  value: string,
+): ChangeSet | null {
+  const changes = incomingSourceChanges(view.state, value);
+  if (changes.empty) return changes;
+  let composing = sourceCompositions.get(view);
+  if (!composing && !view.composing && !view.compositionStarted) return changes;
+  composing ??= composingWord(view);
+  if (view.state.lineBreak !== (value.includes("\r\n") ? "\r\n" : "\n"))
+    return null;
+  const before = view.state.doc.toString();
+  const after = view.state.toText(value).toString();
+  const block = sourceBlock(before, composing);
+  const nextBlock = sourceBlock(after, {
+    from: changes.mapPos(composing.from, -1),
+    to: changes.mapPos(composing.to, 1),
+  });
+  const scan = scanRoughdraftReview(before);
+  const protectedRange = { ...composing };
+  const plain =
+    block.plain &&
+    nextBlock.plain &&
+    !scan.ranges.some(
+      (range) => range.from <= composing.to && range.to >= composing.from,
+    );
+  if (!plain) {
+    // An outside delimiter can turn the composing block into a code fence or
+    // extend its enclosing block without changing any of the composing text.
+    if (
+      block.kind !== nextBlock.kind ||
+      changes.mapPos(block.from, 1) !== nextBlock.from ||
+      changes.mapPos(block.to, -1) !== nextBlock.to
+    )
+      return null;
+    protectedRange.from = Math.min(protectedRange.from, block.from);
+    protectedRange.to = Math.max(protectedRange.to, block.to);
+    for (const range of scan.ranges)
+      if (range.from <= protectedRange.to && range.to >= protectedRange.from) {
+        protectedRange.from = Math.min(protectedRange.from, range.from);
+        protectedRange.to = Math.max(protectedRange.to, range.to);
+      }
+    // Reference definitions can change the meaning of an unchanged link or
+    // footnote. Keep that token context stable while its source is composing.
+    const definitions = (text: string) =>
+      [
+        ...text.matchAll(
+          /^ {0,3}\[[^\]\n]+\]:[^\n]*(?:\n(?: {2,}|\t)[^\n]*)*/gm,
+        ),
+      ].map((match) => match[0]);
+    if (
+      block.references &&
+      JSON.stringify(definitions(before)) !== JSON.stringify(definitions(after))
+    )
+      return null;
+    const owned = scan.items.filter(
+      (item) =>
+        item.offset < protectedRange.to && item.endOffset > protectedRange.from,
+    );
+    if (owned.length) {
+      const incoming = new Map(
+        scanRoughdraftReview(after).items.map((item) => [item.id, item]),
+      );
+      const meaning = ({
+        offset: _offset,
+        endOffset: _end,
+        line: _line,
+        column: _column,
+        ...item
+      }: (typeof owned)[number]) => item;
+      if (
+        owned.some((item) => {
+          const next = incoming.get(item.id);
+          return (
+            !next ||
+            JSON.stringify(meaning(item)) !== JSON.stringify(meaning(next))
+          );
+        })
+      )
+        return null;
+    }
+  }
+  let touches = false;
+  changes.iterChanges((from, to, _nextFrom, _nextTo, inserted) => {
+    if (from <= protectedRange.to && to >= protectedRange.from) touches = true;
+    // A paragraph split/join or source-token change needs the block guard,
+    // even when the literal composing word itself is unchanged.
+    if (
+      plain &&
+      from <= block.to &&
+      to >= block.from &&
+      /\n/.test(before.slice(from, to) + inserted.toString())
+    )
+      touches = true;
+  });
+  return touches ? null : changes;
+}
+
+/** Avoid parsing source for ordinary, non-composing remote acknowledgments. */
+export function canApplyMarkdownSourceUpdate(view: EditorView, value: string) {
+  return (
+    (!sourceCompositions.has(view) &&
+      !view.composing &&
+      !view.compositionStarted) ||
+    sourceChangesDuringComposition(view, value) !== null
+  );
 }
 
 export function createMarkdownCodeEditorExtensions(
@@ -204,6 +366,7 @@ export function MarkdownCodeEditor({
   const lastValueRef = useRef(value);
   const editableCompartmentRef = useRef(new Compartment());
   const lineSeparatorCompartment = useRef(new Compartment());
+  const applyIncomingRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     onChangeRef.current = onChange;
@@ -263,6 +426,14 @@ export function MarkdownCodeEditor({
             lastValueRef,
             editableCompartmentRef.current,
           ),
+          EditorView.updateListener.of((update) => {
+            const range = sourceCompositions.get(update.view);
+            if (range && update.docChanged)
+              sourceCompositions.set(update.view, {
+                from: update.changes.mapPos(range.from, -1),
+                to: update.changes.mapPos(range.to, 1),
+              });
+          }),
         ],
       }),
     });
@@ -276,26 +447,31 @@ export function MarkdownCodeEditor({
     };
     const finishComposition = () => {
       cancelCompositionEnd();
-      if (!onCompositionEndRef.current) return;
       // CodeMirror flushes trailing Android composition mutations separately.
       // Match its own 50 ms composition cleanup before resuming an update.
       compositionTimer = setTimeout(() => {
         compositionTimer = undefined;
-        if (!view.composing && !view.compositionStarted)
+        if (!view.composing && !view.compositionStarted) {
+          sourceCompositions.delete(view);
+          applyIncomingRef.current?.();
           onCompositionEndRef.current?.();
+        }
       }, 50);
     };
-    view.contentDOM.addEventListener("compositionstart", cancelCompositionEnd);
+    const beginComposition = () => {
+      cancelCompositionEnd();
+      sourceCompositions.set(view, composingWord(view));
+    };
+    view.contentDOM.addEventListener("compositionstart", beginComposition);
     view.contentDOM.addEventListener("compositionend", finishComposition);
 
     return () => {
       cancelCompositionEnd();
-      view.contentDOM.removeEventListener(
-        "compositionstart",
-        cancelCompositionEnd,
-      );
+      view.contentDOM.removeEventListener("compositionstart", beginComposition);
       view.contentDOM.removeEventListener("compositionend", finishComposition);
       editorViewRef.current = null;
+      applyIncomingRef.current = null;
+      sourceCompositions.delete(view);
       view.destroy();
     };
   }, []);
@@ -336,28 +512,33 @@ export function MarkdownCodeEditor({
   useEffect(() => {
     const view = editorViewRef.current;
     if (!view) return;
+    const apply = () => {
+      const changes = sourceChangesDuringComposition(view, value);
+      if (!changes) return;
+      const separator = value.includes("\r\n") ? "\r\n" : "\n";
+      if (view.state.lineBreak !== separator)
+        view.dispatch({
+          effects: lineSeparatorCompartment.current.reconfigure(
+            EditorState.lineSeparator.of(separator),
+          ),
+        });
+      const currentValue = view.state.sliceDoc();
+      if (currentValue === value) {
+        lastValueRef.current = value;
+        return;
+      }
 
-    const separator = value.includes("\r\n") ? "\r\n" : "\n";
-    if (view.state.lineBreak !== separator)
-      view.dispatch({
-        effects: lineSeparatorCompartment.current.reconfigure(
-          EditorState.lineSeparator.of(separator),
-        ),
-      });
-    const currentValue = view.state.sliceDoc();
-    if (currentValue === value) {
       lastValueRef.current = value;
-      return;
-    }
-
-    lastValueRef.current = value;
-    view.dispatch({
-      annotations: [
-        Transaction.addToHistory.of(false),
-        Transaction.remote.of(true),
-      ],
-      changes: incomingSourceChanges(view.state, value),
-    });
+      view.dispatch({
+        annotations: [
+          Transaction.addToHistory.of(false),
+          Transaction.remote.of(true),
+        ],
+        changes,
+      });
+    };
+    applyIncomingRef.current = apply;
+    apply();
   }, [value]);
 
   return (

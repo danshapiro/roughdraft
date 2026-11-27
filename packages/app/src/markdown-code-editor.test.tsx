@@ -58,6 +58,139 @@ function editor() {
   return view;
 }
 
+test.each([
+  {
+    name: "fenced code",
+    source: "```js\nconst label = 'target';\n```\n\nOther paragraph.\n",
+    change: (text: string) => text.replace("```js", "```text"),
+  },
+  {
+    name: "inline Markdown",
+    source: "Keep **formatted context** near target.\n\nOther paragraph.\n",
+    change: (text: string) =>
+      text.replace("**formatted context**", "*changed context*"),
+  },
+  {
+    name: "multiline review markup",
+    source:
+      "{==Opening.\n\nMiddle target.\n\nClosing.==}{>>Saved feedback.<<}{#c1}\n",
+    change: (text: string) => text.replace("Opening.", "Changed opening."),
+  },
+  {
+    name: "reference definitions",
+    source: "Read [target][guide] before launch.\n\n[guide]: before.md\n",
+    change: (text: string) => text.replace("before.md", "after.md"),
+  },
+  {
+    name: "frontmatter",
+    source: "---\ntitle: target\nowner: Dan\n---\n\nBody.\n",
+    change: (text: string) => text.replace("owner: Dan", "owner: Pat"),
+  },
+  {
+    name: "surrounding Markdown",
+    source: "Peer paragraph.\n\nKeep target stable.\n\nTail.\n",
+    change: (text: string) =>
+      text.replace("Peer paragraph.", "```text\nPeer paragraph."),
+  },
+])("source composition protects its $name context while a pending update waits", async ({
+  source: original,
+  change,
+}) => {
+  const onChange = vi.fn();
+  const render = (value: string) =>
+    act(async () =>
+      root.render(<MarkdownCodeEditor value={value} onChange={onChange} />),
+    );
+  await render(original);
+  const view = editor();
+  vi.useFakeTimers();
+  const from = view.state.doc.toString().indexOf("target");
+  await act(async () => {
+    view.focus();
+    view.dispatch({
+      selection: { anchor: from, head: from + "target".length },
+    });
+    view.contentDOM.dispatchEvent(
+      new CompositionEvent("compositionstart", { bubbles: true, data: "日" }),
+    );
+    view.dispatch({
+      changes: { from, to: from + "target".length, insert: "日本語" },
+      selection: { anchor: from + 3 },
+    });
+  });
+  const local = view.state.sliceDoc();
+  const caret = view.state.selection.main.anchor;
+  const compositionNode = view.domAtPos(caret).node;
+  await render(change(local));
+  expect(view.state.sliceDoc()).toBe(local);
+  expect(view.state.selection.main.anchor).toBe(caret);
+  expect(view.domAtPos(caret).node).toBe(compositionNode);
+  expect(view.compositionStarted).toBe(true);
+  expect(onChange).toHaveBeenCalledOnce();
+  await act(async () => {
+    view.contentDOM.dispatchEvent(
+      new CompositionEvent("compositionend", { bubbles: true, data: "日本語" }),
+    );
+    await vi.advanceTimersByTimeAsync(60);
+  });
+  expect(view.state.sliceDoc()).toBe(change(local));
+  expect(onChange).toHaveBeenCalledOnce();
+});
+
+test("distant prose changes map through ongoing source input without replacing the composing DOM", async () => {
+  const original = "Before target after.\n\nPeer paragraph.\n";
+  const onChange = vi.fn();
+  const render = (value: string) =>
+    act(async () =>
+      root.render(<MarkdownCodeEditor value={value} onChange={onChange} />),
+    );
+  await render(original);
+  const view = editor();
+  const from = original.indexOf("target");
+  await act(async () => {
+    view.focus();
+    view.dispatch({
+      selection: { anchor: from, head: from + "target".length },
+    });
+    view.contentDOM.dispatchEvent(
+      new CompositionEvent("compositionstart", { bubbles: true }),
+    );
+    view.dispatch({
+      changes: { from, to: from + "target".length, insert: "日本語" },
+      selection: { anchor: from + 3 },
+    });
+  });
+  const compositionNode = view.domAtPos(view.state.selection.main.anchor).node;
+  await render(
+    view.state
+      .sliceDoc()
+      .replace("Before", "Incoming before")
+      .replace("Peer paragraph", "First peer update"),
+  );
+  expect(view.domAtPos(view.state.selection.main.anchor).node).toBe(
+    compositionNode,
+  );
+  await act(async () =>
+    view.dispatch({
+      changes: { from: view.state.selection.main.head, insert: "続" },
+    }),
+  );
+  expect(onChange).toHaveBeenLastCalledWith(
+    "Incoming before 日本語続 after.\n\nFirst peer update.\n",
+  );
+  await render(
+    view.state.sliceDoc().replace("First peer update", "Latest peer update"),
+  );
+  expect(view.state.sliceDoc()).toBe(
+    "Incoming before 日本語続 after.\n\nLatest peer update.\n",
+  );
+  expect(view.domAtPos(view.state.selection.main.anchor).node).toBe(
+    compositionNode,
+  );
+  expect(view.compositionStarted).toBe(true);
+  expect(onChange).toHaveBeenCalledTimes(2);
+});
+
 test("source composition completion uses the latest callback without another document change", async () => {
   const previous = vi.fn();
   const current = vi.fn();

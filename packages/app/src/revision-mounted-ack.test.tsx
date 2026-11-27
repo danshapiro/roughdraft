@@ -9,7 +9,7 @@ import {
 } from "@roughdraft/rfm";
 import type { Editor } from "@tiptap/core";
 import { TextSelection } from "@tiptap/pm/state";
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import editingReview from "../../../docs/spec/fixtures/editing-review.md?raw";
@@ -232,6 +232,21 @@ async function mountEditor(
   const source = {
     current: null as ((value: string, previous?: string) => void) | null,
   };
+  let reflectSource = (_value: string) => {};
+  function SourceEditor() {
+    const [value, setValue] = useState(markdown);
+    reflectSource = setValue;
+    return (
+      <MarkdownCodeEditor
+        value={value}
+        onChange={(next) => {
+          setValue(next);
+          source.current?.(next, controller?.readDraft().markdown);
+        }}
+        onCompositionEnd={onSourceCompositionEnd}
+      />
+    );
+  }
   let editor: Editor | null = null;
   await act(async () =>
     root.render(
@@ -284,15 +299,7 @@ async function mountEditor(
               uiDraftStore: store,
             }}
           />
-          {withSource && (
-            <MarkdownCodeEditor
-              value={markdown}
-              onChange={(next) =>
-                source.current?.(next, controller?.readDraft().markdown)
-              }
-              onCompositionEnd={onSourceCompositionEnd}
-            />
-          )}
+          {withSource && <SourceEditor />}
         </RevisionUiDraftContext.Provider>
       </TooltipProvider>,
     ),
@@ -309,17 +316,93 @@ async function mountEditor(
       .querySelector<HTMLElement>('[data-testid="comment-thread-c1"]')
       ?.click(),
   );
-  return { live, flush, remote };
+  return {
+    live,
+    flush,
+    remote,
+    reflectSource: (value: string) => reflectSource(value),
+  };
 }
 
-test("outside updates wait for actual source composition and drain its latest version even without a final text change", async () => {
+test("a source update checks composition against its final rebase across newer preedit", async () => {
+  const store = privateDrafts();
+  const { live, remote, reflectSource } = await mountEditor(
+    store,
+    original,
+    true,
+  );
+  const host = container.querySelector<HTMLElement>(".cm-editor");
+  const source = host && CodeMirrorView.findFromDOM(host);
+  if (!source) throw new Error("Expected the actual source editor");
+  const at =
+    source.state.doc.toString().indexOf("Live owner B: unchanged.") +
+    "Live owner B: unchanged.".length;
+  await act(async () => {
+    source.focus();
+    source.dispatch({ selection: { anchor: at } });
+    source.contentDOM.dispatchEvent(
+      new CompositionEvent("compositionstart", { bubbles: true }),
+    );
+    source.dispatch({
+      changes: { from: at, insert: " 日本語" },
+      selection: { anchor: at + 4 },
+    });
+  });
+  const baseline = draft(source.state.sliceDoc());
+  const candidate = draft(
+    baseline.markdown.replace(
+      "Live owner A: unchanged.",
+      "Live owner A: Incoming worker text.",
+    ),
+  );
+  // The worker's immutable result predates this newer native composition input.
+  await act(async () =>
+    source.dispatch({
+      changes: { from: source.state.selection.main.head, insert: "続" },
+    }),
+  );
+  let applied: RevisionDraft | null | undefined;
+  await act(async () => {
+    applied = remote.current?.(candidate, { localBase: baseline });
+    if (applied) reflectSource(applied.markdown);
+  });
+  expect(applied).not.toBeNull();
+  expect(live.state.doc.textContent).toContain(
+    "Live owner B: unchanged. 日本語続",
+  );
+  expect(live.state.doc.textContent).toContain(
+    "Live owner A: Incoming worker text.",
+  );
+  expect(source.state.sliceDoc()).toContain(
+    "Live owner B: unchanged. 日本語続",
+  );
+  expect(source.state.sliceDoc()).toContain(
+    "Live owner A: Incoming worker text.",
+  );
+  expect(source.compositionStarted).toBe(true);
+});
+
+test.each([
+  "other paragraph",
+  "same paragraph",
+  "comment only",
+  "overlap",
+] as const)("actual source composition applies independent updates and waits only for protected edits (%s)", async (scenario) => {
+  const profile = { entries: [] as Array<{ stage: string }> };
+  vi.stubGlobal("roughdraftProfile", profile);
   const store = privateDrafts();
   let compositionEnded = 0;
   let draining: Promise<boolean> | undefined;
-  const { live, remote } = await mountEditor(store, original, true, () => {
-    compositionEnded++;
-    draining = controller?.retry();
-  });
+  const { live, remote, reflectSource } = await mountEditor(
+    store,
+    original,
+    true,
+    () => {
+      compositionEnded++;
+      if (controller?.getSnapshot().conflict?.kind === "waiting")
+        draining = controller.retry();
+    },
+  );
   const host = container.querySelector<HTMLElement>(".cm-editor");
   const source = host && CodeMirrorView.findFromDOM(host);
   if (!source) throw new Error("Expected the actual Markdown source editor");
@@ -360,7 +443,11 @@ test("outside updates wait for actual source composition and drain its latest ve
       rebasesBufferedDocument: true,
       prepare: (value, options) =>
         prepareRevisionEditorDraft(value, live, options),
-      apply: (value, options) => remote.current?.(value, options) ?? null,
+      apply: (value, options) => {
+        const result = remote.current?.(value, options) ?? null;
+        if (result) reflectSource(result.markdown);
+        return result;
+      },
       adopt: () => null,
       readUiDrafts: store.read,
       restoreUiDrafts: store.restore,
@@ -369,12 +456,13 @@ test("outside updates wait for actual source composition and drain its latest ve
     active.start();
     await vi.advanceTimersByTimeAsync(0);
     source.focus();
-    source.contentDOM.dispatchEvent(
-      new CompositionEvent("compositionstart", { bubbles: true, data: "日" }),
-    );
     const at =
       source.state.doc.toString().indexOf("Live owner B: unchanged.") +
       "Live owner B: unchanged.".length;
+    source.dispatch({ selection: { anchor: at } });
+    source.contentDOM.dispatchEvent(
+      new CompositionEvent("compositionstart", { bubbles: true, data: "日" }),
+    );
     source.dispatch({
       changes: { from: at, insert: " 日本語" },
       selection: { anchor: at + 4 },
@@ -383,30 +471,97 @@ test("outside updates wait for actual source composition and drain its latest ve
   expect(source.compositionStarted).toBe(true);
   const localText = source.state.sliceDoc();
   const caret = source.state.selection.main.anchor;
+  const compositionNode = source.domAtPos(caret).node;
+  if (scenario === "overlap")
+    await act(async () => {
+      await active.flush(false);
+    });
+  const peerBase = structuredClone(server);
+  const oldComment =
+    "This second comment overlaps the birch and continues to the path. Its highlight must stay separate.";
   for (const [index, addition] of [
     " Earlier outside text.",
     " Latest outside text.",
   ].entries()) {
-    server = state(
-      draft(
-        original.replace(
-          "Live owner A: unchanged.",
-          `Live owner A: unchanged.${addition}`,
-        ),
-      ),
-      index + 2,
-    );
+    const peer =
+      scenario === "overlap" ? peerBase.draft.markdown : server.draft.markdown;
+    const changed =
+      scenario === "overlap"
+        ? peer.replace(
+            "Live owner B: unchanged. 日本語",
+            `Live owner B: unchanged. ${index === 0 ? "先の言葉" : "最新の言葉"}`,
+          )
+        : scenario === "same paragraph"
+          ? peer.replace(
+              /(?:Peer detail \d+\. )?Live owner B:/,
+              `Peer detail ${index + 1}. Live owner B:`,
+            )
+          : scenario === "comment only"
+            ? peer.replaceAll(
+                index === 0 ? oldComment : "Peer comment revision 1.",
+                `Peer comment revision ${index + 1}.`,
+              )
+            : peer.replace(
+                /Live owner A:[^\n]*/,
+                `Live owner A: unchanged.${addition}`,
+              );
+    expect(changed).not.toBe(peer);
+    server = state(draft(changed), server.revision + 1);
     await act(async () => {
       for (const listener of listeners)
         listener({ reason: "changed", state: structuredClone(server) });
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(active.getSnapshot().conflict?.kind).toBe("waiting");
-    expect(live.state.doc.textContent).not.toContain(addition.trim());
-    expect(source.state.sliceDoc()).toBe(localText);
-    expect(source.state.selection.main.anchor).toBe(caret);
+    if (scenario === "overlap") {
+      expect(active.getSnapshot().conflict?.kind).toBe("waiting");
+      expect(source.state.sliceDoc()).toBe(localText);
+      expect(source.state.selection.main.anchor).toBe(caret);
+    } else {
+      expect(
+        active.getSnapshot().conflict,
+        JSON.stringify(
+          profile.entries.filter((entry) => entry.stage.includes("blocked")),
+        ),
+      ).toBeNull();
+      await act(async () => {
+        await active.flush(false);
+      });
+      expect(server.draft.markdown).toContain(
+        "Live owner B: unchanged. 日本語",
+      );
+      expect(active.getSnapshot().writePaused).toBe(false);
+      if (scenario === "other paragraph") {
+        expect(live.state.doc.textContent).toContain(addition.trim());
+        expect(source.state.sliceDoc()).toContain(addition.trim());
+      } else if (scenario === "same paragraph") {
+        expect(live.state.doc.textContent).toContain(
+          `Peer detail ${index + 1}. Live owner B:`,
+        );
+        expect(source.state.sliceDoc()).toContain(
+          `Peer detail ${index + 1}. Live owner B:`,
+        );
+      } else {
+        expect(
+          active
+            .readDraft()
+            .reviewComments.find((comment) => comment.id === "c2")?.content,
+        ).toBe(`Peer comment revision ${index + 1}.`);
+        expect(source.state.sliceDoc()).toContain(
+          `Peer comment revision ${index + 1}.`,
+        );
+      }
+      expect(source.compositionStarted).toBe(true);
+      expect(source.domAtPos(source.state.selection.main.anchor).node).toBe(
+        compositionNode,
+      );
+      expect(
+        source.state.doc.sliceString(
+          source.state.selection.main.anchor - 3,
+          source.state.selection.main.anchor,
+        ),
+      ).toBe("日本語");
+    }
   }
-  const changesBeforeEnd = active.readDraft().markdown;
   await act(async () => {
     source.contentDOM.dispatchEvent(
       new CompositionEvent("compositionend", { bubbles: true, data: "日本語" }),
@@ -415,40 +570,34 @@ test("outside updates wait for actual source composition and drain its latest ve
     await draining;
   });
   expect(compositionEnded).toBe(1);
-  expect(changesBeforeEnd).toContain("日本語");
-  expect(live.state.doc.textContent).toContain("Latest outside text.");
-  expect(live.state.doc.textContent).not.toContain("Earlier outside text.");
-  expect(live.state.doc.textContent).toContain("日本語");
+  if (scenario === "overlap") {
+    expect(source.state.sliceDoc()).toContain(
+      "Live owner B: unchanged. 最新の言葉",
+    );
+    expect(live.state.doc.textContent).toContain(
+      "Live owner B: unchanged. 最新の言葉",
+    );
+  } else if (scenario === "other paragraph") {
+    expect(live.state.doc.textContent).toContain("Latest outside text.");
+    expect(live.state.doc.textContent).not.toContain("Earlier outside text.");
+  }
   expect(active.getSnapshot().conflict).toBeNull();
-  expect(server.draft.markdown).toContain("Latest outside text.");
-  expect(server.draft.markdown).toContain("日本語");
-  expect(
-    server.draft.reviewComments.map(({ id, content, parentCommentId }) => ({
-      id,
-      content,
-      parentCommentId,
-    })),
-  ).toEqual(
-    draft(original).reviewComments.map(({ id, content, parentCommentId }) => ({
-      id,
-      content,
-      parentCommentId,
-    })),
-  );
-  await act(async () => {
-    live.commands.undo();
-  });
-  expect(live.state.doc.textContent).not.toContain(
-    "Live owner B: unchanged. 日本語",
-  );
-  expect(live.state.doc.textContent).toContain("Latest outside text.");
-  await act(async () => {
-    live.commands.redo();
-  });
-  expect(live.state.doc.textContent).toContain(
-    "Live owner B: unchanged. 日本語",
-  );
-  expect(live.state.doc.textContent).toContain("Latest outside text.");
+  if (scenario !== "overlap") {
+    await act(async () => {
+      live.commands.undo();
+    });
+    expect(live.state.doc.textContent).not.toContain(
+      "Live owner B: unchanged. 日本語",
+    );
+    if (scenario === "other paragraph")
+      expect(live.state.doc.textContent).toContain("Latest outside text.");
+    await act(async () => {
+      live.commands.redo();
+    });
+    expect(live.state.doc.textContent).toContain(
+      "Live owner B: unchanged. 日本語",
+    );
+  }
   expect(store.getSnapshot().comments.c1.value).toBe(privateComment);
   expect(store.getSnapshot().comments.c99.value).toBe(privateReply);
 }, 20_000);
