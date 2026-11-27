@@ -6,6 +6,7 @@ import {
   renumberReviewDraft,
   reviewDraftSignature,
   reviewHistoryProposalIds,
+  roughdraftAttachmentContexts,
   type SyncDraft,
   type SyncMerge,
 } from "@roughdraft/rfm";
@@ -82,6 +83,25 @@ function annotationRanges(doc: Node) {
   return { comments, suggestions };
 }
 
+function suggestionAttribution(doc: Node, id: string) {
+  let attribution: Pick<
+    NonNullable<SyncDraft["outdatedSuggestions"]>[number],
+    "createdAt" | "authorType" | "authorId"
+  > = {};
+  doc.descendants((node) => {
+    const change =
+      node.attrs.change ??
+      node.marks.find((mark) => mark.type.name === "criticChange")?.attrs;
+    if (change?.changeId === id)
+      attribution = {
+        createdAt: change.createdAt,
+        authorType: change.authorType,
+        authorId: change.authorType === "ai" ? null : change.authorId,
+      };
+  });
+  return attribution;
+}
+
 /** Reconcile disk's accepted text into a detached review state; never mutate the live editor. */
 export interface RevisionDiskBase {
   path: string;
@@ -112,7 +132,12 @@ export function adoptRevisionDisk(
 ): SyncDraft | RevisionDiskMerge | null {
   if (diskBase) {
     try {
-      return mergeDisk(base, markdown, schema, force, diskBase);
+      const result = mergeDisk(base, markdown, schema, force, diskBase);
+      return result.status !== "merged" &&
+        force &&
+        diskBase.resolution === "incoming"
+        ? reloadRawDisk(base, markdown, schema, diskBase)
+        : result;
     } catch (error) {
       console.warn(
         JSON.stringify({
@@ -155,25 +180,12 @@ function diskDraft(markdown: string, schema: Schema): SyncDraft {
   };
 }
 
-/** Disk and browser changes share the last acknowledged annotated disk base. */
-function mergeDisk(
+function readDiskSides(
   review: SyncDraft,
   markdown: string,
   schema: Schema,
-  force: boolean,
   diskBase: RevisionDiskBase,
-): RevisionDiskMerge {
-  if (
-    review.cleanMarkdown !== undefined &&
-    !provesAcceptedSpelling(review.markdown, review.cleanMarkdown, schema)
-  )
-    return {
-      status: "client-merge-required",
-      draft: review,
-      conflicts: [],
-      signature: reviewDraftSignature(review),
-      reason: "The saved clean text could not be verified against its review.",
-    };
+) {
   const origin = review.diskOrigin;
   const aliases =
     origin?.path === diskBase.path &&
@@ -212,6 +224,34 @@ function mergeDisk(
     aliases,
   );
   const disk = renumberReviewDraft(diskDraft(markdown, schema), aliases);
+  return { aliases, before, disk };
+}
+
+/** Disk and browser changes share the last acknowledged annotated disk base. */
+function mergeDisk(
+  review: SyncDraft,
+  markdown: string,
+  schema: Schema,
+  force: boolean,
+  diskBase: RevisionDiskBase,
+): RevisionDiskMerge {
+  if (
+    review.cleanMarkdown !== undefined &&
+    !provesAcceptedSpelling(review.markdown, review.cleanMarkdown, schema)
+  )
+    return {
+      status: "client-merge-required",
+      draft: review,
+      conflicts: [],
+      signature: reviewDraftSignature(review),
+      reason: "The saved clean text could not be verified against its review.",
+    };
+  const { aliases, before, disk } = readDiskSides(
+    review,
+    markdown,
+    schema,
+    diskBase,
+  );
   if (
     [before, disk].some(
       (side) =>
@@ -385,6 +425,225 @@ function mergeDisk(
     signature: reviewDraftSignature(draft),
   };
 }
+
+/** Compare feedback meaning and its attachment, independently of source spelling. */
+function reloadFeedback(draft: SyncDraft) {
+  const items = extractRoughdraftReviewIndex(draft.markdown).items;
+  const represented = new Map(items.map((item) => [item.id, item]));
+  const contexts = roughdraftAttachmentContexts(
+    draft.markdown,
+    items
+      .filter((item) => item.endOffset > item.offset)
+      .map((item) => item.offset),
+  );
+  const context = (id: string) => {
+    const item = represented.get(id);
+    return item && item.endOffset > item.offset
+      ? (contexts.get(item.offset) ?? null)
+      : null;
+  };
+  const meanings = new Map(
+    items.map((item) => [
+      item.id,
+      JSON.stringify([
+        item.kind,
+        item.suggestionKind ?? null,
+        item.text,
+        item.originalText ?? null,
+        item.replacementText ?? null,
+        item.anchorText ?? null,
+        item.parentId,
+        context(item.id),
+      ]),
+    ]),
+  );
+  for (const comment of draft.reviewComments)
+    meanings.set(
+      comment.id,
+      JSON.stringify([
+        "comment",
+        comment.content,
+        comment.parentCommentId ?? null,
+        represented.get(comment.id)?.anchorText ??
+          comment.originalQuote ??
+          null,
+        context(comment.id),
+        Boolean(comment.detachedReason),
+      ]),
+    );
+  return { items, meanings };
+}
+
+/** Explicit Reload owns disk's prose; unmappable feedback remains visible. */
+function reloadRawDisk(
+  review: SyncDraft,
+  markdown: string,
+  schema: Schema,
+  diskBase: RevisionDiskBase,
+): RevisionDiskMerge {
+  const { aliases, before, disk } = readDiskSides(
+    review,
+    markdown,
+    schema,
+    diskBase,
+  );
+  const localFeedback = reloadFeedback(review);
+  const beforeFeedback = reloadFeedback(before);
+  const diskFeedback = reloadFeedback(disk);
+  const reserved = new Set([
+    ...Object.keys(review.decisions),
+    ...reviewHistoryProposalIds(review.reviewed),
+    ...(review.outdatedSuggestions ?? []).map((item) => item.id),
+  ]);
+  const owned = new Set([
+    ...localFeedback.meanings.keys(),
+    // Deleting an item does not release its identity from browser Undo.
+    ...beforeFeedback.meanings.keys(),
+    ...review.reviewComments.map((comment) => comment.id),
+    ...reserved,
+  ]);
+  const used = new Set([
+    ...owned,
+    ...diskFeedback.meanings.keys(),
+    ...Object.keys(aliases),
+    ...Object.values(aliases),
+  ]);
+  const remap: Record<string, string> = {};
+  for (const [id, incomingMeaning] of diskFeedback.meanings) {
+    const localMeaning = localFeedback.meanings.get(id);
+    const beforeMeaning = beforeFeedback.meanings.get(id);
+    const collision =
+      owned.has(id) &&
+      ((reserved.has(id) && localMeaning === undefined) ||
+        beforeMeaning === undefined ||
+        (localMeaning !== beforeMeaning && localMeaning !== incomingMeaning));
+    if (collision) {
+      remap[id] = nextReviewIdentity(id, used);
+      used.add(remap[id]);
+    }
+  }
+  const incoming = renumberReviewDraft(disk, remap);
+  const incomingItems = extractRoughdraftReviewIndex(incoming.markdown).items;
+  const incomingById = new Map(incomingItems.map((item) => [item.id, item]));
+  const clean = cleanRevisionSourceMarkdown(markdown);
+  // Only parsed identity patches may distinguish this review from raw disk.
+  // Their clean spelling must remain identical; old review clean text is unused.
+  if (cleanRevisionSourceMarkdown(incoming.markdown) !== clean)
+    return {
+      status: "client-merge-required",
+      draft: review,
+      conflicts: [],
+      signature: reviewDraftSignature(review),
+      reason:
+        "The source identities could not be restored without changing its text.",
+    };
+
+  const parsed = parseRemoteRevision(
+    review.markdown,
+    EditorState.create({ schema }),
+  );
+  const ranges = annotationRanges(parsed.doc);
+  const comments = new Map<string, SyncDraft["reviewComments"][number]>(
+    review.reviewComments.map((comment) => [comment.id, comment]),
+  );
+  for (const comment of parsed.comments.values())
+    if (!comments.has(comment.id))
+      comments.set(comment.id, {
+        ...comment,
+        changeId: comment.parentCommentId ?? "document",
+      });
+  const incomingComments = new Set(
+    incoming.reviewComments.map((comment) => comment.id),
+  );
+  for (const [id, comment] of comments) {
+    if (incomingComments.has(id) || comment.parentCommentId) continue;
+    const range = ranges.comments.get(id);
+    comments.set(id, {
+      ...comment,
+      scope: "document",
+      changeId: "document",
+      originalQuote:
+        comment.originalQuote ??
+        (range
+          ? parsed.doc.textBetween(range.from, range.to, "\n")
+          : undefined),
+      detachedReason:
+        comment.detachedReason ??
+        "The file was reloaded before this comment could be safely attached.",
+    });
+  }
+  for (const comment of incoming.reviewComments) {
+    const existing = comments.get(comment.id);
+    const source = incomingById.get(comment.id);
+    comments.set(comment.id, {
+      ...comment,
+      ...(existing && !source?.createdAt
+        ? { createdAt: existing.createdAt }
+        : {}),
+      ...(existing && !source?.author
+        ? { authorType: existing.authorType, authorId: existing.authorId }
+        : {}),
+    });
+  }
+  const outdated = [...(review.outdatedSuggestions ?? [])];
+  const pending = new Set(
+    incomingItems
+      .filter((item) => item.kind === "suggestion")
+      .map((item) => item.id),
+  );
+  for (const [id] of ranges.suggestions) {
+    if (pending.has(id) || outdated.some((item) => item.id === id)) continue;
+    const detail = suggestionDetail(parsed.doc, id);
+    outdated.push({
+      id,
+      originalText: detail.oldText,
+      proposedText: detail.newText,
+      reason:
+        "The file was reloaded before this proposal could be safely attached.",
+      ...suggestionAttribution(parsed.doc, id),
+    });
+  }
+  const ids = { ...aliases };
+  for (const item of extractRoughdraftReviewIndex(markdown).items) {
+    const previous = aliases[item.id] ?? item.id;
+    if (remap[previous]) ids[item.id] = remap[previous];
+  }
+  const draft: SyncDraft = {
+    ...review,
+    markdown: incoming.markdown,
+    cleanMarkdown: clean,
+    reviewComments: [...comments.values()],
+    outdatedSuggestions: outdated,
+    reviewed: review.reviewed?.map((entry) => ({
+      ...entry,
+      stale: true,
+      staleReason:
+        entry.staleReason ?? "The file was reloaded from its source.",
+    })),
+    diskOrigin: {
+      path: diskBase.path,
+      signature: contentSignature(markdown),
+      ids,
+    },
+  };
+  console.info(
+    JSON.stringify({
+      severity: "info",
+      component: "revision-editor",
+      event: "explicit-raw-disk-reload",
+      comments: comments.size,
+      outdatedSuggestions: outdated.length,
+      renumbered: Object.keys(remap).length,
+    }),
+  );
+  return {
+    status: "merged",
+    draft,
+    conflicts: [],
+    signature: reviewDraftSignature(draft),
+    diskCleanMarkdown: clean,
+  };
+}
 function adoptDisk(
   base: SyncDraft,
   markdown: string,
@@ -535,28 +794,13 @@ function adoptDisk(
   const outdated = [...(base.outdatedSuggestions ?? [])];
   for (const id of affectedSuggestions) {
     const detail = suggestionDetail(state.doc, id);
-    let attribution: Pick<
-      NonNullable<SyncDraft["outdatedSuggestions"]>[number],
-      "createdAt" | "authorType" | "authorId"
-    > = {};
-    state.doc.descendants((node) => {
-      const change =
-        node.attrs.change ??
-        node.marks.find((mark) => mark.type.name === "criticChange")?.attrs;
-      if (change?.changeId === id)
-        attribution = {
-          createdAt: change.createdAt,
-          authorType: change.authorType,
-          authorId: change.authorType === "ai" ? null : change.authorId,
-        };
-    });
     if (!outdated.some((item) => item.id === id))
       outdated.push({
         id,
         originalText: detail.oldText,
         proposedText: detail.newText,
         reason: "The file changed on disk across this proposal.",
-        ...attribution,
+        ...suggestionAttribution(state.doc, id),
       });
     const rejected = rejectCriticChangeTransaction(state, id);
     if (rejected) state = state.apply(rejected);
