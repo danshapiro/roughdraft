@@ -170,6 +170,8 @@ export interface Comparison {
     entryUiDrafts?: Record<string, unknown>;
     createdAt: string;
     resolvedAt?: string;
+    // A covering save can commit before the snapshot of its newer generation.
+    resolvedThroughGeneration?: number;
     savedCopyId?: string;
   }>;
 }
@@ -2277,11 +2279,20 @@ export class ComparisonStore {
         (entry) =>
           entry.id === checkpointId &&
           entry.resolvedAt &&
-          entry.generation >= generation,
+          (entry.resolvedThroughGeneration ?? entry.generation) >= generation,
       );
       // A delayed snapshot cannot reopen work a durable covering save retired.
       // A higher generation still represents new work and follows the normal path.
-      if (completed) return { checkpointId, generation: completed.generation };
+      if (completed) {
+        log("checkpoint-snapshot-covered", {
+          id,
+          checkpointId,
+          generation,
+          coveredGeneration:
+            completed.resolvedThroughGeneration ?? completed.generation,
+        });
+        return { checkpointId, generation: completed.generation };
+      }
       const directory = path.join(this.directory, "checkpoints", id);
       fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
       const filename = path.join(directory, `${checkpointId}.json`);
@@ -2435,6 +2446,10 @@ export class ComparisonStore {
         return;
     }
     entry.resolvedAt = new Date().toISOString();
+    entry.resolvedThroughGeneration = Math.max(
+      entry.resolvedThroughGeneration ?? entry.generation,
+      generation,
+    );
     entry.savedCopyId = copyId;
     const retained = this.pruneCheckpoints(id, list);
     atomicWrite(this.checkpointIndex(id), JSON.stringify(retained));
