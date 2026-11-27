@@ -1335,6 +1335,20 @@ export class ComparisonStore {
     this.reservations.release(review.id, operation.pageInstanceId);
     return this.operations.finish(record);
   }
+  private liveOperationResult(
+    result: SyncResult<Comparison>,
+  ): SyncResult<Comparison> {
+    const context = this.operations.context();
+    return {
+      ...result,
+      ...(result.state
+        ? { state: { ...result.state, operationContext: context } }
+        : {}),
+      ...(result.status === "retry-later" && result.operationContext
+        ? { operationContext: context }
+        : {}),
+    };
+  }
   operationStatus(id: string): SyncResult<Comparison> {
     try {
       const record = this.operations.read(id);
@@ -1353,32 +1367,12 @@ export class ComparisonStore {
             "Operation is unrecorded. Resolve its saved identity before retrying.",
         };
       if (record.phase === "done" && record.result)
-        return {
-          ...record.result,
-          ...(record.result.state
-            ? {
-                state: {
-                  ...record.result.state,
-                  operationContext: this.operations.context(),
-                },
-              }
-            : {}),
-        };
+        return this.liveOperationResult(record.result);
       const review = this.readReview(record.reviewId);
       const marker =
         review.operationOutcomes?.[record.operation.pageInstanceId];
       if (marker?.id === id && record.result)
-        return {
-          ...record.result,
-          ...(record.result.state
-            ? {
-                state: {
-                  ...record.result.state,
-                  operationContext: this.operations.context(),
-                },
-              }
-            : {}),
-        };
+        return this.liveOperationResult(record.result);
       return {
         status: "publishing",
         operationId: id,
@@ -1536,7 +1530,11 @@ export class ComparisonStore {
           message: "Another page has the next merge turn.",
         };
   }
-  reconcile(id: string, body: Record<string, unknown>): SyncResult<Comparison> {
+  reconcile(
+    id: string,
+    body: Record<string, unknown>,
+    capabilities: { compactRetry?: boolean } = {},
+  ): SyncResult<Comparison> {
     const operation = readOperation(body);
     return this.mutation(id, body, () => {
       const previous = this.operations.read(operation.operationId);
@@ -1564,7 +1562,22 @@ export class ComparisonStore {
           message: "Refresh the save context and retry your queued changes.",
         });
       const record = this.operations.begin(operation, id);
-      const reject = (result: SyncResult<Comparison>) => {
+      const reject = (
+        result: SyncResult<Comparison>,
+        allowCompactRetry = true,
+      ) => {
+        if (
+          capabilities.compactRetry &&
+          allowCompactRetry &&
+          result.status === "retry-later"
+        )
+          result = {
+            status: "retry-later",
+            retryAfter: result.retryAfter,
+            message: result.message,
+            retryRevision: review.revision,
+            operationContext: this.operations.context(),
+          };
         log("sync-deferred", {
           id,
           operationId: operation.operationId,
@@ -1586,12 +1599,15 @@ export class ComparisonStore {
         review.pendingSave ||
         review.pendingApply
       )
-        return reject({
-          status: "retry-later",
-          retryAfter: 100,
-          state: this.state(id, review),
-          message: "Another publication is finishing.",
-        });
+        return reject(
+          {
+            status: "retry-later",
+            retryAfter: 100,
+            state: this.state(id, review),
+            message: "Another publication is finishing.",
+          },
+          false,
+        );
       const request = body as unknown as ReconcileRequest;
       const resolutionCheckpoints = new Map<string, number>();
       if (Array.isArray(request.resolution?.checkpointIds))
@@ -1613,11 +1629,12 @@ export class ComparisonStore {
           request.reservationToken,
         )
       ) {
-        const state = this.state(id, review);
         return reject({
           status: "retry-later",
           retryAfter: this.reservations.remaining(id) || 25,
-          state,
+          ...(capabilities.compactRetry
+            ? {}
+            : { state: this.state(id, review) }),
         });
       }
       let submitted: SyncDraft;
@@ -4666,7 +4683,8 @@ export function comparisonRouter(
     }
   });
   router.use((req, res, next) => {
-    if (req.get("X-Roughdraft-Sync") === "compact-v1") {
+    const protocol = req.get("X-Roughdraft-Sync");
+    if (protocol === "compact-v1" || protocol === "compact-v2") {
       const send = res.json.bind(res);
       res.json = (value) =>
         send(
@@ -4676,6 +4694,7 @@ export function comparisonRouter(
               ? req.params.id
               : String(req.body?.reviewId ?? ""),
             req.get("X-Roughdraft-Reference"),
+            protocol,
           ),
         );
     }
@@ -4844,7 +4863,11 @@ export function comparisonRouter(
   router.post(
     "/:id/reconcile",
     handle((req, res) => {
-      res.json(store.reconcile(String(req.params.id), objectBody(req.body)));
+      res.json(
+        store.reconcile(String(req.params.id), objectBody(req.body), {
+          compactRetry: req.get("X-Roughdraft-Sync") === "compact-v2",
+        }),
+      );
     }),
   );
   router.get(
@@ -4979,12 +5002,16 @@ export function comparisonRouter(
       const body = objectBody(req.body);
       if (body.operationId)
         res.json(
-          store.reconcile(String(req.params.id), {
-            ...body,
-            reason: "send",
-            adoptDisk: body.reason === "adopt",
-            writeFile: false,
-          }),
+          store.reconcile(
+            String(req.params.id),
+            {
+              ...body,
+              reason: "send",
+              adoptDisk: body.reason === "adopt",
+              writeFile: false,
+            },
+            { compactRetry: req.get("X-Roughdraft-Sync") === "compact-v2" },
+          ),
         );
       else res.json(store.view(store.sendFeedback(load(req), body)));
     }),

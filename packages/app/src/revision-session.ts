@@ -178,7 +178,7 @@ async function request<T>(
     const response = await fetch(browserPath(`/api/comparisons${path}`), {
       method: body === undefined ? "GET" : "POST",
       headers: {
-        "X-Roughdraft-Sync": "compact-v1",
+        "X-Roughdraft-Sync": "compact-v2",
         ...(referenceVersion
           ? { "X-Roughdraft-Reference": referenceVersion }
           : {}),
@@ -1195,8 +1195,9 @@ export class RevisionSessionController {
         });
     }, wait);
   }
-  private deferAutosave(delay: number) {
-    this.retryRevision = this.state?.revision ?? this.baseRevision;
+  private deferAutosave(delay: number, retryRevision?: number) {
+    this.retryRevision =
+      retryRevision ?? this.state?.revision ?? this.baseRevision;
     this.retryNotBefore =
       performance.now() + Math.max(20, Math.min(750, delay));
     this.schedule(0);
@@ -1221,12 +1222,25 @@ export class RevisionSessionController {
     this.acknowledged = this.acknowledged.slice(-16);
   }
   private async postOperation(path: string, body: SyncOperation) {
+    const reviewId = this.snapshot.session.id;
     this.activeOperations.add(body.operationId);
     try {
-      return await this.api<SyncResult<ComparisonReviewData>>(path, body);
+      const result = await this.api<SyncResult<ComparisonReviewData>>(
+        path,
+        body,
+      );
+      if (this.snapshot.session.id === reviewId)
+        this.acceptOperationContext(result);
+      return result;
     } finally {
       this.activeOperations.delete(body.operationId);
     }
+  }
+  private acceptOperationContext(
+    result: SyncResult<ComparisonReviewData> | null,
+  ) {
+    if (result?.operationContext && this.state)
+      this.state = { ...this.state, operationContext: result.operationContext };
   }
   private resumeIncoming() {
     const incoming = this.pendingIncoming;
@@ -1302,6 +1316,8 @@ export class RevisionSessionController {
       { ...pending.operation, reviewId: pending.reviewId },
     );
     if (!result) return false;
+    if (pending.reviewId === this.snapshot.session.id)
+      this.acceptOperationContext(result);
     if (result.status === "committed" && result.state) {
       if (!(await this.applyAcknowledgment(result.state, pending)))
         return false;
@@ -2526,7 +2542,10 @@ export class RevisionSessionController {
                   ),
                 );
               else {
-                this.deferAutosave(committed.retryAfter ?? 100);
+                this.deferAutosave(
+                  committed.retryAfter ?? 100,
+                  committed.retryRevision,
+                );
                 return false;
               }
             }
@@ -2551,7 +2570,7 @@ export class RevisionSessionController {
             recoveryPending: true,
             notice: "Waiting briefly for another save.",
           });
-          this.deferAutosave(result.retryAfter ?? 100);
+          this.deferAutosave(result.retryAfter ?? 100, result.retryRevision);
           return false;
         }
         this.wait(

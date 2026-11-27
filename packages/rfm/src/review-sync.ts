@@ -158,6 +158,9 @@ export type SyncStatus =
 export interface SyncResult<Review = unknown> {
   status: SyncStatus;
   state?: SyncState<Review>;
+  /** Revision and refreshed permission for a negotiated state-free retry. */
+  retryRevision?: number;
+  operationContext?: SyncContext;
   merge?: SyncMerge;
   reservation?: SyncReservation;
   retryAfter?: number;
