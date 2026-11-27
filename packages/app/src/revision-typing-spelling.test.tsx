@@ -10,6 +10,7 @@ import { closeHistory, undo } from "@tiptap/pm/history";
 import { act, useEffect, useMemo, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import editingReview from "../../../docs/spec/fixtures/editing-review.md?raw";
 import type { ComparisonReviewData } from "./comparison-types";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { RevisionEditor } from "./RevisionEditor";
@@ -17,10 +18,13 @@ import {
   cleanRevisionMarkdown,
   cleanRevisionSourceMarkdown,
 } from "./revision-markdown";
+import { parseRemoteRevision } from "./revision-remote-source";
 import type {
   RevisionDraft,
   RevisionSessionController,
 } from "./revision-session";
+
+vi.mock("./revision-remote-source", { spy: true });
 
 const mounted = vi.hoisted(() => ({
   editor: null as Editor | null,
@@ -161,29 +165,9 @@ afterEach(async () => {
   Reflect.deleteProperty(Range.prototype, "getBoundingClientRect");
 });
 
-test("keeping a suggestion and rewriting a long paragraph preserves exact list spelling and CRLF through native typing and Undo", async () => {
-  const opening = "a".repeat(1900);
-  const rewritten = "b".repeat(1900);
-  const suffix = " typing remains immediate";
-  const source = [
-    "# Continued review",
-    "",
-    "* Keep this exact list marker.",
-    "* Keep this neighboring item.",
-    "",
-    "A {==stable passage==}{>>Keep this comment attached.<<}{#c1}.",
-    "",
-    "Review {~~old~>new~~}{#s1} wording.",
-    "",
-    "Leave {++pending wording++}{#s2} undecided.",
-    "",
-    opening,
-    "",
-    "Footer stays unchanged.",
-    "",
-  ].join("\r\n");
+async function mountReview(source: string, id = "spelling-rewrite") {
   const initial = {
-    id: "spelling-rewrite",
+    id,
     revision: 1,
     mode: "document",
     title: "Review exact source spelling after continued edits",
@@ -280,6 +264,31 @@ test("keeping a suggestion and rewriting a long paragraph preserves exact list s
     throw new Error("Expected the actual editor and controller");
   const editor = mounted.editor as Editor;
   const controller = mounted.controller as RevisionSessionController;
+  return { editor, controller, current: () => current };
+}
+
+test("keeping a suggestion and rewriting a long paragraph preserves exact list spelling and CRLF through native typing and Undo", async () => {
+  const opening = "a".repeat(1900);
+  const rewritten = "b".repeat(1900);
+  const suffix = " typing remains immediate";
+  const source = [
+    "# Continued review",
+    "",
+    "* Keep this exact list marker.",
+    "* Keep this neighboring item.",
+    "",
+    "A {==stable passage==}{>>Keep this comment attached.<<}{#c1}.",
+    "",
+    "Review {~~old~>new~~}{#s1} wording.",
+    "",
+    "Leave {++pending wording++}{#s2} undecided.",
+    "",
+    opening,
+    "",
+    "Footer stays unchanged.",
+    "",
+  ].join("\r\n");
+  const { editor, controller, current } = await mountReview(source);
   vi.useFakeTimers();
   await act(async () => {
     container
@@ -317,7 +326,7 @@ test("keeping a suggestion and rewriting a long paragraph preserves exact list s
     .replace("Review old wording.", "Review new wording.")
     .replace(opening, rewritten + suffix);
   expect(saved.cleanMarkdown).toBe(expected);
-  expect(current.disk?.text).toBe(expected);
+  expect(current().disk?.text).toBe(expected);
   expect(
     saved.reviewComments.find((comment) => comment.id === "c1")?.content,
   ).toBe("Keep this comment attached.");
@@ -336,3 +345,81 @@ test("keeping a suggestion and rewriting a long paragraph preserves exact list s
     expected.replace(rewritten + suffix, opening),
   );
 });
+
+test("the first plain Edit keystroke after a large review opens uses its initialized accepted-spelling proof", async () => {
+  const metadata = editingReview.lastIndexOf("\n---\n");
+  if (metadata < 0)
+    throw new Error("The maintained fixture requires its review registry");
+  const padding = Array.from(
+    { length: 750 },
+    (_, index) =>
+      `Unchanged section ${index + 1}. This paragraph provides real reading distance while the two pages keep their independent edits and feedback.`,
+  ).join("\n\n");
+  const source = `${editingReview.slice(0, metadata)}\n\n${padding}\n\nFirst typing owner: unchanged.\n${editingReview.slice(metadata)}`;
+  expect(source.length).toBeGreaterThan(100_000);
+  const { editor, controller, current } = await mountReview(
+    source,
+    "first-keystroke",
+  );
+  vi.useFakeTimers();
+  await act(async () => {
+    await controller.flush();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  const baseline = structuredClone(controller.readDraft());
+  const initialModel = editor.state;
+  expect(baseline.cleanMarkdown).toContain("return draft;");
+  expect(baseline.cleanMarkdown).toContain("- Draft the release plan.");
+  expect(baseline.reviewComments.length).toBeGreaterThan(10);
+  const pending = (markdown: string) =>
+    extractRoughdraftReviewIndex(markdown)
+      .items.filter((item) => item.kind === "suggestion")
+      .map((item) => item.id);
+  expect(pending(baseline.markdown).length).toBeGreaterThan(5);
+  let at = -1;
+  editor.state.doc.descendants((node, pos) => {
+    if (
+      node.type.name === "paragraph" &&
+      node.textContent === "First typing owner: unchanged."
+    )
+      at = pos + node.nodeSize - 1;
+  });
+  expect(at).toBeGreaterThan(0);
+  vi.mocked(parseRemoteRevision).mockClear();
+  await act(async () => {
+    editor.view.dispatch(editor.state.tr.insertText(" A", at));
+    await vi.advanceTimersByTimeAsync(225);
+  });
+  const firstKeyParses = vi
+    .mocked(parseRemoteRevision)
+    .mock.calls.map(([markdown]) => markdown.length);
+  process.stdout.write(
+    `${JSON.stringify({ severity: "info", event: "first-native-key-spelling-proof", sourceCharacters: source.length, firstKeyParseCharacters: firstKeyParses, reparsedCharacters: firstKeyParses.reduce((total, characters) => total + characters, 0) })}\n`,
+  );
+  expect(firstKeyParses.filter((characters) => characters > 100_000)).toEqual(
+    [],
+  );
+  const next = controller.readDraft();
+  expect(next.markdown).toContain("First typing owner: unchanged. A");
+  expect(next.cleanMarkdown).toContain("First typing owner: unchanged. A");
+  const code = (markdown: string) =>
+    [...markdown.matchAll(/```[^\n]*\n[\s\S]*?\n```/g)].map(
+      (match) => match[0],
+    );
+  expect(code(next.cleanMarkdown ?? "")).toEqual(
+    code(baseline.cleanMarkdown ?? ""),
+  );
+  expect(next.cleanMarkdown).toContain("- Draft the release plan.");
+  expect(
+    editor.state.doc.content.eq(
+      initialModel.apply(initialModel.tr.insertText(" A", at)).doc.content,
+    ),
+  ).toBe(true);
+  expect(next.reviewComments).toEqual(baseline.reviewComments);
+  expect(pending(next.markdown)).toEqual(pending(baseline.markdown));
+  await act(async () => {
+    await controller.flush();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  expect(current().disk?.text).toBe(next.cleanMarkdown);
+}, 15_000);

@@ -672,11 +672,23 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
           ),
           next.state,
         );
-        acceptedSpellingProof.current.matches(
-          exactClean.current,
-          projectCleanRevisionNode(next.state.doc),
-          next.state,
-        );
+        const accepted = projectCleanRevisionNode(next.state.doc);
+        if (
+          !acceptedSpellingProof.current.matches(
+            exactClean.current,
+            accepted,
+            next.state,
+          )
+        ) {
+          // Prepare the existing fallback once while the document opens, so
+          // its first plain edit does not validate the complete source again.
+          canonicalSpellingProof.current.matches(
+            exactClean.current,
+            cleanRevisionNode(next.state.doc),
+            accepted,
+            next.state,
+          );
+        }
       }
       if (next)
         canonicalCleanBaseline.current ??= cleanRevisionNode(next.state.doc);
