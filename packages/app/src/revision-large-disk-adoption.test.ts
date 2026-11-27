@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
+import * as rfm from "@roughdraft/rfm";
 import { extractRoughdraftReviewIndex, type SyncDraft } from "@roughdraft/rfm";
 import { getSchema } from "@tiptap/core";
 import { EditorState } from "@tiptap/pm/state";
-import { expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   criticMarkdownToEditorState,
   editorStateToCriticMarkdown,
@@ -16,6 +17,27 @@ import { serializeRevisionNode } from "./revision-review-cache";
 import { RevisionSource } from "./revision-source";
 
 vi.mock("./critic-markup", { spy: true });
+// These cases protect output and serialization work, not elapsed time. Keep a
+// real merge's own clock fixed while it runs, so a descheduled worker cannot
+// spend its 100 ms allowance. Parsing and source-spelling fallbacks retain real
+// clocks. Separate 99/100/101 ms cases and browser runs protect timing behavior.
+beforeEach(() => {
+  const merge = rfm.mergeReviewDrafts;
+  vi.spyOn(rfm, "mergeReviewDrafts").mockImplementation((...args) => {
+    const now = performance.now();
+    const date = Date.now();
+    const monotonic = vi.spyOn(performance, "now").mockReturnValue(now);
+    const wall = vi.spyOn(Date, "now").mockReturnValue(date);
+    try {
+      return merge(...args);
+    } finally {
+      wall.mockRestore();
+      monotonic.mockRestore();
+    }
+  });
+});
+afterEach(() => vi.restoreAllMocks());
+
 function largeReview() {
   const fixture = fs.readFileSync(
     path.resolve(process.cwd(), "../../docs/spec/fixtures/editing-review.md"),
