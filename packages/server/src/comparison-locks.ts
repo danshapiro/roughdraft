@@ -43,17 +43,35 @@ export class ComparisonLocks {
           if (this.held.has(key)) continue;
           const name = key;
           const fd = fs.openSync(path.join(this.directory, name), "a", 0o600);
-          const result = spawnSync("flock", ["-xn", "3"], {
-            stdio: ["ignore", "pipe", "pipe", fd],
-            timeout: 3000,
-          });
+          acquired.push({ key, fd });
+        }
+        if (acquired.length) {
+          // Fork the potentially large server only once. The small shell
+          // acquires the same individual flocks on inherited descriptors;
+          // their open file descriptions remain owned by this parent.
+          const result = spawnSync(
+            "/bin/sh",
+            [
+              "-c",
+              'for roughdraft_fd do flock -xn "$roughdraft_fd" || exit "$?"; done',
+              "roughdraft-locks",
+              ...acquired.map((_, index) => String(index + 3)),
+            ],
+            {
+              stdio: [
+                "ignore",
+                "pipe",
+                "pipe",
+                ...acquired.map(({ fd }) => fd),
+              ],
+              timeout: 3000,
+            },
+          );
           if (result.status !== 0) {
-            fs.closeSync(fd);
             if (result.status === 1) throw new ComparisonLockBusy();
             throw new Error("Could not acquire the review's publication lock");
           }
-          this.held.set(key, fd);
-          acquired.push({ key, fd });
+          for (const { key, fd } of acquired) this.held.set(key, fd);
         }
       }
       return action();
