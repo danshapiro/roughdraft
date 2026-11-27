@@ -29,6 +29,28 @@ export interface ParsedSource {
 const caches = new WeakMap<object, Map<string, ParsedSource>>();
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;
 
+/** Reuse only literal prose whose Markdown meaning needs no parser or context. */
+function unchangedPlainParagraph(
+  raw: string,
+  live: Node | null,
+  template: Node | undefined,
+) {
+  if (
+    !live ||
+    !template ||
+    !live.sameMarkup(template) ||
+    !live.children.every((child) => child.isText && !child.marks.length)
+  )
+    return false;
+  const text = raw.replace(/[\r\n]+$/, "");
+  return (
+    /^[\p{L}][\p{L}\p{N} .,!?;()'’"%-]*$/u.test(text) &&
+    !/ {2}| $/.test(text) &&
+    !/\bwww\./i.test(text) &&
+    live.textContent === text
+  );
+}
+
 /** Keep a review range spanning blank lines together before parsing blocks. */
 function reviewRanges(body: string) {
   const ranges: Array<{ from: number; to: number }> = [];
@@ -171,8 +193,20 @@ export function parseRemoteRevision(
   const sourceRanges: NonNullable<ParsedSource["sourceBlocks"]> = [];
   const comments = new Map<string, CriticComment>();
   const used = new Set<string>();
+  const plainParagraph = state.schema.nodes.paragraph?.create();
   for (const span of blocks.spans) {
     const raw = body.slice(span.from, span.to);
+    const live = state.doc.maybeChild(nodes.length);
+    if (unchangedPlainParagraph(raw, live, plainParagraph) && live) {
+      sourceRanges.push({
+        from: (frontmatter?.length ?? 0) + span.from,
+        to: (frontmatter?.length ?? 0) + span.to,
+        index: nodes.length,
+        count: 1,
+      });
+      nodes.push(live);
+      continue;
+    }
     const ids = new Set(
       [
         ...raw.matchAll(
