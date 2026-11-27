@@ -1,10 +1,11 @@
 import {
-  expect,
-  test,
   type APIRequestContext,
+  expect,
   type Page,
+  test,
 } from "@playwright/test";
 import {
+  activeCommentDraft,
   createMarkdownProject,
   logE2eEvent,
   openMarkdownFile,
@@ -77,16 +78,13 @@ async function anchorText(page: Page, id: string) {
     );
 }
 
-async function addComment(
-  page: Page,
-  selectedText: string,
-  id: string,
-  comment: string,
-) {
+async function addComment(page: Page, selectedText: string, comment: string) {
   await selectText(page, selectedText);
   await page.getByTestId("selection-menu-action-comment").click();
-  await page.getByTestId(`comment-rail-${id}-editor`).fill(comment);
-  await page.getByTestId(`comment-rail-${id}-action-save`).click();
+  const { editor, id } = await activeCommentDraft(page);
+  await editor.fill(comment);
+  await editor.press("Control+Enter");
+  return id;
 }
 
 test.describe("comment anchors through document editing", () => {
@@ -175,9 +173,13 @@ test.describe("comment anchors through document editing", () => {
   }) => {
     await open(page, request);
     expect(await anchorText(page, "c1")).toBe("bravo charlie");
-    await addComment(page, "charlie delta", "c2", "Second overlapping comment");
+    const overlappingId = await addComment(
+      page,
+      "charlie delta",
+      "Second overlapping comment",
+    );
     expect(await anchorText(page, "c1")).toBe("bravo charlie");
-    expect(await anchorText(page, "c2")).toBe("charlie delta");
+    expect(await anchorText(page, overlappingId)).toBe("charlie delta");
     await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
       "aria-label",
       "Review saved",
@@ -185,7 +187,7 @@ test.describe("comment anchors through document editing", () => {
     await page.reload();
     await expect(richTextEditor(page)).toBeVisible();
     expect(await anchorText(page, "c1")).toBe("bravo charlie");
-    expect(await anchorText(page, "c2")).toBe("charlie delta");
+    expect(await anchorText(page, overlappingId)).toBe("charlie delta");
   });
 
   test("replying to an outer comment preserves a nested comment's anchor", async ({
@@ -193,23 +195,22 @@ test.describe("comment anchors through document editing", () => {
     request,
   }) => {
     await open(page, request);
-    await addComment(page, "charlie", "c2", "Nested comment");
-    expect(await anchorText(page, "c2")).toBe("charlie");
+    const nestedId = await addComment(page, "charlie", "Nested comment");
+    expect(await anchorText(page, nestedId)).toBe("charlie");
     await page.getByTestId("comment-thread-c1").click();
     await page.getByTestId("comment-rail-c1-action-reply").click();
-    await page
-      .getByTestId("comment-rail-c3-editor")
-      .fill("Reply to first comment");
-    await page.getByTestId("comment-rail-c3-action-save").click();
+    const { editor: reply } = await activeCommentDraft(page);
+    await reply.fill("Reply to first comment");
+    await reply.press("Control+Enter");
     expect(await anchorText(page, "c1")).toBe("bravo charlie");
-    expect(await anchorText(page, "c2")).toBe("charlie");
+    expect(await anchorText(page, nestedId)).toBe("charlie");
     await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
       "aria-label",
       "Review saved",
     );
     await page.reload();
     await expect(richTextEditor(page)).toBeVisible();
-    expect(await anchorText(page, "c2")).toBe("charlie");
+    expect(await anchorText(page, nestedId)).toBe("charlie");
   });
 
   test("editing before and inside an anchor preserves it through Undo and Redo", async ({
@@ -241,13 +242,12 @@ test.describe("comment anchors through document editing", () => {
       request,
       "# Notes\n\nOne **bold phrase** and its ending.\n\nSecond paragraph stays in the selection.\n",
     );
-    await addComment(
+    const crossBlockId = await addComment(
       page,
       "bold phrase and its ending.Second paragraph",
-      "c1",
       "Cross-block comment",
     );
-    expect(await anchorText(page, "c1")).toBe(
+    expect(await anchorText(page, crossBlockId)).toBe(
       "bold phrase and its ending.Second paragraph",
     );
     await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
@@ -256,13 +256,15 @@ test.describe("comment anchors through document editing", () => {
     );
     await page.reload();
     await expect(richTextEditor(page)).toBeVisible();
-    expect(await anchorText(page, "c1")).toBe(
+    expect(await anchorText(page, crossBlockId)).toBe(
       "bold phrase and its ending.Second paragraph",
     );
-    await expect(page.getByTestId("comment-thread-c1")).toContainText(
-      "Cross-block comment",
-    );
-    await expect(page.getByTestId("comment-thread-c1")).toHaveCount(1);
+    await expect(
+      page.getByTestId(`comment-thread-${crossBlockId}`),
+    ).toContainText("Cross-block comment");
+    await expect(
+      page.getByTestId(`comment-thread-${crossBlockId}`),
+    ).toHaveCount(1);
   });
 
   test("pasting over every commented word keeps the comment on the pasted text", async ({

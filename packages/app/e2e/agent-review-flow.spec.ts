@@ -96,14 +96,21 @@ test("chat reviews preserve unfinished comments, edits and choices without writi
     await comment.fill(
       "Please include an example for first-time laser owners.",
     );
-    // Returning to chat must preserve this text even before the comment Save button.
+    // Returning to chat preserves a private draft without submitting it.
     await page.evaluate(() => window.dispatchEvent(new Event("blur")));
-    await expect
-      .poll(async () => (await read()).reviewComments?.[0]?.content)
-      .toBe("Please include an example for first-time laser owners.");
+    expect((await read()).reviewComments ?? []).toHaveLength(0);
     await expect
       .poll(async () => (await read()).draft?.cleanMarkdown)
       .toContain("supported materials");
+    await page.reload();
+    await expect(comment).toHaveValue(
+      "Please include an example for first-time laser owners.",
+    );
+    expect((await read()).reviewComments ?? []).toHaveLength(0);
+    await comment.press("Control+Enter");
+    await expect
+      .poll(async () => (await read()).reviewComments?.[0]?.content)
+      .toBe("Please include an example for first-time laser owners.");
 
     const output = execFileSync(
       process.execPath,
