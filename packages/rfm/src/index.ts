@@ -1518,7 +1518,16 @@ function hasDocumentLevelComment(parsed: Record<string, unknown>): boolean {
 function findFinalYamlEndmatter(
   markdown: string,
 ): { raw: string; yaml: string; offset: number } | null {
-  const matches = [...markdown.matchAll(/\n---[ \t]*\r?\n/g)];
+  // A frontmatter closing fence is document metadata, never the beginning of
+  // review endmatter. In particular, literal compact markers later in the body
+  // must not turn the complete document into malformed YAML endmatter.
+  const frontmatter = markdown.match(
+    /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/,
+  );
+  const bodyStart = frontmatter?.[0].length ?? 0;
+  const matches = [...markdown.matchAll(/\n---[ \t]*\r?\n/g)].filter(
+    (match) => match.index + 1 >= bodyStart,
+  );
   const last = matches.at(-1);
   if (!last || last.index === undefined) return null;
 

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { cleanRoughdraftMarkdown } from "./index";
+import {
+  cleanRoughdraftMarkdown,
+  extractRoughdraftReviewIndex,
+  validateRoughdraftMarkdown,
+} from "./index";
 
 describe("clean source projection", () => {
   it("keeps original wording while omitting pending edits and inline feedback", () => {
@@ -15,6 +19,82 @@ describe("clean source projection", () => {
       "---\r\nexample: '{++literal++}'\r\n---\r\n\r\n* Example `{~~old~>new~~}`\r\n\r\n```md\r\n{>>Literal feedback<<}\r\n{++Literal addition++}\r\n```\r\n\r\nUse {~~old~>new~~} wording.";
     expect(cleanRoughdraftMarkdown(source)).toBe(
       source.replace("Use {~~old~>new~~}", "Use old"),
+    );
+  });
+
+  it.each([
+    "\n",
+    "\r\n",
+  ])("keeps the complete clean document after frontmatter when code contains a compact review example (%j)", (newline) => {
+    const source = [
+      "---",
+      "title: Review plan",
+      "---",
+      "",
+      "# Release plan",
+      "",
+      "Keep the [setup reference][setup] and note[^review].",
+      "",
+      "````markdown",
+      "{==literal highlight==}{>>literal comment<<}{#literal-comment}",
+      "{++literal addition++} {~~old~>new~~}",
+      "````",
+      "",
+      '[setup]: https://example.com "Setup"',
+      "",
+      "[^review]: Preserve this **complete note**.",
+      "",
+      "    Its second paragraph also stays.",
+      "",
+    ].join(newline);
+
+    expect(cleanRoughdraftMarkdown(source)).toBe(source);
+    expect(extractRoughdraftReviewIndex(source).items).toEqual([]);
+    expect(validateRoughdraftMarkdown(source).diagnostics).toEqual([]);
+  });
+
+  it.each([
+    "\n",
+    "\r\n",
+  ])("still projects real review endmatter after frontmatter (%j)", (newline) => {
+    const frontmatter = ["---", "title: Review plan", "---", ""].join(newline);
+    const source = `${frontmatter}${newline}Use {~~old~>new~~}{#s1} wording.${newline}${newline}---${newline}suggestions:${newline}  s1:${newline}    by: AI${newline}    at: "2026-11-22T12:00:00.000Z"${newline}`;
+
+    expect(cleanRoughdraftMarkdown(source)).toBe(
+      `${frontmatter}${newline}Use old wording.${newline}`,
+    );
+    expect(extractRoughdraftReviewIndex(source).items).toEqual([
+      expect.objectContaining({ id: "s1", kind: "suggestion", author: "AI" }),
+    ]);
+    expect(validateRoughdraftMarkdown(source).diagnostics).toEqual([]);
+  });
+
+  it.each([
+    "\n",
+    "\r\n",
+  ])("still reports malformed review endmatter after frontmatter (%j)", (newline) => {
+    const source = [
+      "---",
+      "title: Review plan",
+      "---",
+      "",
+      "Discuss {==this==}{>>Feedback<<}{#c1}.",
+      "",
+      "---",
+      "comments:",
+      "  c1: [unterminated {#c1}",
+      "",
+    ].join(newline);
+
+    expect(validateRoughdraftMarkdown(source).diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "invalid-endmatter-yaml" }),
+      ]),
+    );
+    expect(cleanRoughdraftMarkdown(source)).toBe(
+      ["---", "title: Review plan", "---", "", "Discuss this.", ""].join(
+        newline,
+      ),
     );
   });
 
