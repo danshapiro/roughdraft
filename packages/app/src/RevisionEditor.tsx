@@ -117,7 +117,7 @@ import {
   type RevisionView,
   useRevisionPreferences,
 } from "./revision-preferences";
-import { prepareRevisionDraft } from "./revision-prepare";
+import { prepareRevisionEditorDraft } from "./revision-prepare";
 import {
   containsReviewIdentity,
   resolvePrivateCommentAnchor,
@@ -685,9 +685,9 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     if (!editor) return;
     const adapter: RevisionRemoteAdapter = {
       rebasesBufferedDocument: true,
-      prepare: (draft) =>
+      prepare: (draft, options) =>
         measureRevision("detached-prepare", () =>
-          prepareRevisionDraft(draft, editor.state),
+          prepareRevisionEditorDraft(draft, editor, options),
         ),
       canRestorePrivateComment: (id, value) => {
         const draft = value as CommentDraftState;

@@ -430,15 +430,6 @@ for (const newerNotice of [false, true]) {
     }
     expect(await saving).toBe(true);
     await vi.advanceTimersByTimeAsync(0);
-    expect(editor.doc.firstChild?.textContent).toBe(
-      `${newerNotice ? "Latest peer" : "Peer"}: abcdefghijabcdefghijabcd.`,
-    );
-    expect(editor.doc.lastChild?.textContent).toBe(
-      "Mine: ready. One. Two. Three.",
-    );
-    expect(applied).toHaveLength(
-      newerNotice && order === "response-first" ? 2 : 1,
-    );
     expect(writes.at(-1)?.expectedRevision).toBe(newerNotice ? 4 : 3);
     expect(releaseTrailing).toBeDefined();
     const activeId = writes.at(-1)?.operationId;
@@ -457,6 +448,15 @@ for (const newerNotice of [false, true]) {
     ).toBe(true);
     releaseTrailing?.();
     await vi.advanceTimersByTimeAsync(0);
+    expect(editor.doc.firstChild?.textContent).toBe(
+      `${newerNotice ? "Latest peer" : "Peer"}: abcdefghijabcdefghijabcd.`,
+    );
+    expect(editor.doc.lastChild?.textContent).toBe(
+      "Mine: ready. One. Two. Three.",
+    );
+    expect(applied).toHaveLength(
+      newerNotice && order === "response-first" ? 2 : 1,
+    );
     expect(controller.getSnapshot().conflict).toBeNull();
     expect(controller.getSnapshot().writePaused).toBe(false);
   });

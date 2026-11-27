@@ -44,7 +44,10 @@ export interface RevisionRemoteAdapter {
   /** The live editor maps newer buffered input through its remote transaction. */
   rebasesBufferedDocument?: boolean;
   /** Validate an immutable merged candidate without changing the live editor. */
-  prepare?(draft: RevisionDraft): RevisionDraft | null;
+  prepare?(
+    draft: RevisionDraft,
+    options?: { beforeReflection?: boolean },
+  ): RevisionDraft | null;
   canRestorePrivateComment?(id: string, draft: unknown): boolean;
   apply(
     draft: RevisionDraft,
@@ -87,6 +90,13 @@ export interface PendingOperation {
   copyPath?: string;
   /** The immutable candidate was published before its incoming delta was shown. */
   editorBase?: RevisionDraft;
+}
+interface PreparedRevisionCommit {
+  candidate: RevisionDraft;
+  requestBase: RevisionDraft;
+  editorBase: RevisionDraft;
+  generation: number;
+  state: SyncState<ComparisonReviewData>;
 }
 export interface BrowserRecovery {
   version: 2;
@@ -1659,6 +1669,7 @@ export class RevisionSessionController {
       }
       if (!this.adapter?.rebasesBufferedDocument) this.adapter?.flush?.();
       const localBase = this.current;
+      const mergeGeneration = this.generation;
       const merged = await this.merge(this.base, localBase, incoming, {
         server: false,
       });
@@ -1670,6 +1681,46 @@ export class RevisionSessionController {
           merged,
         );
         return;
+      }
+      if (
+        !sameReviewDraft(localBase, this.base) &&
+        !Object.keys(merged.idRemap ?? {}).length &&
+        !this.snapshot.writePaused &&
+        !this.snapshot.copyLocked &&
+        performance.now() >= this.retryNotBefore
+      ) {
+        const projected = this.adapter?.prepare?.(
+          merged.draft as RevisionDraft,
+          { beforeReflection: true },
+        );
+        if (
+          typeof projected?.cleanMarkdown === "string" &&
+          !this.snapshot.writePaused &&
+          !this.snapshot.copyLocked &&
+          performance.now() >= this.retryNotBefore
+        ) {
+          measureRevision("observed-candidate-ready", () => {});
+          const committed = await this.commit("sync", undefined, undefined, {
+            candidate: {
+              ...merged.draft,
+              cleanMarkdown: projected.cleanMarkdown,
+            } as RevisionDraft,
+            requestBase: state.draft as RevisionDraft,
+            editorBase: localBase,
+            generation: mergeGeneration,
+            state,
+          });
+          if (
+            !committed &&
+            !this.operation &&
+            !this.snapshot.writePaused &&
+            !this.snapshot.copyLocked
+          ) {
+            this.retainIncoming(this.state ?? state);
+            this.resumeIncoming();
+          }
+          return;
+        }
       }
       if (
         !(await this.applyDraft(
@@ -1871,12 +1922,19 @@ export class RevisionSessionController {
     reason: ReconcileRequest["reason"],
     resolution?: ReconcileRequest["resolution"],
     comment?: string,
+    prepared?: PreparedRevisionCommit,
   ) {
     let includeBase = false;
     attempts: for (let attempt = 0; attempt < 3; attempt++) {
-      const state = this.state;
+      const preparedAttempt = attempt === 0 ? prepared : undefined;
+      const state = preparedAttempt?.state ?? this.state;
       if (!state) return false;
-      const snapshot = this.current;
+      const snapshot = preparedAttempt?.candidate ?? this.current;
+      const requestBase = preparedAttempt?.requestBase ?? this.base;
+      const requestRevision = preparedAttempt
+        ? state.revision
+        : this.baseRevision;
+      const generation = preparedAttempt?.generation ?? this.generation;
       const identity = this.operationIdentity();
       const adoptedDisk = Boolean(
         state.disk &&
@@ -1893,17 +1951,18 @@ export class RevisionSessionController {
         reviewId: state.review.id,
         draft: snapshot,
         base: this.base,
-        generation: this.generation,
+        generation,
         kind: "reconcile",
+        ...(preparedAttempt ? { editorBase: preparedAttempt.editorBase } : {}),
       };
       this.operation = pending;
       this.persist();
       const body: ReconcileRequest = {
         ...identity,
         expectedRevision: state.revision,
-        baseRevision: this.baseRevision,
-        baseSignature: reviewDraftSignature(this.base),
-        ...(state.baseReferences && !includeBase ? {} : { base: this.base }),
+        baseRevision: requestRevision,
+        baseSignature: reviewDraftSignature(requestBase),
+        ...(state.baseReferences && !includeBase ? {} : { base: requestBase }),
         draft: snapshot,
         expectedDisk: state.disk
           ? {
@@ -1916,7 +1975,7 @@ export class RevisionSessionController {
           reason !== "send" &&
           (!adoptedDisk || reason === "resolve" || reason === "recreate") &&
           (reason === "recreate" || this.needsFileWrite(state, snapshot)),
-        localGeneration: this.generation,
+        localGeneration: generation,
         reason: requestReason,
         resolution,
         comment,
