@@ -152,7 +152,7 @@ async function awaitSignal(
 }
 function installMeasurements() {
   type ProfileEntry = { stage: string; at: number; duration: number };
-  const scope = window as Window & {
+  const scope = window as unknown as Window & {
     liveInputDelays: number[];
     liveInputEvents: { at: number; data: string | null }[];
     liveLongTasks: { at: number; duration: number }[];
@@ -204,11 +204,30 @@ function installMeasurements() {
           : input.url;
     if (!url.includes("/api/comparisons/")) return nativeFetch(input, init);
     const id = ++apiSequence;
+    // Read the immutable bytes already given to fetch. Keep only bounded
+    // operation/owner summaries, never a second full request document.
+    let sent: Record<string, unknown> = {};
+    if (url.endsWith("/reconcile") && typeof init?.body === "string") {
+      const body = JSON.parse(init.body);
+      const markdown = body?.draft?.markdown;
+      if (typeof markdown === "string")
+        sent = {
+          operationId: body.operationId,
+          generation: body.localGeneration,
+          reserved: Boolean(body.reservationToken),
+          owners: Object.fromEntries(
+            ["A", "B"].map((name) => [
+              name,
+              markdown.split(`Live owner ${name}:`)[1]?.split("\n")[0] ?? "",
+            ]),
+          ),
+        };
+    }
     const record = (stage: string, detail: Record<string, unknown> = {}) => {
       if (scope.liveApiEvents.length < 1024)
         scope.liveApiEvents.push({ at: Date.now(), id, stage, url, ...detail });
     };
-    record("fetch-start");
+    record("fetch-start", sent);
     const response = await nativeFetch(input, init);
     record("fetch-headers", { httpStatus: response.status });
     const nativeJson = response.json.bind(response);
@@ -216,11 +235,15 @@ function installMeasurements() {
       record("json-start");
       const value = await nativeJson();
       record("json-finished", {
+        ...sent,
         status: value?.status,
         revision: value?.state?.revision ?? value?.revision,
         draftTextFromRequest: Boolean(value?.state?.draftTextFromRequest),
         savedTextFromDraft: Boolean(value?.state?.savedTextFromDraft),
         reservationExpiresAt: value?.reservation?.expiresAt,
+        reservationRevision: value?.reservation?.revision,
+        retryAfter: value?.retryAfter,
+        message: value?.message,
         lastOperationId:
           value?.state?.review?.lastOperation?.id ??
           value?.review?.lastOperation?.id,
@@ -294,6 +317,63 @@ function installMeasurements() {
       else super.postMessage(message, options);
     }
   };
+}
+
+interface ProgressApiEvent {
+  at: number;
+  id: number;
+  stage: string;
+  url: string;
+  operationId?: string;
+  generation?: number;
+  reserved?: boolean;
+  owners?: Record<string, string>;
+  status?: string;
+  revision?: number;
+  lastOperationId?: string;
+  reservationExpiresAt?: number;
+  reservationRevision?: number;
+  retryAfter?: number;
+  message?: string;
+}
+function measuredProgress(
+  events: ProgressApiEvent[],
+  name: "A" | "B",
+  started: number,
+) {
+  const seen = new Set<string>();
+  const counts: number[] = [];
+  const responses = events
+    .filter(
+      (event) =>
+        event.stage === "json-finished" &&
+        event.url.endsWith("/reconcile") &&
+        event.at >= started &&
+        event.operationId &&
+        event.status,
+    )
+    .sort((left, right) => left.at - right.at)
+    .map((event) => {
+      const own = event.owners?.[name] ?? "";
+      if (
+        event.status === "committed" &&
+        event.lastOperationId === event.operationId &&
+        own.startsWith(" unchanged.") &&
+        own !== " unchanged." &&
+        !seen.has(own)
+      ) {
+        seen.add(own);
+        counts.push(event.at - started);
+      }
+      return {
+        page: name,
+        status: event.status as string,
+        revision: event.revision,
+        at: event.at - started,
+        own,
+      };
+    });
+  return { counts, responses };
 }
 function recordReconcileTraffic(page: Page, name: string, testInfo: TestInfo) {
   const target = testInfo.outputPath("reconcile-wire.jsonl");
@@ -488,6 +568,74 @@ async function startMainThreadCpuCapture(pages: Page[], testInfo: TestInfo) {
   };
 }
 
+test("save progress uses native completion even while a separate response observer is waiting", async ({
+  page,
+}) => {
+  const observerGate = deferred();
+  const observed = deferred();
+  let observerCompleted = false;
+  const route = "**/api/comparisons/progress-measurement/reconcile";
+  await page.route(route, (request) =>
+    request.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "committed",
+        state: {
+          revision: 2,
+          review: { lastOperation: { id: "observed-save" } },
+        },
+      }),
+    }),
+  );
+  page.on("response", async (response) => {
+    if (!response.url().endsWith("/progress-measurement/reconcile")) return;
+    await observerGate.promise;
+    await response.json();
+    observerCompleted = true;
+    observed.resolve();
+  });
+  try {
+    await page.goto("/");
+    await page.evaluate(installMeasurements);
+    const started = await page.evaluate(() => Date.now());
+    const events = (await page.evaluate(async () => {
+      const body = {
+        operationId: "observed-save",
+        localGeneration: 1,
+        draft: { markdown: "Live owner A: unchanged. Typed before fetch.\n" },
+      };
+      const response = fetch(
+        "/api/comparisons/progress-measurement/reconcile",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      body.draft.markdown = "Live owner A: A newer unsent draft.\n";
+      await (await response).json();
+      return Reflect.get(window, "liveApiEvents");
+    })) as ProgressApiEvent[];
+    expect(observerCompleted).toBe(false);
+    const native = events.find((event) => event.stage === "json-finished");
+    expect(native).toBeDefined();
+    const measured = measuredProgress(events, "A", started);
+    expect(measured.counts).toEqual([(native?.at ?? 0) - started]);
+    expect(measured.responses[0].own).toBe(" unchanged. Typed before fetch.");
+    observerGate.resolve();
+    await awaitSignal(
+      observed.promise,
+      "the deliberately held response observer",
+    );
+    expect(observerCompleted).toBe(true);
+    expect(measuredProgress(events, "A", started)).toEqual(measured);
+  } finally {
+    observerGate.resolve();
+    await page.unroute(route);
+  }
+});
+
 test("both pages keep committing during continuous typing in the complex 100 KiB review", async ({
   page,
   browser,
@@ -500,9 +648,7 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
   const other = await browser.newContext();
   const second = await other.newPage();
   const gate = deferred();
-  const firstCommits = deferred();
   const counts = { A: [] as number[], B: [] as number[] };
-  const seen = { A: new Set<string>(), B: new Set<string>() };
   const responses: Array<{
     page: string;
     status: string;
@@ -523,10 +669,6 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
       ...entry,
     };
     timeline.push(value);
-    fs.appendFileSync(
-      testInfo.outputPath("progress-timeline.jsonl"),
-      `${JSON.stringify(value)}\n`,
-    );
   };
   let completed = false;
   let finishCpuCapture: (() => Promise<void>) | undefined;
@@ -577,20 +719,14 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
       ["A", page],
       ["B", second],
     ] as const) {
-      await view.route(`**/api/comparisons/${id}/reconcile`, async (route) => {
+      const routePattern = `**/api/comparisons/${id}/reconcile`;
+      const initialGate = async (route: import("@playwright/test").Route) => {
         const received = Date.now();
         const sent = route.request().postDataJSON() as ReconcileRequest;
         const own =
           sent.draft.markdown.split(`Live owner ${name}:`)[1]?.split("\n")[0] ??
           "";
-        recordTime({
-          kind: "request",
-          page: name,
-          operationId: sent.operationId,
-          generation: sent.localGeneration,
-          reserved: Boolean(sent.reservationToken),
-          own,
-        });
+        let capturedHere = false;
         // Hold actual user-edit requests, not any projection-only initialization.
         if (
           !captured.has(name) &&
@@ -598,6 +734,7 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
           own.includes("unchanged.")
         ) {
           captured.add(name);
+          capturedHere = true;
           recordTime({ kind: "gate-captured", page: name });
           if (captured.size === 2) {
             recordTime({ kind: "gate-released" });
@@ -613,55 +750,21 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
         });
         try {
           await route.continue();
+          // Only the first pair needs interception to force a stale race.
+          // Later saves go directly to the server, without a CDP round trip.
+          if (capturedHere) await view.unroute(routePattern, initialGate);
         } catch (error) {
           if (!closing) throw error;
         }
+      };
+      await view.route(routePattern, initialGate);
+      view.on("request", (request) => {
+        if (!request.url().endsWith(`/${id}/reconcile`)) return;
+        recordTime({ kind: "request-observed", page: name });
       });
-      view.on("response", async (response) => {
+      view.on("response", (response) => {
         if (!response.url().endsWith(`/${id}/reconcile`)) return;
-        const received = Date.now();
         recordTime({ kind: "response-received", page: name });
-        try {
-          const body = (await response.json()) as SyncResult;
-          const sent = response.request().postDataJSON() as ReconcileRequest;
-          const own =
-            sent.draft.markdown
-              .split(`Live owner ${name}:`)[1]
-              ?.split("\n")[0] ?? "";
-          recordTime({
-            kind: "response-parsed",
-            page: name,
-            status: body.status,
-            operationId: sent.operationId,
-            received,
-            parseMs: Date.now() - received,
-            reservationExpiresAt: body.reservation?.expiresAt,
-            reservationRevision: body.reservation?.revision,
-            retryAfter: body.retryAfter,
-            message: body.message,
-            own,
-          });
-          responses.push({
-            page: name,
-            status: body.status,
-            revision: body.state?.revision,
-            at: started ? Date.now() - started : -1,
-            own,
-          });
-          if (body.status === "client-merge-required") fallbackCount++;
-          if (
-            body.status !== "committed" ||
-            !own.startsWith(" unchanged.") ||
-            own === " unchanged." ||
-            seen[name].has(own)
-          )
-            return;
-          seen[name].add(own);
-          counts[name].push(Date.now() - started);
-          if (counts.A.length && counts.B.length) firstCommits.resolve();
-        } catch {
-          /* A closing page may cancel response-body inspection. */
-        }
       });
       await owner(view, name).click();
       await view.keyboard.press("End");
@@ -680,42 +783,13 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
     ]);
     void typing.catch(() => {}); // The original assertion remains primary if cleanup cancels typing.
     const verify = expect.configure({ soft: true });
-    let progressDeadline: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        firstCommits.promise,
-        new Promise<never>((_resolve, reject) => {
-          progressDeadline = setTimeout(
-            () =>
-              reject(
-                new Error(
-                  `Both pages must commit within two seconds while typing: ${JSON.stringify({ counts, responses })}`,
-                ),
-              ),
-            2000,
-          );
-        }),
-      ]);
-    } catch (error) {
-      recordTime({
-        kind: "first-commit-deadline-failed",
-        message: error instanceof Error ? error.message : String(error),
-        counts: { A: [...counts.A], B: [...counts.B] },
-      });
-      verify(
-        error,
-        "Both pages must commit within two seconds while typing",
-      ).toBeUndefined();
-    } finally {
-      if (progressDeadline) clearTimeout(progressDeadline);
-    }
     await typing;
     const typingEnded = Date.now() - started;
     await finishCpuCapture();
     const samples = await Promise.all(
       [page, second].map((view) =>
         view.evaluate(() => {
-          const scope = window as Window & {
+          const scope = window as unknown as Window & {
             liveInputDelays: number[];
             liveMergeMetrics: {
               workers: number;
@@ -799,7 +873,55 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
 
     for (const view of [page, second])
       await verify(view.getByTestId("revision-conflict")).toHaveCount(0);
+    for (const [index, view] of [page, second].entries()) {
+      const name = index === 0 ? "A" : "B";
+      const events = (await view.evaluate(() =>
+        Reflect.get(window, "liveApiEvents"),
+      )) as ProgressApiEvent[];
+      const measured = measuredProgress(events, name, started);
+      counts[name] = measured.counts;
+      responses.push(...measured.responses);
+      fallbackCount += measured.responses.filter(
+        (response) => response.status === "client-merge-required",
+      ).length;
+      for (const event of events) {
+        if (
+          event.at < started ||
+          !event.url.endsWith("/reconcile") ||
+          !event.operationId ||
+          !["fetch-start", "json-finished"].includes(event.stage)
+        )
+          continue;
+        const received = events.find(
+          (item) => item.id === event.id && item.stage === "fetch-headers",
+        )?.at;
+        recordTime({
+          kind: event.stage === "fetch-start" ? "request" : "response-parsed",
+          page: name,
+          at: event.at,
+          elapsed: event.at - started,
+          operationId: event.operationId,
+          generation: event.generation,
+          reserved: event.reserved,
+          own: event.owners?.[name] ?? "",
+          status: event.status,
+          revision: event.revision,
+          received,
+          parseMs: received === undefined ? undefined : event.at - received,
+          reservationExpiresAt: event.reservationExpiresAt,
+          reservationRevision: event.reservationRevision,
+          retryAfter: event.retryAfter,
+          message: event.message,
+          clock: "browser",
+        });
+      }
+    }
+    responses.sort((left, right) => left.at - right.at);
     for (const times of Object.values(counts)) {
+      verify(
+        times[0] ?? Number.POSITIVE_INFINITY,
+        "Each page must complete its first save within two seconds while typing",
+      ).toBeLessThan(2000);
       verify(times.length).toBeGreaterThan(3);
       const sorted = [...times].sort((left, right) => left - right);
       verify(
@@ -815,7 +937,6 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
   } finally {
     await finishCpuCapture?.();
     gate.resolve();
-    firstCommits.resolve();
     await testInfo.attach("live-update-progress.json", {
       body: JSON.stringify(
         {
@@ -840,6 +961,11 @@ test("both pages keep committing during continuous typing in the complex 100 KiB
     closing = true;
     await page.close();
     await other.close();
+    timeline.sort((left, right) => Number(left.at) - Number(right.at));
+    fs.writeFileSync(
+      testInfo.outputPath("progress-timeline.jsonl"),
+      `${timeline.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+    );
     fs.writeFileSync(
       testInfo.outputPath("progress-summary.json"),
       JSON.stringify({ started, counts, responses, timeline }, null, 2),
