@@ -665,6 +665,12 @@ export function createTurndownService(): TurndownService {
 
 const turndown = createTurndownService();
 
+const spacingCache = new Map<string, string>();
+const MIN_SPACING_CHARACTERS = 1024;
+const MAX_SPACING_ENTRIES = 32;
+const MAX_SPACING_CHARACTERS = 2 * 1024 * 1024;
+let spacingCharacters = 0;
+
 /**
  * Collapse runs of 3+ newlines to 2 and remove the blank line that
  * Turndown inserts before/after ATX headings.  This keeps block
@@ -673,12 +679,38 @@ const turndown = createTurndownService();
  * gratuitous whitespace changes.
  */
 export function normalizeBlockSpacing(md: string): string {
-  return transformOutsideCode(md, (prose) =>
+  const cached = spacingCache.get(md);
+  if (cached !== undefined) {
+    spacingCache.delete(md);
+    spacingCache.set(md, cached);
+    return cached;
+  }
+  const normalized = transformOutsideCode(md, (prose) =>
     prose
       .replace(/\n{3,}/g, "\n\n")
       .replace(/\n\n(#{1,6} )/g, "\n$1")
       .replace(/(^#{1,6} [^\n]+)\n\n/gm, "$1\n"),
   );
+  // Retain only exact immutable inputs; never cache or change parser tokens.
+  const characters = md.length + normalized.length;
+  // Small fragment serialization must not evict the complete editor buffers.
+  if (
+    md.length >= MIN_SPACING_CHARACTERS &&
+    characters <= MAX_SPACING_CHARACTERS
+  ) {
+    spacingCache.set(md, normalized);
+    spacingCharacters += characters;
+    while (
+      spacingCache.size > MAX_SPACING_ENTRIES ||
+      spacingCharacters > MAX_SPACING_CHARACTERS
+    ) {
+      const oldest = spacingCache.entries().next().value;
+      if (!oldest) break;
+      spacingCharacters -= oldest[0].length + oldest[1].length;
+      spacingCache.delete(oldest[0]);
+    }
+  }
+  return normalized;
 }
 
 export function toMarkdown(html: string): string {
