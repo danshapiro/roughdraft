@@ -598,12 +598,14 @@ export function mergeReviewDrafts(
       scans[1] = scanRoughdraftReview(local.markdown);
     }
     check();
-    const parity = [base, local, incoming].every(
-      (draft) =>
-        cleanRoughdraftMarkdown(draft.markdown) ===
-        (draft.cleanMarkdown ?? draft.markdown),
-    );
-    if (options.server && !parity)
+    let parity: boolean | undefined;
+    const hasParity = () =>
+      (parity ??= [base, local, incoming].every(
+        (draft) =>
+          cleanRoughdraftMarkdown(draft.markdown) ===
+          (draft.cleanMarkdown ?? draft.markdown),
+      ));
+    if (options.server && !hasParity())
       throw new UnsupportedReviewMerge(
         "The annotated and clean browser projections require client reconciliation.",
       );
@@ -799,15 +801,16 @@ export function mergeReviewDrafts(
           }
         : {}),
     };
+    const exact = [local, incoming, base].find(
+      (draft) => draft.markdown === markdown,
+    );
     if (!options.server && options.projectedCleanMarkdown !== undefined)
       result.cleanMarkdown = options.projectedCleanMarkdown;
-    else if (parity) result.cleanMarkdown = cleanRoughdraftMarkdown(markdown);
-    else {
-      const exact = [local, incoming, base].find(
-        (draft) => draft.markdown === markdown,
-      );
-      if (exact) result.cleanMarkdown = exact.cleanMarkdown;
-    }
+    else if (!options.server && typeof exact?.cleanMarkdown === "string")
+      result.cleanMarkdown = exact.cleanMarkdown;
+    else if (hasParity())
+      result.cleanMarkdown = cleanRoughdraftMarkdown(markdown);
+    else if (exact) result.cleanMarkdown = exact.cleanMarkdown;
     check();
     const signature = conflicts.length
       ? contentSignature(canonicalValue(conflicts))
