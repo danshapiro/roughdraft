@@ -3,6 +3,7 @@ import {
   cleanRoughdraftMarkdown,
   extractRoughdraftReviewIndex,
   mergeReviewDrafts,
+  scanRoughdraftReview,
 } from "./index.js";
 
 function source(paragraphs: number, newline: string) {
@@ -123,4 +124,53 @@ test.each([
     long,
     "unchanged prose should not create additional fence-parser regular expressions",
   ).toBeLessThanOrEqual(short + 20);
+});
+
+test.each([
+  "\n",
+  "\r\n",
+])("scanning ordinary reading distance does not inspect each character through every delimiter branch (%j)", (newline) => {
+  let markdown = source(1_000, newline);
+  const end = markdown.lastIndexOf(`${newline}---${newline}`);
+  markdown =
+    markdown.slice(0, end) +
+    `${newline}Unfinished {++addition and {~~substitution.${newline}` +
+    markdown.slice(end);
+  const actual = scanRoughdraftReview(markdown);
+  const comment = "{==this anchor==}{>>Keep this discussion.<<}{#c1}";
+  const suggestion = "{++proposed wording++}{#s1}";
+  expect(actual.items.map((item) => item.id)).toEqual(["c1", "s1"]);
+  expect(actual.ranges).toEqual(
+    [comment, suggestion].map((raw) => ({
+      from: markdown.indexOf(raw),
+      to: markdown.indexOf(raw) + raw.length,
+    })),
+  );
+  for (const item of actual.items) {
+    const marker =
+      item.kind === "comment"
+        ? "{>>Keep this discussion."
+        : "{++proposed wording";
+    const offset = markdown.indexOf(marker);
+    expect(item).toMatchObject({
+      offset,
+      line: markdown.slice(0, offset).split("\n").length,
+      column: offset - markdown.lastIndexOf("\n", offset - 1),
+    });
+  }
+  // Count character reads, not elapsed time. Native methods still read the real
+  // string; the independent primitive-string assertions above protect output.
+  let reads = 0;
+  const metered = new Proxy(Object(markdown), {
+    get(target, key) {
+      if (typeof key === "string" && key[0] >= "0" && key[0] <= "9") reads++;
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as unknown as string;
+  expect(scanRoughdraftReview(metered)).toEqual(actual);
+  expect(
+    reads,
+    "one full line-index pass is required; ordinary text should bypass repeated delimiter branches",
+  ).toBeLessThanOrEqual(markdown.length * 2);
 });

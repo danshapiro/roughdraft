@@ -586,6 +586,8 @@ export function scanRoughdraftReview(markdown: string): {
 
   let offset = 0;
   const scanEndOffset = endmatter.offset ?? markdown.length;
+  // Line starts, escapes, inline code and review openers keep their parser path.
+  const ordinary = /[^\\\n`{]+/y;
   let fence: FenceState | null = null;
 
   while (offset < scanEndOffset) {
@@ -615,7 +617,10 @@ export function scanRoughdraftReview(markdown: string): {
     }
 
     if (markdown[offset] !== "{") {
-      offset += 1;
+      ordinary.lastIndex = offset;
+      offset = ordinary.exec(markdown)
+        ? Math.min(ordinary.lastIndex, scanEndOffset)
+        : offset + 1;
       continue;
     }
 
@@ -737,6 +742,9 @@ function projectRoughdraftMarkdown(
         }
       }
     : null;
+  // Attachment offsets require character-level capture. Other projections can
+  // copy ordinary runs, stopping at line, escape, code and review boundaries.
+  const ordinary = capture ? null : /[^\\\n`{]+/y;
   let fence: FenceState | null = null;
   const noopDiagnostic = () => {};
   // Frontmatter belongs to the document, even when a value quotes markup.
@@ -811,6 +819,15 @@ function projectRoughdraftMarkdown(
       if (capture) attachment += content.attachment;
       offset = suggestion.endOffset;
       continue;
+    }
+    if (ordinary) {
+      ordinary.lastIndex = offset;
+      if (ordinary.exec(markdown)) {
+        const next = Math.min(ordinary.lastIndex, end);
+        result += markdown.slice(offset, next);
+        offset = next;
+        continue;
+      }
     }
     result += markdown[offset];
     if (capture) {
