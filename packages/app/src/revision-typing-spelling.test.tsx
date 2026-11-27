@@ -393,8 +393,17 @@ test("the first plain Edit keystroke after a large review opens uses its initial
   const firstKeyParses = vi
     .mocked(parseRemoteRevision)
     .mock.calls.map(([markdown]) => markdown.length);
-  process.stdout.write(
-    `${JSON.stringify({ severity: "info", event: "first-native-key-spelling-proof", sourceCharacters: source.length, firstKeyParseCharacters: firstKeyParses, reparsedCharacters: firstKeyParses.reduce((total, characters) => total + characters, 0) })}\n`,
+  console.info(
+    JSON.stringify({
+      severity: "info",
+      event: "first-native-key-spelling-proof",
+      sourceCharacters: source.length,
+      firstKeyParseCharacters: firstKeyParses,
+      reparsedCharacters: firstKeyParses.reduce(
+        (total, characters) => total + characters,
+        0,
+      ),
+    }),
   );
   expect(firstKeyParses.filter((characters) => characters > 100_000)).toEqual(
     [],
