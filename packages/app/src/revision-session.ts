@@ -2072,6 +2072,7 @@ export class RevisionSessionController {
               if (await this.applyAcknowledgment(committed.state, submitted)) {
                 this.operation = null;
                 this.persist();
+                this.resumeIncoming();
                 if (
                   !sameReviewDraft(this.current, this.base) ||
                   (reason !== "send" && this.needsFileWrite(committed.state))

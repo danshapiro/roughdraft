@@ -269,6 +269,144 @@ test("a reserved candidate is prepared and posted before reflection, then its ac
   expect(controller.readDraft().markdown).toBe(editorText);
 });
 
+for (const reserved of [false, true]) {
+  test.each([
+    false,
+    true,
+  ])(`a newer peer notice parked behind an own ${reserved ? "reserved" : "ordinary"} response resumes without another event (newer typing: %s)`, async (newerTyping) => {
+    let server = state();
+    let own: SyncState<ComparisonReviewData> | undefined;
+    let release:
+      | ((value: SyncResult<ComparisonReviewData>) => void)
+      | undefined;
+    const sent: ReconcileRequest[] = [];
+    const ui = new RevisionUiDraftStore();
+    const api = async <T>(path: string, body?: object): Promise<T | null> => {
+      if (!body) return structuredClone(server) as T;
+      if (!path.endsWith("/reconcile")) throw new Error(`Unexpected ${path}`);
+      const request = body as ReconcileRequest;
+      sent.push(structuredClone(request));
+      if (reserved && sent.length === 1) {
+        server = state("First.\n\nPeer last.\n");
+        server.revision = server.review.revision = 2;
+        return {
+          status: "client-merge-required",
+          state: structuredClone(server),
+          reservation: {
+            token: "initial-turn",
+            revision: 2,
+            expiresAt: Date.now() + 750,
+          },
+        } as T;
+      }
+      if (!release) {
+        server = commit(server, request);
+        own = structuredClone(server);
+        return await new Promise<T>((resolve) => {
+          release = resolve;
+        });
+      }
+      if (request.expectedRevision !== server.revision)
+        return {
+          // Annotated/large reviews cannot use the server's quick merge.
+          status: "client-merge-required",
+          state: structuredClone(server),
+          reservation: {
+            token: "avoidable-turn",
+            revision: server.revision,
+            expiresAt: Date.now() + 750,
+          },
+        } as T;
+      server = commit(server, request);
+      return { status: "committed", state: structuredClone(server) } as T;
+    };
+    const controller = new RevisionSessionController(
+      server.review,
+      server.draft as RevisionDraft,
+      {
+        request: api,
+        storage: new MemoryStorage(),
+        tabStorage: new MemoryStorage(),
+      },
+    );
+    controllers.push(controller);
+    controller.setAdapter({
+      rebasesBufferedDocument: true,
+      prepare: (value) => ({ ...value, cleanMarkdown: value.markdown }),
+      apply: (value) => ({ ...value, cleanMarkdown: value.markdown }),
+      adopt: () => null,
+      readUiDrafts: ui.read,
+      restoreUiDrafts: ui.restore,
+      subscribeUiDrafts: ui.subscribe,
+    });
+    controller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    controller.updateDraft(() => draft("My first.\n\nLast.\n"));
+    const pending = controller.flush(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(release).toBeDefined();
+    const committed = required(own);
+    const incoming = draft(
+      committed.draft.markdown.replace(
+        /(?:Peer )?Last\.|Peer last\./,
+        "Latest peer last.",
+      ),
+    );
+    server = {
+      ...committed,
+      draft: incoming,
+      revision: committed.revision + 1,
+      signature: reviewDraftSignature(incoming),
+      registryGeneration: String(committed.revision + 1),
+      review: {
+        ...committed.review,
+        revision: committed.revision + 1,
+        draft: incoming,
+        lastOperation: {
+          id: "newer-peer",
+          pageInstanceId: "other-page",
+          reason: "sync",
+        },
+      },
+    };
+    if (newerTyping)
+      controller.updateDraft((current) =>
+        draft(current.markdown.replace("My first.", "My first. Newer typing.")),
+      );
+    ui.setComment("private-reply", {
+      value: "Unsubmitted private reply",
+      original: "",
+      editing: true,
+    });
+    notifications.get("review")?.({
+      reason: "changed",
+      state: structuredClone(server),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(controller.readDraft().markdown).not.toContain("Latest peer last.");
+    release?.({ status: "committed", state: committed });
+    expect(await pending).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(controller.readDraft().markdown).toContain("Latest peer last.");
+    expect(controller.readDraft().markdown).toContain(
+      newerTyping ? "My first. Newer typing." : "My first.",
+    );
+    expect(sent).toHaveLength((reserved ? 2 : 1) + Number(newerTyping));
+    expect(
+      sent.every(
+        (request) =>
+          !JSON.stringify(request).includes("Unsubmitted private reply"),
+      ),
+    ).toBe(true);
+    expect(ui.getSnapshot().comments["private-reply"]?.value).toBe(
+      "Unsubmitted private reply",
+    );
+    expect(controller.getSnapshot().conflict).toBeNull();
+    expect(controller.getSnapshot().writePaused).toBe(false);
+  });
+}
+
 test.each([
   false,
   true,
