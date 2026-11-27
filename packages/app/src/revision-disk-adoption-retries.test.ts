@@ -6,6 +6,7 @@ import {
 } from "@roughdraft/rfm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { ComparisonReviewData } from "./comparison-types";
+import type { mergeReviewDraftsAsync } from "./revision-reconciliation";
 import {
   type RevisionDraft,
   type RevisionRemoteAdapter,
@@ -36,12 +37,11 @@ const draft = (markdown: string): RevisionDraft => ({
   decisions: {},
   reviewComments: [],
 });
-type AsyncAdoption = (
-  ...args: Parameters<RevisionRemoteAdapter["adopt"]>
-) => Promise<ReturnType<RevisionRemoteAdapter["adopt"]>>;
+type AsyncAdoption = NonNullable<RevisionRemoteAdapter["adoptAsync"]>;
 async function fixture(
   evaluate: RevisionRemoteAdapter["adopt"] = () => null,
   evaluateAsync?: AsyncAdoption,
+  compare?: typeof mergeReviewDraftsAsync,
 ) {
   const initial = draft(original);
   let server: SyncState<ComparisonReviewData> = {
@@ -176,12 +176,14 @@ async function fixture(
       setItem: () => {},
       removeItem: () => {},
     },
-    merge: async (base, local, incoming, options) =>
-      mergeReviewDrafts(base, local, incoming, {
-        ...options,
-        server: false,
-        budgetMs: 1000,
-      }),
+    merge:
+      compare ??
+      (async (base, local, incoming, options) =>
+        mergeReviewDrafts(base, local, incoming, {
+          ...options,
+          server: false,
+          budgetMs: 1000,
+        })),
   });
   active.push(controller);
   const adapter = (): RevisionRemoteAdapter => ({
@@ -332,6 +334,179 @@ test("async adoption deduplicates in-flight checkpoint notices and merges typing
   );
   expect(f.controller.readDraft().markdown).toContain("Last owner: outside.");
   expect(f.controller.getSnapshot().conflict).toBeNull();
+});
+
+test("async disk jobs use the configured comparator and preserve typing and private feedback received while it waits", async () => {
+  const pending = deferred<void>();
+  const compare = vi.fn<typeof mergeReviewDraftsAsync>(async (...args) =>
+    mergeReviewDrafts(...args),
+  );
+  const prose = draft("Prose comparison inputs.\n");
+  const feedback = draft("Feedback comparison inputs.\n");
+  const f = await fixture(
+    () => null,
+    async (_base, source, _force, _binding, configured) => {
+      if (!configured) return null;
+      await configured(prose, prose, prose, { server: false, budgetMs: 100 });
+      await pending.promise;
+      await configured(feedback, feedback, feedback, {
+        server: false,
+        budgetMs: 100,
+      });
+      return draft(source);
+    },
+    compare,
+  );
+  await f.changedDisk();
+  expect(compare.mock.calls.map(([base]) => base.markdown)).toContain(
+    prose.markdown,
+  );
+  f.controller.updateDraft((current) => ({
+    ...current,
+    markdown: current.markdown.replace(
+      "First owner: ready.",
+      "First owner: newer typing.",
+    ),
+    cleanMarkdown: current.cleanMarkdown?.replace(
+      "First owner: ready.",
+      "First owner: newer typing.",
+    ),
+  }));
+  f.setUiDrafts({
+    comments: {
+      c1: {
+        value: "Unsubmitted private feedback.",
+        original: "",
+        editing: true,
+      },
+    },
+  });
+  pending.resolve();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(compare.mock.calls.map(([base]) => base.markdown)).toContain(
+    feedback.markdown,
+  );
+  expect(f.controller.readDraft().markdown).toContain(
+    "First owner: newer typing.",
+  );
+  expect(f.controller.readDraft().markdown).toContain("Last owner: outside.");
+  expect(f.controller.readDraft().reviewComments).toEqual([]);
+  expect(JSON.stringify(f.posts)).not.toContain(
+    "Unsubmitted private feedback.",
+  );
+  expect(f.controller.getSnapshot().conflict).toBeNull();
+});
+
+test("stopping during source parsing prevents its first background comparison from starting", async () => {
+  const parsed = deferred<void>();
+  const compare = vi.fn<typeof mergeReviewDraftsAsync>(async (...args) =>
+    mergeReviewDrafts(...args),
+  );
+  const f = await fixture(
+    () => null,
+    async (base, source, _force, _binding, configured) => {
+      await parsed.promise;
+      if (!configured) return null;
+      return configured(base, base, draft(source));
+    },
+    compare,
+  );
+  await f.changedDisk();
+  expect(f.evaluatedAsync).toHaveBeenCalledTimes(1);
+  f.controller.stop();
+  parsed.resolve();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(compare).not.toHaveBeenCalled();
+  expect(f.posts).toEqual([]);
+  expect(f.controller.readDraft().markdown).toBe(original);
+  expect(f.controller.getSnapshot().recoveryError).toBe("");
+});
+
+test.each([
+  "stop",
+  "Retry",
+  "adapter",
+  "disk",
+  "review",
+  "binding",
+  "copy",
+] as const)("%s invalidation prevents an obsolete second disk job from dispatching to the worker comparator", async (change) => {
+  const pending = deferred<void>();
+  const compare = vi.fn<typeof mergeReviewDraftsAsync>(async (...args) =>
+    mergeReviewDrafts(...args),
+  );
+  const first = draft("First obsolete disk job.\n");
+  const second = draft("Second obsolete disk job.\n");
+  let evaluations = 0;
+  const f = await fixture(
+    () => null,
+    async (_base, source, _force, _binding, configured) => {
+      if (++evaluations > 1) return draft(source);
+      if (!configured) return null;
+      await configured(first, first, first);
+      await pending.promise;
+      await configured(second, second, second);
+      return draft(source);
+    },
+    compare,
+  );
+  await f.changedDisk();
+  expect(compare.mock.calls.map(([base]) => base.markdown)).toContain(
+    first.markdown,
+  );
+  let retrying: Promise<unknown> | undefined;
+  if (change === "stop") f.controller.stop();
+  if (change === "Retry") {
+    retrying = f.controller.retry();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  if (change === "adapter") {
+    f.controller.setAdapter(f.adapter());
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  if (change === "copy") {
+    const copying = f.controller.copy("/separate.md", true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await copying).status).toBe("committed");
+  }
+  if (change === "disk" || change === "review" || change === "binding")
+    await f.publish((current) => {
+      if (!current.disk) throw new Error("Expected source");
+      if (change === "disk")
+        current.disk = {
+          ...current.disk,
+          text: outside.replace("outside.", "newest outside."),
+          version: "3",
+          hash: "3",
+        };
+      if (change === "binding")
+        current.disk = { ...current.disk, path: "/moved.md" };
+      if (change === "review") {
+        current.revision++;
+        current.review.revision++;
+        current.draft = draft(
+          original.replace("First owner: ready.", "First owner: peer update."),
+        );
+        current.signature = reviewDraftSignature(current.draft);
+      }
+      return current;
+    });
+  pending.resolve();
+  await vi.advanceTimersByTimeAsync(0);
+  await retrying;
+  expect(compare.mock.calls.map(([base]) => base.markdown)).not.toContain(
+    second.markdown,
+  );
+  expect(f.controller.getSnapshot().recoveryError).toBe("");
+  expect(f.controller.getSnapshot().conflict?.message ?? "").not.toContain(
+    "superseded",
+  );
+  if (change === "disk")
+    expect(f.controller.readDraft().markdown).toContain("newest outside.");
+  if (change === "copy") {
+    expect(f.controller.getSnapshot().session.id).toBe("separate-review");
+    expect(f.controller.readDraft().markdown).toBe(original);
+  }
 });
 
 test.each([

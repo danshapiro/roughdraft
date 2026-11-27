@@ -1,6 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { SyncDraft } from "@roughdraft/rfm";
+import {
+  mergeReviewDrafts,
+  type SyncDraft,
+  type SyncMerge,
+} from "@roughdraft/rfm";
 import { getSchema } from "@tiptap/core";
 import { expect, test, vi } from "vitest";
 import { criticMarkdownToEditorState } from "./critic-markup";
@@ -209,6 +213,185 @@ test("a hidden review completes without waiting on background-throttled scheduli
     expect(throttled).not.toHaveBeenCalled();
   } finally {
     visibility.mockRestore();
+    vi.unstubAllGlobals();
+  }
+});
+
+test("both pure disk comparisons await the supplied comparison service with unchanged inputs and options", async () => {
+  const input = structuredClone(base);
+  const binding = {
+    path: "/practice.md",
+    markdown: original,
+    resolution: "incoming" as const,
+  };
+  const disk = original.replace("Beta owner: stable.", "Beta owner: updated.");
+  const expected = adoptRevisionDisk(
+    structuredClone(input),
+    disk,
+    schema,
+    false,
+    { ...binding },
+  );
+  const jobs: Array<{
+    args: Parameters<typeof mergeReviewDrafts>;
+    finish(): void;
+  }> = [];
+  const compare = vi.fn(
+    (...args: Parameters<typeof mergeReviewDrafts>) =>
+      new Promise<SyncMerge>((resolve) => {
+        jobs.push({ args, finish: () => resolve(mergeReviewDrafts(...args)) });
+      }),
+  );
+  let done = false;
+  const pending = adoptRevisionDiskAsync(
+    input,
+    disk,
+    schema,
+    false,
+    binding,
+    undefined,
+    compare,
+  ).finally(() => {
+    done = true;
+  });
+  await vi.waitFor(() => expect(jobs).toHaveLength(1));
+  expect(done).toBe(false);
+  let inputRan = false;
+  await new Promise<void>((resolve) =>
+    setTimeout(() => {
+      inputRan = true;
+      resolve();
+    }, 0),
+  );
+  expect(inputRan).toBe(true);
+  input.markdown = "Newer native typing.\n";
+  binding.markdown = "A later disk revision.\n";
+  jobs[0].finish();
+  await vi.waitFor(() => expect(jobs).toHaveLength(2));
+  expect(done).toBe(false);
+  jobs[1].finish();
+  expect(await pending).toEqual(expected);
+  expect(compare).toHaveBeenCalledTimes(2);
+  for (const { args } of jobs) {
+    expect(args[3]).toEqual({
+      server: false,
+      budgetMs: 100,
+      resolution: "local",
+    });
+    expect(JSON.stringify(args)).not.toContain("Newer native typing");
+    expect(JSON.stringify(args)).not.toContain("A later disk revision");
+  }
+  expect(input.markdown).toBe("Newer native typing.\n");
+  expect(binding.markdown).toBe("A later disk revision.\n");
+});
+
+test("a rejected background disk comparison becomes a safe waiting result without mutating its source", async () => {
+  const input = structuredClone(base);
+  const before = structuredClone(input);
+  const disk = original.replace("Beta owner: stable.", "Beta owner: updated.");
+  const compare = vi.fn(async () => {
+    throw new Error("Comparison was superseded");
+  });
+  const result = await adoptRevisionDiskAsync(
+    input,
+    disk,
+    schema,
+    false,
+    { path: "/practice.md", markdown: original },
+    undefined,
+    compare,
+  );
+  expect(compare).toHaveBeenCalledOnce();
+  expect(result).toMatchObject({
+    status: "client-merge-required",
+    draft: before,
+    reason: "The outside update could not be mapped safely.",
+  });
+  expect(input).toEqual(before);
+});
+
+test("an unavailable comparison service returns its waiting result without mapping or retrying", async () => {
+  const input = structuredClone(base);
+  const compare = vi.fn(async (_before, local: SyncDraft) => ({
+    status: "client-merge-required" as const,
+    draft: local,
+    conflicts: [],
+    signature: "unavailable",
+    reason: "This browser cannot run the background comparison.",
+  }));
+  const result = await adoptRevisionDiskAsync(
+    input,
+    original.replace("Beta owner: stable.", "Beta owner: updated."),
+    schema,
+    false,
+    { path: "/practice.md", markdown: original },
+    undefined,
+    compare,
+  );
+  expect(compare).toHaveBeenCalledOnce();
+  expect(result).toMatchObject({
+    status: "client-merge-required",
+    reason: "This browser cannot run the background comparison.",
+  });
+  expect(input).toEqual(base);
+});
+
+test("comparison timing includes deferred work while local mapping timing excludes that wait", async () => {
+  let clock = 0;
+  const monotonic = vi
+    .spyOn(performance, "now")
+    .mockImplementation(() => clock);
+  const profile = {
+    entries: [] as Array<{
+      stage: string;
+      duration: number;
+      durationKind?: string;
+    }>,
+  };
+  vi.stubGlobal("roughdraftProfile", profile);
+  const compare = vi.fn(
+    async (...args: Parameters<typeof mergeReviewDrafts>) => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      clock += 100;
+      return mergeReviewDrafts(...args);
+    },
+  );
+  try {
+    const result = await adoptRevisionDiskAsync(
+      base,
+      original.replace("Beta owner: stable.", "Beta owner: updated."),
+      schema,
+      false,
+      { path: "/practice.md", markdown: original },
+      undefined,
+      compare,
+    );
+    expect(result).toMatchObject({ status: "merged" });
+    expect(
+      profile.entries.filter((entry) =>
+        ["disk-adoption-prose-merge", "disk-adoption-feedback-merge"].includes(
+          entry.stage,
+        ),
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        stage: "disk-adoption-prose-merge",
+        duration: 100,
+        durationKind: "elapsed",
+      }),
+      expect.objectContaining({
+        stage: "disk-adoption-feedback-merge",
+        duration: 100,
+        durationKind: "elapsed",
+      }),
+    ]);
+    expect(
+      profile.entries
+        .filter((entry) => entry.durationKind === "cpu")
+        .every((entry) => entry.duration === 0),
+    ).toBe(true);
+  } finally {
+    monotonic.mockRestore();
     vi.unstubAllGlobals();
   }
 });

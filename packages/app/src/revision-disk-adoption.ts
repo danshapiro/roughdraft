@@ -113,7 +113,14 @@ export interface RevisionDiskBase {
   resolution?: "local" | "incoming";
 }
 export type RevisionDiskMerge = SyncMerge & { diskCleanMarkdown?: string };
-type RevisionWork<T> = Generator<void, T, void>;
+export type RevisionDiskCompare = (
+  ...args: Parameters<typeof mergeReviewDrafts>
+) => SyncMerge | Promise<SyncMerge>;
+type RevisionWork<T> = Generator<
+  undefined | Promise<SyncMerge>,
+  T,
+  SyncMerge | undefined
+>;
 type DiskAdoption = SyncDraft | RevisionDiskMerge | null;
 export async function adoptRevisionDiskAsync(
   base: SyncDraft,
@@ -122,6 +129,7 @@ export async function adoptRevisionDiskAsync(
   force = false,
   diskBase?: RevisionDiskBase,
   unchangedParagraphsFrom?: Node,
+  compare?: RevisionDiskCompare,
 ) {
   const work = adoptRevisionDiskWork(
     structuredClone(base),
@@ -130,11 +138,23 @@ export async function adoptRevisionDiskAsync(
     force,
     diskBase ? { ...diskBase } : undefined,
     unchangedParagraphsFrom,
+    compare,
   );
   let step = work.next();
   while (!step.done) {
-    await yieldRevisionTask();
-    step = work.next();
+    if (step.value) {
+      let result: SyncMerge;
+      try {
+        result = await step.value;
+      } catch (error) {
+        step = work.throw(error);
+        continue;
+      }
+      step = work.next(result);
+    } else {
+      await yieldRevisionTask();
+      step = work.next();
+    }
   }
   return step.value;
 }
@@ -180,6 +200,7 @@ function* adoptRevisionDiskWork(
   force: boolean,
   diskBase?: RevisionDiskBase,
   unchangedParagraphsFrom?: Node,
+  compare: RevisionDiskCompare = mergeReviewDrafts,
 ): RevisionWork<DiskAdoption> {
   const context = paragraphReuseContext(schema, unchangedParagraphsFrom);
   yield;
@@ -192,6 +213,7 @@ function* adoptRevisionDiskWork(
         force,
         diskBase,
         context,
+        compare,
       );
       return result.status !== "merged" &&
         force &&
@@ -350,6 +372,7 @@ function* mergeDiskWork(
   force: boolean,
   diskBase: RevisionDiskBase,
   context: EditorState,
+  compare: RevisionDiskCompare,
 ): RevisionWork<RevisionDiskMerge> {
   if (
     review.cleanMarkdown !== undefined &&
@@ -424,8 +447,16 @@ function* mergeDiskWork(
   // become detached/outdated feedback rather than a false writing conflict.
   const sides = [before, disk, review];
   const plainSides = sides.map(plain);
-  const prose = measureRevision("disk-adoption-prose-merge", () =>
-    mergeReviewDrafts(plainSides[0], plainSides[1], plainSides[2], options),
+  const prose = yield* measuredWork(
+    "disk-adoption-prose-merge",
+    compareDiskWork(
+      compare,
+      plainSides[0],
+      plainSides[1],
+      plainSides[2],
+      options,
+    ),
+    "elapsed",
   );
   yield;
   if (prose.status !== "merged")
@@ -491,8 +522,10 @@ function* mergeDiskWork(
       ...(mappedDisk.outdatedSuggestions ?? []),
       ...displaced,
     ];
-  const merged = measureRevision("disk-adoption-feedback-merge", () =>
-    mergeReviewDrafts(mappedBefore, mappedDisk, mappedReview, options),
+  const merged = yield* measuredWork(
+    "disk-adoption-feedback-merge",
+    compareDiskWork(compare, mappedBefore, mappedDisk, mappedReview, options),
+    "elapsed",
   );
   yield;
   if (merged.status !== "merged")
@@ -1155,25 +1188,50 @@ function* evaluateWork<T>(stage: string, action: () => T): RevisionWork<T> {
   yield;
   return result;
 }
-/** Active CPU time only; task pauses and intervening user input are excluded. */
+/** Only plain review data crosses the comparison boundary; model mapping stays local. */
+function* compareDiskWork(
+  compare: RevisionDiskCompare,
+  ...args: Parameters<typeof mergeReviewDrafts>
+): RevisionWork<SyncMerge> {
+  const result = compare(...args);
+  return "then" in result ? ((yield result) as SyncMerge) : result;
+}
+/** Separate local CPU work from elapsed time spent awaiting comparisons. */
 function* measuredWork<T>(
   stage: string,
   work: RevisionWork<T>,
+  durationKind: "cpu" | "elapsed" = "cpu",
 ): RevisionWork<T> {
   let elapsed = 0;
-  let started = performance.now();
+  const started = performance.now();
   const at = performance.timeOrigin + started;
+  const advance = (resume: () => ReturnType<typeof work.next>) => {
+    const began = performance.now();
+    try {
+      return resume();
+    } finally {
+      elapsed += performance.now() - began;
+    }
+  };
   try {
-    let step = work.next();
-    elapsed += performance.now() - started;
+    let step = advance(() => work.next());
     while (!step.done) {
-      yield;
-      started = performance.now();
-      step = work.next();
-      elapsed += performance.now() - started;
+      let result: SyncMerge | undefined;
+      try {
+        result = yield step.value;
+      } catch (error) {
+        step = advance(() => work.throw(error));
+        continue;
+      }
+      step = advance(() => work.next(result));
     }
     return step.value;
   } finally {
-    recordRevisionTiming(stage, at, elapsed, "cpu");
+    recordRevisionTiming(
+      stage,
+      at,
+      durationKind === "elapsed" ? performance.now() - started : elapsed,
+      durationKind,
+    );
   }
 }

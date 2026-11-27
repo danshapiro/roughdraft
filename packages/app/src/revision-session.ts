@@ -25,6 +25,7 @@ import {
 } from "./revision-browser-recovery";
 import type {
   RevisionDiskBase,
+  RevisionDiskCompare,
   RevisionDiskMerge,
 } from "./revision-disk-adoption";
 import { subscribeReviewChanges } from "./revision-live-transport";
@@ -80,6 +81,7 @@ export interface RevisionRemoteAdapter {
     markdown: string,
     force?: boolean,
     diskBase?: RevisionDiskBase,
+    compare?: RevisionDiskCompare,
   ): Promise<RevisionDraft | RevisionDiskMerge | null>;
   readUiDrafts(): Record<string, unknown>;
   restoreUiDrafts(drafts: Record<string, unknown>): void;
@@ -1891,6 +1893,23 @@ export class RevisionSessionController {
       !inputs.every((value, index) => value === cached?.inputs[index])
     ) {
       const adapter = this.adapter;
+      const generation = this.diskAdoptionGeneration;
+      const compare: RevisionDiskCompare = (...args) => {
+        // Adoption can yield between pure jobs. Check before dispatch so an
+        // obsolete parse cannot restart the shared worker after stop or Retry.
+        if (
+          this.diskAdoptionGeneration !== generation ||
+          !this.diskAdoptionStateMatches(state)
+        )
+          return {
+            status: "client-merge-required",
+            draft: args[1],
+            conflicts: [],
+            signature: reviewDraftSignature(args[1]),
+            reason: "The outside comparison was superseded.",
+          };
+        return this.merge(...args);
+      };
       const compute = async () => {
         try {
           const args: Parameters<RevisionRemoteAdapter["adopt"]> = [
@@ -1907,7 +1926,7 @@ export class RevisionSessionController {
           ];
           const adopted =
             (adapter?.adoptAsync
-              ? await adapter.adoptAsync(...args)
+              ? await adapter.adoptAsync(...args, compare)
               : adapter?.adopt(...args)) ?? null;
           const result: RevisionDiskMerge | null = !adopted
             ? null
@@ -1926,7 +1945,6 @@ export class RevisionSessionController {
         }
       };
       let entry: DiskAdoptionEntry | null = null;
-      const generation = this.diskAdoptionGeneration;
       const outcome = adapter?.adoptAsync
         ? this.diskAdoptionWork.then(() =>
             this.diskAdoptionGeneration === generation &&

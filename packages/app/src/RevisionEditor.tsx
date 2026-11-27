@@ -792,7 +792,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
             editor.state.doc,
           ),
         ),
-      adoptAsync: (base, markdown, force, diskBase) =>
+      adoptAsync: (base, markdown, force, diskBase, compare) =>
         measureRevisionAsync("disk-adoption", () =>
           adoptRevisionDiskAsync(
             base,
@@ -801,6 +801,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
             force,
             diskBase,
             editor.state.doc,
+            compare,
           ),
         ),
       readUiDrafts: uiDraftStore.read,
