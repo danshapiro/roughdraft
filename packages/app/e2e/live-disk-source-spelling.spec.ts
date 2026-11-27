@@ -215,16 +215,9 @@ test("explicit Reload from file completes when exact mixed metadata prevents aut
 
     stage = "confirming explicit Reload from file";
     await page.getByTestId("revision-reload-file").click();
-    const dialog = page.getByRole("dialog", {
-      name: "Reload from file and keep feedback?",
-    });
+    const dialog = page.getByTestId("revision-reload-dialog");
     await expect(dialog).toBeVisible();
-    await dialog
-      .getByRole("button", {
-        name: "Reload from file, keep feedback",
-        exact: true,
-      })
-      .click();
+    await page.getByTestId("revision-reload-confirm").click();
     stage = "waiting for explicit Reload to complete";
     await expect(dialog).toBeHidden();
     await expect(banner).toHaveCount(0);
@@ -262,7 +255,9 @@ test("explicit Reload from file completes when exact mixed metadata prevents aut
           banners: await page
             .getByTestId("revision-conflict")
             .allTextContents(),
-          dialogs: await page.getByRole("dialog").allTextContents(),
+          dialogs: await page
+            .getByTestId("revision-reload-dialog")
+            .allTextContents(),
         },
         null,
         2,

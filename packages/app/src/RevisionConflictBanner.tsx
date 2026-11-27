@@ -365,7 +365,7 @@ export function RevisionConflictBanner({
           if (!busy) setReload(open);
         }}
       >
-        <DialogContent>
+        <DialogContent data-testid="revision-reload-dialog">
           <DialogTitle>Reload from file and keep feedback?</DialogTitle>
           <DialogDescription>
             The latest file becomes the working document. Comments and proposals
@@ -385,6 +385,7 @@ export function RevisionConflictBanner({
             <Button
               className="min-h-11"
               disabled={busy || disabled}
+              data-testid="revision-reload-confirm"
               onClick={() => {
                 setBusy(true);
                 setError("");
