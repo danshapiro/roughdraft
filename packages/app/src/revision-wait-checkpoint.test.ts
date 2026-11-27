@@ -76,6 +76,8 @@ function fixture(autosave = false) {
   let holdSaves = false;
   let releaseCheckpoint: (() => void) | undefined;
   let checkpointBarrier: Promise<void> | undefined;
+  let releaseCheckpointRequest: (() => void) | undefined;
+  let checkpointRequestBarrier: Promise<void> | undefined;
   let releaseSave: (() => void) | undefined;
   let saveBarrier: Promise<void> | undefined;
   let merges = 0;
@@ -84,6 +86,7 @@ function fixture(autosave = false) {
     if (!body) return state() as T;
     posted.push({ path: route, body: structuredClone(body) });
     if (route.endsWith("/checkpoint")) {
+      if (checkpointRequestBarrier) await checkpointRequestBarrier;
       const result = store.checkpoint(
         review.id,
         body as Record<string, unknown>,
@@ -221,6 +224,15 @@ function fixture(autosave = false) {
     releaseCheckpoint: () => {
       checkpointBarrier = undefined;
       releaseCheckpoint?.();
+    },
+    holdCheckpointRequest: () => {
+      checkpointRequestBarrier = new Promise<void>((resolve) => {
+        releaseCheckpointRequest = resolve;
+      });
+    },
+    releaseCheckpointRequest: () => {
+      checkpointRequestBarrier = undefined;
+      releaseCheckpointRequest?.();
     },
   };
 }
@@ -648,3 +660,80 @@ for (const submitted of [false, true]) {
     },
   );
 }
+
+test("a delayed snapshot of submitted feedback cannot reopen the episode after its covering save acknowledges", async () => {
+  const f = fixture(true);
+  const { controller, ui } = f.page("owner");
+  await vi.advanceTimersByTimeAsync(0);
+  const text = "Keep this feedback private until I explicitly submit it.";
+  ui.setComment("c9", { value: text, original: "", editing: true });
+  f.local(
+    controller,
+    original.replace("First owner: stable.", "First owner: browser edit."),
+  );
+  f.peer(
+    original.replace("Second owner: stable.", "Second owner: external edit."),
+  );
+  f.block(true);
+  await controller.refresh(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.checkpoints()).toHaveLength(1);
+  f.block(false);
+  await controller.refresh(true);
+  await controller.flush(false);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(controller.getSnapshot().conflict).toBeNull();
+  expect(f.checkpoints()[0].resolvedAt).toBeUndefined();
+  expect(f.state().draft.reviewComments).toEqual([]);
+  expect(fs.readFileSync(f.target, "utf8")).not.toContain(text);
+
+  // Comment Save removes its private editor and posts its public content.
+  // The public update advances beyond the episode's previous UI generation.
+  ui.setComment("c9", null);
+  controller.updateDraft((draft) => ({
+    ...draft,
+    reviewComments: [
+      ...draft.reviewComments,
+      {
+        id: "c9",
+        changeId: "document",
+        content: text,
+        createdAt: new Date().toISOString(),
+      },
+    ],
+  }));
+  f.holdSaveResponse();
+  f.holdCheckpointRequest();
+  const saving = controller.flush(false);
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.state().draft.reviewComments[0]?.content).toBe(text);
+    expect(f.checkpoints()[0].resolvedAt).toEqual(expect.any(String));
+    // Its already scheduled snapshot is captured while the save response is
+    // delayed, but the request reaches the store only after acknowledgment.
+    await vi.advanceTimersByTimeAsync(300);
+    const delayed = f.posted
+      .filter((request) => request.path.endsWith("/checkpoint"))
+      .at(-1)?.body as { generation: number; uiDrafts: unknown };
+    expect(delayed.uiDrafts).toEqual({ comments: {}, suggestion: undefined });
+    const covering = f.posted
+      .filter((request) => request.path.endsWith("/reconcile"))
+      .at(-1)?.body as { localGeneration: number };
+    expect(delayed.generation).toBe(covering.localGeneration);
+    f.releaseSaveResponse();
+    await saving;
+    await vi.advanceTimersByTimeAsync(0);
+    await controller.refresh(true);
+    f.releaseCheckpointRequest();
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(f.checkpoints().filter((entry) => !entry.resolvedAt)).toEqual([]);
+    expect(f.state().draft.reviewComments[0]?.content).toBe(text);
+    expect(fs.readFileSync(f.target, "utf8")).not.toContain(text);
+  } finally {
+    f.releaseSaveResponse();
+    f.releaseCheckpointRequest();
+    await saving;
+    await vi.advanceTimersByTimeAsync(0);
+  }
+});

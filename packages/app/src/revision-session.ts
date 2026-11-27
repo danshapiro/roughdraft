@@ -2384,7 +2384,11 @@ export class RevisionSessionController {
       coveredCheckpoint: {
         recoveryId: episode.recoveryId,
         pageInstanceId: episode.pageInstanceId,
-        generation: episode.generation,
+        // The save covers its complete captured generation. A scheduled
+        // checkpoint can capture newer public content from that same snapshot
+        // before this acknowledgment arrives, even when the episode's last
+        // recorded UI generation is older.
+        generation,
         ...(episode.reconciled
           ? { reconciledSignature: reviewDraftSignature(this.current) }
           : {}),
