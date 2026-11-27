@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { extractRoughdraftReviewIndex } from "@roughdraft/rfm";
 import {
   type APIRequestContext,
   expect,
@@ -6,6 +7,7 @@ import {
   test,
 } from "@playwright/test";
 import {
+  activeCommentDraft,
   createMarkdownProject,
   removeMarkdownProject,
   richTextEditor,
@@ -77,7 +79,7 @@ test.describe("comment lifecycle audit", () => {
     });
   }
 
-  test("Escape restores an edited comment after it autosaves", async ({
+  test("Escape discards a recovered private edit without changing the saved comment", async ({
     page,
     request,
   }) => {
@@ -86,15 +88,43 @@ test.describe("comment lifecycle audit", () => {
     await page.getByTestId("comment-rail-c1-action-edit").click();
     const editor = page.getByTestId("comment-rail-c1-editor");
     await editor.fill("Changed feedback");
+    await expect(editor).toHaveValue("Changed feedback");
     await expect
       .poll(() => readComments(request, id))
-      .toContain("Changed feedback");
+      .toEqual(["Original feedback"]);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (reviewId) =>
+            Object.entries(sessionStorage).some(([key, value]) => {
+              if (!key.startsWith(`roughdraft-draft:${reviewId}:`))
+                return false;
+              return (
+                JSON.parse(value).uiDrafts?.comments?.c1?.value ===
+                "Changed feedback"
+              );
+            }),
+          id,
+        ),
+      )
+      .toBe(true);
+    await page.reload();
+    await page.getByTestId("comment-thread-c1").click();
+    await expect(editor).toHaveValue("Changed feedback");
+    await expect
+      .poll(() => readComments(request, id))
+      .toEqual(["Original feedback"]);
     await editor.press("Escape");
     await expect(editor).toBeHidden();
     await expect
       .poll(() => readComments(request, id))
       .toContain("Original feedback");
     expect(fs.readFileSync(filename, "utf8")).toBe(annotated);
+    await page.reload();
+    await expect(editor).toBeHidden();
+    await expect(page.getByTestId("comment-rail-c1")).toContainText(
+      "Original feedback",
+    );
   });
 
   test("a canceled new reply leaves no empty comment or highlight", async ({
@@ -104,7 +134,7 @@ test.describe("comment lifecycle audit", () => {
     const { id, filename } = await openDocument(page, request);
     await page.getByTestId("comment-thread-c1").click();
     await page.getByTestId("comment-rail-c1-action-reply").click();
-    const reply = page.getByTestId("comment-rail-c2-editor");
+    const { editor: reply, id: replyId } = await activeCommentDraft(page);
     await expect(reply).toBeFocused();
     await reply.fill("Do not keep this reply");
     await reply.press("Escape");
@@ -117,7 +147,7 @@ test.describe("comment lifecycle audit", () => {
     await expect(page.getByTestId("document-review-rail")).toContainText(
       "Original feedback",
     );
-    await expect(page.getByTestId("comment-rail-c2")).toHaveCount(0);
+    await expect(page.getByTestId(`comment-rail-${replyId}`)).toHaveCount(0);
   });
 
   test("a canceled new root comment does not leave review markup", async ({
@@ -128,7 +158,7 @@ test.describe("comment lifecycle audit", () => {
     const { filename } = await openDocument(page, request, plain);
     await selectRichText(page, "passage");
     await page.getByTestId("selection-menu-action-comment").click();
-    const editor = page.getByTestId("comment-rail-c1-editor");
+    const { editor } = await activeCommentDraft(page);
     await expect(editor).toBeFocused();
     await editor.fill("A draft comment");
     await editor.press("Escape");
@@ -149,12 +179,16 @@ test.describe("comment lifecycle audit", () => {
     await page.getByTestId("comment-rail-c1-action-edit").click();
     const editor = page.getByTestId("comment-rail-c1-editor");
     await editor.fill("Feedback while unfolding");
+    await expect(editor).toHaveValue("Feedback while unfolding");
     await expect
       .poll(() => readComments(request, id))
-      .toContain("Feedback while unfolding");
+      .toEqual(["Original feedback"]);
     await page.setViewportSize({ width: 1100, height: 900 });
     await expect(editor).toHaveValue("Feedback while unfolding");
     await expect(editor).toBeFocused();
+    await expect
+      .poll(() => readComments(request, id))
+      .toEqual(["Original feedback"]);
     await page.getByTestId("comment-rail-c1-action-cancel").click();
     await expect
       .poll(() => readComments(request, id))
@@ -174,19 +208,31 @@ test.describe("comment lifecycle audit", () => {
     const { id, filename } = await openDocument(page, request, plain);
     await selectRichText(page, "passage");
     await page.getByTestId("selection-menu-action-comment").click();
-    const editor = page.getByTestId("comment-rail-c1-editor");
+    const { editor, id: commentId } = await activeCommentDraft(page);
     await expect(editor).toBeFocused();
     await page.keyboard.type("Keep the detail.");
     await page.keyboard.press("Enter");
     await page.keyboard.insertText(
       "Second line: café, 日本語, and an emoji 🙂.",
     );
-    await page.getByTestId("comment-rail-c1-action-save").click();
+    await editor.press("Control+Enter");
     const content =
       "Keep the detail.\nSecond line: café, 日本語, and an emoji 🙂.";
     await expect.poll(() => readComments(request, id)).toEqual([content]);
+    const saved = await (await request.get(`${api}/${id}`)).json();
+    expect(saved.reviewComments).toEqual([
+      expect.objectContaining({ id: commentId, content }),
+    ]);
+    const root = saved.reviewComments[0];
+    expect(root.parentCommentId ?? null).toBeNull();
+    const anchor = extractRoughdraftReviewIndex(
+      saved.draft.markdown,
+    ).items.find((item) => item.id === commentId);
+    expect(anchor?.anchorText).toBe("passage");
     await page.reload();
-    await expect(page.getByTestId("comment-rail-c1")).toContainText(content);
+    await expect(page.getByTestId(`comment-rail-${commentId}`)).toContainText(
+      content,
+    );
     expect(fs.readFileSync(filename, "utf8")).toBe(plain);
   });
 
@@ -197,14 +243,27 @@ test.describe("comment lifecycle audit", () => {
     const { id, filename } = await openDocument(page, request);
     await page.getByTestId("comment-thread-c1").click();
     await page.getByTestId("comment-rail-c1-action-reply").click();
-    const reply = page.getByTestId("comment-rail-c2-editor");
+    const { editor: reply, id: replyId } = await activeCommentDraft(page);
     await expect(reply).toBeFocused();
     await page.keyboard.type("A reply that can be restored.");
     await page.keyboard.press("Control+Enter");
     await expect
       .poll(() => readComments(request, id))
       .toEqual(["Original feedback", "A reply that can be restored."]);
-    await page.getByTestId("comment-rail-c2-action-delete").click();
+    const saved = await (await request.get(`${api}/${id}`)).json();
+    expect(
+      saved.reviewComments.find(
+        (comment: { id: string }) => comment.id === replyId,
+      ),
+    ).toMatchObject({
+      content: "A reply that can be restored.",
+      parentCommentId: "c1",
+    });
+    expect(
+      new Set(saved.reviewComments.map((comment: { id: string }) => comment.id))
+        .size,
+    ).toBe(saved.reviewComments.length);
+    await page.getByTestId(`comment-rail-${replyId}-action-delete`).click();
     await expect
       .poll(() => readComments(request, id))
       .toEqual(["Original feedback"]);
@@ -220,7 +279,7 @@ test.describe("comment lifecycle audit", () => {
       .poll(() => readComments(request, id))
       .toEqual(["Original feedback", "A reply that can be restored."]);
     await page.reload();
-    await expect(page.getByTestId("comment-rail-c2")).toContainText(
+    await expect(page.getByTestId(`comment-rail-${replyId}`)).toContainText(
       "A reply that can be restored.",
     );
     expect(fs.readFileSync(filename, "utf8")).toBe(annotated);
