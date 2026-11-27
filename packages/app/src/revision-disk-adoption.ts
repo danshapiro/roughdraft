@@ -17,6 +17,7 @@ import {
   editorStateToCriticMarkdown,
 } from "./critic-markup";
 import { rejectCriticChangeTransaction } from "./editor-extensions";
+import { splitYamlDocumentMetadata } from "./markdown";
 import { suggestionDetail } from "./revision-bulk";
 import { cleanSourceFromNode } from "./revision-clean-cache";
 import {
@@ -25,6 +26,11 @@ import {
   createSourceSpellingPreserver,
 } from "./revision-markdown";
 import {
+  documentMetadata,
+  sameMetadata,
+  withDocumentMetadata,
+} from "./revision-metadata";
+import {
   projectAcceptedDocument,
   suggestionPositions,
 } from "./revision-projection";
@@ -32,6 +38,10 @@ import {
   parseRemoteRevision,
   replaceRevisionContent,
 } from "./revision-remote-source";
+import {
+  RevisionCanonicalSpellingProof,
+  RevisionSpellingProof,
+} from "./revision-spelling-proof";
 
 function annotationRanges(doc: Node) {
   const comments = new Map<string, { from: number; to: number }>();
@@ -153,6 +163,17 @@ function mergeDisk(
   force: boolean,
   diskBase: RevisionDiskBase,
 ): RevisionDiskMerge {
+  if (
+    review.cleanMarkdown !== undefined &&
+    !provesAcceptedSpelling(review.markdown, review.cleanMarkdown, schema)
+  )
+    return {
+      status: "client-merge-required",
+      draft: review,
+      conflicts: [],
+      signature: reviewDraftSignature(review),
+      reason: "The saved clean text could not be verified against its review.",
+    };
   const origin = review.diskOrigin;
   const aliases =
     origin?.path === diskBase.path &&
@@ -191,6 +212,21 @@ function mergeDisk(
     aliases,
   );
   const disk = renumberReviewDraft(diskDraft(markdown, schema), aliases);
+  if (
+    [before, disk].some(
+      (side) =>
+        side.cleanMarkdown !== undefined &&
+        !provesAcceptedSpelling(side.markdown, side.cleanMarkdown, schema),
+    )
+  )
+    return {
+      status: "client-merge-required",
+      draft: review,
+      conflicts: [],
+      signature: reviewDraftSignature(review),
+      reason:
+        "The source file's clean text could not be verified against its complete document.",
+    };
   const options = {
     server: false,
     budgetMs: 100,
@@ -296,6 +332,34 @@ function mergeDisk(
         incoming: conflict.local,
       })),
     };
+  // The second merge settles annotations, not prose. A clean source can spell
+  // the accepted model differently around pending markup. Keep its proven
+  // spelling only after checking that the final feedback still projects to
+  // exactly the same canonical accepted document.
+  const mergedMarkdown = withDocumentMetadata(
+    merged.draft.markdown,
+    documentMetadata(prose.draft.markdown),
+  );
+  const finalState = EditorState.create({ schema });
+  const parsedFinal = parseRemoteRevision(mergedMarkdown, finalState);
+  const finalAccepted = projectAcceptedDocument(parsedFinal.doc).doc;
+  const canonical = acceptedSpelling(finalAccepted, prose.draft.markdown);
+  if (
+    !new RevisionCanonicalSpellingProof().matches(
+      prose.draft.markdown,
+      canonical,
+      finalAccepted,
+      finalState,
+    )
+  )
+    return {
+      status: "client-merge-required",
+      draft: review,
+      conflicts: [],
+      signature: reviewDraftSignature(review),
+      reason:
+        "The outside update could not be mapped without changing its accepted text.",
+    };
   const ids: Record<string, string> = { ...aliases };
   for (const item of extractRoughdraftReviewIndex(markdown).items) {
     const mapped = aliases[item.id] ?? item.id;
@@ -303,7 +367,8 @@ function mergeDisk(
   }
   const draft: SyncDraft = {
     ...merged.draft,
-    cleanMarkdown: cleanRevisionSourceMarkdown(merged.draft.markdown),
+    markdown: mergedMarkdown,
+    cleanMarkdown: prose.draft.markdown,
     diskOrigin: {
       path: diskBase.path,
       signature: contentSignature(markdown),
@@ -564,13 +629,44 @@ function adoptDisk(
     comments,
     {
       frontmatter: parsedIncoming.frontmatter,
-      endmatter: parsedIncoming.endmatter,
+      endmatter:
+        comparisonMarkdown === undefined
+          ? parsedIncoming.endmatter
+          : splitYamlDocumentMetadata(
+              withDocumentMetadata(base.markdown, documentMetadata(markdown)),
+            ).endmatter,
     },
   );
-  const sourceReview =
-    createSourceSpellingPreserver(base.markdown, canonicalOriginal)(review) ??
-    review;
-  const clean = cleanRevisionDocument(parsedIncoming.doc.toJSON());
+  const clean = acceptedSpelling(expected.doc, markdown);
+  const oldSpelling = createSourceSpellingPreserver(
+    base.markdown,
+    canonicalOriginal,
+  )(review);
+  let sourceReview = oldSpelling;
+  if (comparisonMarkdown === undefined) sourceReview ??= review;
+  else if (
+    sourceReview === null ||
+    !provesReviewSpelling(
+      sourceReview,
+      review,
+      transaction.doc,
+      state,
+      markdown,
+    )
+  ) {
+    sourceReview = createSourceSpellingPreserver(markdown, clean)(review);
+    if (
+      sourceReview === null ||
+      !provesReviewSpelling(
+        sourceReview,
+        review,
+        transaction.doc,
+        state,
+        markdown,
+      )
+    )
+      return null;
+  }
   const preserved =
     createSourceSpellingPreserver(markdown, clean)(clean) ?? clean;
   return {
@@ -581,6 +677,52 @@ function adoptDisk(
     outdatedSuggestions: outdated,
     reviewed: base.reviewed,
   };
+}
+
+function acceptedSpelling(doc: Node, markdown: string) {
+  return cleanRevisionDocument({
+    ...doc.toJSON(),
+    attrs: { ...doc.attrs, sourceMetadata: documentMetadata(markdown) },
+  });
+}
+
+function provesAcceptedSpelling(review: string, clean: string, schema: Schema) {
+  const state = EditorState.create({ schema });
+  const parsed = parseRemoteRevision(review, state);
+  const accepted = projectAcceptedDocument(parsed.doc).doc;
+  return new RevisionCanonicalSpellingProof().matches(
+    clean,
+    acceptedSpelling(accepted, review),
+    accepted,
+    state,
+  );
+}
+
+function provesReviewSpelling(
+  candidate: string,
+  canonical: string,
+  doc: Node,
+  state: EditorState,
+  prose: string,
+) {
+  if (
+    !sameMetadata(documentMetadata(candidate), documentMetadata(prose)) ||
+    !new RevisionSpellingProof().matchesFile(candidate, canonical, doc, state)
+  )
+    return false;
+  const comments = (markdown: string) =>
+    [...parseRemoteRevision(markdown, state).comments.values()]
+      .map((comment) => ({
+        id: comment.id,
+        content: comment.content,
+        parent: comment.parentCommentId ?? null,
+        authorType: comment.authorType ?? null,
+        authorId: comment.authorId ?? null,
+      }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+  return (
+    JSON.stringify(comments(candidate)) === JSON.stringify(comments(canonical))
+  );
 }
 
 function applyMappedSteps(
