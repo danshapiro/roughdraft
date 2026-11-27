@@ -1038,7 +1038,11 @@ function matchFence(
   fence: FenceState | null,
 ): { fence: FenceState } | null {
   const lineEnd = nextLineOffset(markdown, offset);
-  let line = markdown.slice(offset, lineEnd).replace(/\r?\n$/, "");
+  let line = markdown.slice(offset, lineEnd);
+  // Ordinary prose cannot open or close a fence. Avoid constructing container
+  // and fence expressions for every unchanged reading line in every scan.
+  if (!line.includes("`") && !line.includes("~")) return null;
+  line = line.replace(/\r?\n$/, "");
   let containerIndent = 0;
   let quoteDepth = 0;
   while (true) {
