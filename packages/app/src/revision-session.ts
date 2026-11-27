@@ -75,6 +75,12 @@ export interface RevisionRemoteAdapter {
     force?: boolean,
     diskBase?: RevisionDiskBase,
   ): RevisionDraft | RevisionDiskMerge | null;
+  adoptAsync?(
+    base: RevisionDraft,
+    markdown: string,
+    force?: boolean,
+    diskBase?: RevisionDiskBase,
+  ): Promise<RevisionDraft | RevisionDiskMerge | null>;
   readUiDrafts(): Record<string, unknown>;
   restoreUiDrafts(drafts: Record<string, unknown>): void;
   flush?(): void;
@@ -119,6 +125,12 @@ interface CheckpointEpisode {
   protectedUi: boolean;
   coveragePending: boolean;
   coveredGeneration?: number;
+}
+interface DiskAdoptionEntry {
+  inputs: unknown[];
+  generation: number;
+  ready: boolean;
+  outcome: Promise<{ result: RevisionDiskMerge | null } | { error: unknown }>;
 }
 export interface BrowserRecovery {
   version: 2;
@@ -373,12 +385,17 @@ export class RevisionSessionController {
   private checkpointRecoveryId: string | undefined;
   private checkpointEpisode: CheckpointEpisode | undefined;
   private diskProjections = new Map<string, string>();
-  private diskAdoption: {
-    inputs: unknown[];
-    outcome: { result: RevisionDiskMerge | null } | { error: unknown };
-  } | null = null;
+  private diskAdoption: DiskAdoptionEntry | null = null;
+  private diskAdoptionVariants = new Map<string, DiskAdoptionEntry>();
+  private diskAdoptionGeneration = 0;
+  private latestDiskAdoptionInputs: unknown[] | null = null;
+  private latestDiskAdoptionState: SyncState<ComparisonReviewData> | null =
+    null;
+  private latestDiskAdoptionRevision = -1;
+  private diskAdoptionWork: Promise<void> = Promise.resolve();
   private reflectedDisk: {
     path: string;
+    inputs: unknown[];
     baseSignature: string;
     draft: RevisionDraft;
   } | null = null;
@@ -1092,7 +1109,13 @@ export class RevisionSessionController {
           operationContext: notice.operationContext,
         };
       if (notice.reason === "heartbeat") return;
-      if (notice.state) void this.observe(notice.state);
+      if (notice.state)
+        void this.observe(notice.state).catch((error) => {
+          if (!this.stopped && this.snapshot.session.id === reviewId)
+            this.emit({
+              recoveryError: `Updates are temporarily unavailable. Your work remains in this tab. ${errorMessage(error)}`,
+            });
+        });
       else void this.refresh();
     });
   }
@@ -1115,7 +1138,8 @@ export class RevisionSessionController {
     this.refreshPromise = null;
     this.refreshReviewId = null;
     this.refreshRequested = false;
-    this.diskAdoption = null;
+    this.invalidateDiskAdoption();
+    this.latestDiskAdoptionInputs = null;
     this.unsubscribe?.();
     this.unsubscribe = null;
     this.unsubscribeUi?.();
@@ -1137,7 +1161,8 @@ export class RevisionSessionController {
   }
   setAdapter = (adapter: RevisionRemoteAdapter | null) => {
     this.unsubscribeUi?.();
-    this.diskAdoption = null;
+    this.invalidateDiskAdoption();
+    this.latestDiskAdoptionInputs = null;
     this.adapter = adapter;
     if (!adapter) this.projectionReady = false;
     this.unsubscribeUi =
@@ -1409,6 +1434,7 @@ export class RevisionSessionController {
       return this.refreshPromise;
     }
     this.refreshRequested = false;
+    const observedInputs = this.latestDiskAdoptionInputs;
     const current = () =>
       !this.stopped &&
       this.snapshot.session.id === reviewId &&
@@ -1421,6 +1447,17 @@ export class RevisionSessionController {
           force ? undefined : this.state?.registryGeneration,
         );
         if (!current()) return;
+        // Disk versions are opaque. A notice received during this read can be
+        // newer even at the same review revision; confirm with a fresh read.
+        if (
+          state &&
+          this.latestDiskAdoptionInputs !== observedInputs &&
+          this.latestDiskAdoptionState &&
+          this.latestDiskAdoptionState.revision >= state.revision
+        ) {
+          this.refreshRequested = true;
+          return;
+        }
         if (state) await this.observe(state);
         if (!current()) return;
         if (this.operation)
@@ -1753,14 +1790,87 @@ export class RevisionSessionController {
             ""),
     );
   }
-  private incomingFor(
+  private invalidateDiskAdoption() {
+    this.diskAdoption = null;
+    this.diskAdoptionVariants.clear();
+    this.diskAdoptionGeneration++;
+  }
+  private diskAdoptionInputs(
     state: SyncState<ComparisonReviewData>,
     force = false,
     resolution?: "local" | "incoming",
-  ): RevisionDiskMerge | null {
+  ) {
+    return [
+      this.adapter,
+      this.adapter?.adopt,
+      this.adapter?.adoptAsync,
+      state.review.id,
+      state.revision,
+      state.signature,
+      state.draft.markdown,
+      state.draft.cleanMarkdown,
+      state.review.savedText,
+      state.disk?.path,
+      state.disk?.version,
+      state.disk?.hash,
+      state.disk?.text,
+      force,
+      resolution,
+    ];
+  }
+  private noteDiskAdoptionState(state: SyncState<ComparisonReviewData>) {
+    if (
+      this.stopped ||
+      state.review.id !== this.snapshot.session.id ||
+      state.revision < this.latestDiskAdoptionRevision
+    )
+      return false;
+    this.latestDiskAdoptionRevision = state.revision;
+    this.latestDiskAdoptionState = state;
+    const inputs = this.diskAdoptionInputs(state).slice(0, -2);
+    if (
+      !inputs.every(
+        (value, index) => value === this.latestDiskAdoptionInputs?.[index],
+      )
+    ) {
+      this.latestDiskAdoptionInputs = inputs;
+      this.invalidateDiskAdoption();
+    }
+    return true;
+  }
+  private resumeLatestDiskAdoption() {
+    if (
+      !this.latestDiskAdoptionInputs ||
+      !this.latestDiskAdoptionState ||
+      this.stopped ||
+      this.snapshot.copyLocked
+    )
+      return;
+    this.retainIncoming(this.latestDiskAdoptionState);
+    this.resumeIncoming();
+  }
+  private diskAdoptionStateMatches(state: SyncState<ComparisonReviewData>) {
+    return (
+      !this.stopped &&
+      state.review.id === this.snapshot.session.id &&
+      this.diskAdoptionInputs(state)
+        .slice(0, -2)
+        .every(
+          (value, index) => value === this.latestDiskAdoptionInputs?.[index],
+        )
+    );
+  }
+  private async incomingFor(
+    state: SyncState<ComparisonReviewData>,
+    force = false,
+    resolution?: "local" | "incoming",
+  ): Promise<RevisionDiskMerge | null | undefined> {
+    if (this.stopped || state.review.id !== this.snapshot.session.id)
+      return undefined;
+    if (!this.diskAdoptionStateMatches(state)) return undefined;
     const disk = state.disk;
     if (!disk || disk.text === null || disk.text === state.review.savedText) {
-      this.diskAdoption = null;
+      this.invalidateDiskAdoption();
       return {
         status: "merged",
         draft: state.draft,
@@ -1768,35 +1878,24 @@ export class RevisionSessionController {
         signature: state.signature,
       };
     }
+    const source = disk.text;
     // Checkpoint notices and newer local typing do not change this pure input.
-    // Keep one result, including refusals, while editor application retries on
+    // Keep bounded force/choice outcomes while editor application retries on
     // every observation. Real source/review changes or explicit Retry recompute.
-    const inputs = [
-      this.adapter,
-      this.adapter?.adopt,
-      state.review.id,
-      state.revision,
-      state.signature,
-      state.draft.markdown,
-      state.draft.cleanMarkdown,
-      state.review.savedText,
-      disk.path,
-      disk.version,
-      disk.hash,
-      disk.text,
-      force,
-      resolution,
-    ];
-    let cached = this.diskAdoption;
+    const inputs = this.diskAdoptionInputs(state, force, resolution);
+    // Six force/choice variants at most, all for the same authoritative source.
+    const variant = `${force}:${resolution ?? "default"}`;
+    let cached = this.diskAdoptionVariants.get(variant);
     if (
       !cached ||
       !inputs.every((value, index) => value === cached?.inputs[index])
     ) {
-      try {
-        const adopted =
-          this.adapter?.adopt(
+      const adapter = this.adapter;
+      const compute = async () => {
+        try {
+          const args: Parameters<RevisionRemoteAdapter["adopt"]> = [
             state.draft as RevisionDraft,
-            disk.text,
+            source,
             force,
             typeof state.review.savedText === "string"
               ? {
@@ -1805,29 +1904,89 @@ export class RevisionSessionController {
                   resolution,
                 }
               : undefined,
-          ) ?? null;
-        const result: RevisionDiskMerge | null = !adopted
-          ? null
-          : "status" in adopted
-            ? adopted
-            : {
-                status: "merged",
-                draft: adopted,
-                conflicts: [],
-                signature: reviewDraftSignature(adopted),
-                diskCleanMarkdown: adopted.cleanMarkdown,
-              };
-        cached = { inputs, outcome: { result } };
-      } catch (error) {
-        cached = { inputs, outcome: { error } };
-      }
+          ];
+          const adopted =
+            (adapter?.adoptAsync
+              ? await adapter.adoptAsync(...args)
+              : adapter?.adopt(...args)) ?? null;
+          const result: RevisionDiskMerge | null = !adopted
+            ? null
+            : "status" in adopted
+              ? adopted
+              : {
+                  status: "merged",
+                  draft: adopted,
+                  conflicts: [],
+                  signature: reviewDraftSignature(adopted),
+                  diskCleanMarkdown: adopted.cleanMarkdown,
+                };
+          return { result };
+        } catch (error) {
+          return { error };
+        }
+      };
+      let entry: DiskAdoptionEntry | null = null;
+      const generation = this.diskAdoptionGeneration;
+      const outcome = adapter?.adoptAsync
+        ? this.diskAdoptionWork.then(() =>
+            this.diskAdoptionGeneration === generation &&
+            this.diskAdoptionStateMatches(state)
+              ? compute()
+              : { result: null },
+          )
+        : compute();
+      entry = { inputs, generation, outcome, ready: false };
+      cached = entry;
       this.diskAdoption = cached;
+      this.diskAdoptionVariants.set(variant, cached);
+      void outcome.then(() => {
+        if (entry) entry.ready = true;
+      });
+      if (adapter?.adoptAsync) this.diskAdoptionWork = outcome.then(() => {});
     }
-    if ("error" in cached.outcome) throw cached.outcome.error;
-    const result = cached.outcome.result;
+    this.diskAdoption = cached;
+    const outcome = await cached.outcome;
+    // A later source/adapter/copy can supersede a cooperative parse while it yields.
+    if (
+      this.diskAdoptionGeneration !== cached.generation ||
+      !this.diskAdoptionStateMatches(state)
+    ) {
+      this.resumeLatestDiskAdoption();
+      return undefined;
+    }
+    if ("error" in outcome) throw outcome.error;
+    const result = outcome.result;
     if (result?.status === "merged")
       this.rememberDiskProjection(state, result.diskCleanMarkdown);
     return result;
+  }
+  /** Save retries start preparation without holding the mutation queue open. */
+  private async preparedIncomingFor(
+    state: SyncState<ComparisonReviewData>,
+    force = false,
+    resolution?: "local" | "incoming",
+  ) {
+    if (!this.noteDiskAdoptionState(state)) {
+      this.resumeLatestDiskAdoption();
+      return undefined;
+    }
+    const preparing = this.incomingFor(state, force, resolution);
+    if (
+      this.adapter?.adoptAsync &&
+      this.diskAdoption &&
+      !this.diskAdoption.ready
+    ) {
+      this.retainIncoming(state);
+      void preparing.then(
+        () => this.resumeLatestDiskAdoption(),
+        (error) => {
+          if (this.diskAdoptionStateMatches(state))
+            this.emit({ recoveryError: errorMessage(error) });
+        },
+      );
+      return undefined;
+    }
+    return preparing;
   }
   private incomingMergeBase(state: SyncState<ComparisonReviewData>) {
     return this.reflectedDisk &&
@@ -1835,6 +1994,25 @@ export class RevisionSessionController {
       this.reflectedDisk.baseSignature === reviewDraftSignature(this.base)
       ? this.reflectedDisk.draft
       : this.base;
+  }
+  private reflectedDiskMatches(state: SyncState<ComparisonReviewData>) {
+    const inputs = this.diskAdoptionInputs(state);
+    return Boolean(
+      this.reflectedDisk &&
+        this.reflectedDisk.path === state.disk?.path &&
+        this.reflectedDisk.baseSignature === reviewDraftSignature(this.base) &&
+        this.reflectedDisk.inputs.every(
+          (value, index) => value === inputs[index],
+        ),
+    );
+  }
+  private diskSourceReady(state: SyncState<ComparisonReviewData>) {
+    return (
+      !state.disk ||
+      state.disk.text === null ||
+      state.disk.text === state.review.savedText ||
+      this.reflectedDiskMatches(state)
+    );
   }
   private rememberReflectedDisk(
     state: SyncState<ComparisonReviewData>,
@@ -1844,6 +2022,7 @@ export class RevisionSessionController {
       state.disk && state.disk.text !== state.review.savedText
         ? {
             path: state.disk.path,
+            inputs: this.diskAdoptionInputs(state).slice(0, -2),
             baseSignature: reviewDraftSignature(this.base),
             draft: incoming,
           }
@@ -1891,6 +2070,7 @@ export class RevisionSessionController {
       return true;
     };
     if (stale()) return;
+    if (!this.noteDiskAdoptionState(state)) return;
     this.confirmCheckpointResolution(state);
     if (
       !state.publishing &&
@@ -1946,9 +2126,31 @@ export class RevisionSessionController {
       this.retainIncoming(state);
       return;
     }
+    const prepareOutsideQueue = Boolean(
+      this.adapter?.adoptAsync &&
+        (!state.disk || state.disk.availability === "available"),
+    );
+    const prepared = prepareOutsideQueue
+      ? await this.incomingFor(state)
+      : undefined;
+    if (
+      prepareOutsideQueue &&
+      (prepared === undefined || !this.diskAdoptionStateMatches(state))
+    )
+      return;
     await this.serialize(async () => {
       if (state.review.id !== this.snapshot.session.id) return;
       if (stale()) return;
+      if (!this.diskAdoptionStateMatches(state)) return;
+      // An operation can begin while preparation yields outside this queue.
+      if (
+        this.operation ||
+        (this.copyOperation &&
+          this.activeOperations.has(this.copyOperation.operation.operationId))
+      ) {
+        this.retainIncoming(state);
+        return;
+      }
       const previousState = this.state;
       this.state = state;
       if (
@@ -1967,7 +2169,11 @@ export class RevisionSessionController {
         );
         return;
       }
-      const adoption = this.incomingFor(state);
+      const adoption = prepareOutsideQueue
+        ? prepared
+        : await this.incomingFor(state);
+      if (adoption === undefined || !this.diskAdoptionStateMatches(state))
+        return;
       const incoming =
         adoption?.status === "merged"
           ? (adoption.draft as RevisionDraft)
@@ -2052,6 +2258,7 @@ export class RevisionSessionController {
           server: false,
         },
       );
+      if (!this.diskAdoptionStateMatches(state)) return;
       if (merged.status !== "merged") {
         this.wait(
           merged.status === "conflict" ? "conflict" : "waiting",
@@ -2395,6 +2602,23 @@ export class RevisionSessionController {
         ? state.revision
         : this.baseRevision;
       const generation = preparedAttempt?.generation ?? this.generation;
+      // The queue is free while disk preparation runs. A retry's newer CAS
+      // version alone must not acknowledge prose that has not reached the editor.
+      if (
+        this.adapter?.adoptAsync &&
+        !preparedAttempt &&
+        reason !== "resolve" &&
+        !this.diskSourceReady(state)
+      ) {
+        void this.preparedIncomingFor(state).then(
+          () => this.resumeLatestDiskAdoption(),
+          (error) => {
+            if (this.diskAdoptionStateMatches(state))
+              this.emit({ recoveryError: errorMessage(error) });
+          },
+        );
+        return false;
+      }
       const identity = this.operationIdentity();
       const adoptedDisk = Boolean(
         state.disk &&
@@ -2514,7 +2738,12 @@ export class RevisionSessionController {
           result.state
         ) {
           if (result.status === "base-unavailable") includeBase = true;
-          let adoption = this.incomingFor(result.state);
+          let adoption = await this.preparedIncomingFor(result.state);
+          if (
+            adoption === undefined ||
+            !this.diskAdoptionStateMatches(result.state)
+          )
+            return false;
           // Inspect the disk-versus-review conflict before applying a previous
           // choice. A newer overlapping disk value requires a new confirmation,
           // just like a changed conflict in the subsequent local merge.
@@ -2528,7 +2757,16 @@ export class RevisionSessionController {
               );
               return false;
             }
-            adoption = this.incomingFor(result.state, false, resolution.choice);
+            adoption = await this.preparedIncomingFor(
+              result.state,
+              false,
+              resolution.choice,
+            );
+            if (
+              adoption === undefined ||
+              !this.diskAdoptionStateMatches(result.state)
+            )
+              return false;
           }
           const incoming =
             adoption?.status === "merged"
@@ -2551,6 +2789,7 @@ export class RevisionSessionController {
           const check = await this.merge(mergeBase, localBase, incoming, {
             server: false,
           });
+          if (!this.diskAdoptionStateMatches(result.state)) return false;
           if (
             resolution &&
             check.status === "conflict" &&
@@ -2570,6 +2809,7 @@ export class RevisionSessionController {
                 resolution: resolution.choice,
               })
             : check;
+          if (!this.diskAdoptionStateMatches(result.state)) return false;
           if (merged.status !== "merged") {
             this.wait(
               merged.status === "conflict" ? "conflict" : "waiting",
@@ -2798,102 +3038,135 @@ export class RevisionSessionController {
   resolveConflict = async (
     choice: "local" | "incoming",
     inspectedSignature: string,
-  ) =>
-    this.serialize(async () => {
-      this.adapter?.flush?.();
-      const conflict = this.snapshot.conflict;
-      if (!conflict || conflict.kind !== "conflict") return false;
-      const ownResult =
-        this.operation &&
-        conflict.state?.review.lastOperation?.id ===
-          this.operation.operation.operationId
-          ? this.operation
-          : null;
-      const resolutionBase =
-        ownResult?.editorBase ?? ownResult?.draft ?? this.base;
-      if (conflict.signature !== inspectedSignature)
-        throw new Error(
-          "The overlapping changes changed. Inspect the refreshed comparison before confirming.",
-        );
-      await this.checkpoint(true);
-      if (!this.snapshot.conflict?.checkpointSaved)
-        throw new Error(
-          "Recovery must finish before replacing overlapping changes.",
-        );
-      const fresh = await this.api<SyncState<ComparisonReviewData>>(
-        `/${encodeURIComponent(this.snapshot.session.id)}/state`,
+  ) => {
+    this.adapter?.flush?.();
+    const conflict = this.snapshot.conflict;
+    if (!conflict || conflict.kind !== "conflict") return false;
+    const inspectionCurrent = () =>
+      this.snapshot.conflict?.kind === "conflict" &&
+      this.snapshot.conflict.signature === inspectedSignature;
+    const ownResult =
+      this.operation &&
+      conflict.state?.review.lastOperation?.id ===
+        this.operation.operation.operationId
+        ? this.operation
+        : null;
+    const resolutionBase =
+      ownResult?.editorBase ?? ownResult?.draft ?? this.base;
+    if (conflict.signature !== inspectedSignature)
+      throw new Error(
+        "The overlapping changes changed. Inspect the refreshed comparison before confirming.",
       );
-      if (!fresh) return false;
-      const adoption = this.incomingFor(fresh);
-      if (!adoption || adoption.status === "client-merge-required") {
-        this.wait(
-          "waiting",
-          "The outside file update is waiting for safe mapping.",
-          fresh,
-        );
-        return false;
-      }
-      const check =
-        adoption.status === "conflict"
-          ? adoption
-          : await this.merge(resolutionBase, this.current, adoption.draft, {
-              server: false,
-            });
+    await this.checkpoint(true);
+    if (!inspectionCurrent()) return false;
+    if (!this.snapshot.conflict?.checkpointSaved)
+      throw new Error(
+        "Recovery must finish before replacing overlapping changes.",
+      );
+    const generation = this.generation;
+    const uiSignature = JSON.stringify(this.adapter?.readUiDrafts() ?? {});
+    const fresh = await this.api<SyncState<ComparisonReviewData>>(
+      `/${encodeURIComponent(this.snapshot.session.id)}/state`,
+    );
+    if (!fresh) return false;
+    if (!this.noteDiskAdoptionState(fresh)) {
+      this.resumeLatestDiskAdoption();
+      return false;
+    }
+    const adoption = await this.incomingFor(fresh);
+    if (adoption === undefined || !this.diskAdoptionStateMatches(fresh))
+      return false;
+    if (!inspectionCurrent()) return false;
+    if (!adoption || adoption.status === "client-merge-required") {
+      this.wait(
+        "waiting",
+        "The outside file update is waiting for safe mapping.",
+        fresh,
+      );
+      return false;
+    }
+    const check =
+      adoption.status === "conflict"
+        ? adoption
+        : await this.merge(resolutionBase, this.current, adoption.draft, {
+            server: false,
+          });
+    if (!this.diskAdoptionStateMatches(fresh) || !inspectionCurrent())
+      return false;
+    if (check.status === "conflict" && check.signature !== inspectedSignature) {
+      this.state = fresh;
+      this.wait(
+        "conflict",
+        "The overlapping changes changed. Please inspect them again.",
+        fresh,
+        check,
+      );
+      return false;
+    }
+    const resolvedAdoption =
+      adoption.status === "conflict"
+        ? await this.incomingFor(fresh, false, choice)
+        : adoption;
+    if (
+      !this.diskAdoptionStateMatches(fresh) ||
+      !inspectionCurrent() ||
+      !resolvedAdoption ||
+      resolvedAdoption.status !== "merged"
+    )
+      return false;
+    const incoming = resolvedAdoption.draft as RevisionDraft;
+    // Checkpoint the outside side before applying the user's choice. In an
+    // Overwrite, the resolved candidate already contains the user's wording.
+    const incomingVersion =
+      adoption.status === "conflict" && choice === "local"
+        ? await this.incomingFor(fresh, false, "incoming")
+        : resolvedAdoption;
+    if (incomingVersion === undefined || !this.diskAdoptionStateMatches(fresh))
+      return false;
+    if (!inspectionCurrent()) return false;
+    if (!incomingVersion || incomingVersion.status !== "merged") {
+      this.wait(
+        "waiting",
+        "The incoming recovery copy is waiting for safe mapping.",
+        fresh,
+        incomingVersion ?? undefined,
+      );
+      return false;
+    }
+    const incomingCheckpoint = await this.api<{ checkpointId: string }>(
+      `/${encodeURIComponent(this.snapshot.session.id)}/checkpoint`,
+      {
+        operationId: randomId(),
+        pageInstanceId: this.pageId,
+        conflictId: `${inspectedSignature}:incoming`,
+        recoveryId: `${this.checkpointRecoveryId ?? randomId()}:incoming`,
+        generation: fresh.revision,
+        workingDraft: incomingVersion.draft,
+        reason: "Incoming version before conflict resolution",
+      },
+    );
+    if (!inspectionCurrent() || !this.diskAdoptionStateMatches(fresh))
+      return false;
+    if (!incomingCheckpoint)
+      throw new Error(
+        "The incoming recovery copy must be saved before replacing overlapping changes.",
+      );
+    if (!this.diskAdoptionStateMatches(fresh)) return false;
+    return this.serialize(async () => {
       if (
-        check.status === "conflict" &&
-        check.signature !== inspectedSignature
+        !this.diskAdoptionStateMatches(fresh) ||
+        this.snapshot.conflict?.signature !== inspectedSignature ||
+        generation !== this.generation ||
+        uiSignature !== JSON.stringify(this.adapter?.readUiDrafts() ?? {})
       ) {
-        this.state = fresh;
-        this.wait(
-          "conflict",
-          "The overlapping changes changed. Please inspect them again.",
-          fresh,
-          check,
-        );
+        this.resumeLatestDiskAdoption();
         return false;
       }
-      const resolvedAdoption =
-        adoption.status === "conflict"
-          ? this.incomingFor(fresh, false, choice)
-          : adoption;
-      if (!resolvedAdoption || resolvedAdoption.status !== "merged")
-        return false;
-      const incoming = resolvedAdoption.draft as RevisionDraft;
-      // Checkpoint the outside side before applying the user's choice. In an
-      // Overwrite, the resolved candidate already contains the user's wording.
-      const incomingVersion =
-        adoption.status === "conflict" && choice === "local"
-          ? this.incomingFor(fresh, false, "incoming")
-          : resolvedAdoption;
-      if (!incomingVersion || incomingVersion.status !== "merged") {
-        this.wait(
-          "waiting",
-          "The incoming recovery copy is waiting for safe mapping.",
-          fresh,
-          incomingVersion ?? undefined,
-        );
-        return false;
-      }
-      const incomingCheckpoint = await this.api<{ checkpointId: string }>(
-        `/${encodeURIComponent(this.snapshot.session.id)}/checkpoint`,
-        {
-          operationId: randomId(),
-          pageInstanceId: this.pageId,
-          conflictId: `${inspectedSignature}:incoming`,
-          recoveryId: `${this.checkpointRecoveryId ?? randomId()}:incoming`,
-          generation: fresh.revision,
-          workingDraft: incomingVersion.draft,
-          reason: "Incoming version before conflict resolution",
-        },
-      );
-      if (!incomingCheckpoint)
-        throw new Error(
-          "The incoming recovery copy must be saved before replacing overlapping changes.",
-        );
       const merged = await this.merge(resolutionBase, this.current, incoming, {
         server: false,
         resolution: choice,
       });
+      if (!this.diskAdoptionStateMatches(fresh)) return false;
       if (merged.status !== "merged") return false;
       this.state = fresh;
       if (
@@ -2931,31 +3204,64 @@ export class RevisionSessionController {
       if (!result) this.emit({ writePaused: true });
       return result;
     });
-  reloadFromFile = async () =>
-    this.serialize(async () => {
-      this.adapter?.flush?.();
-      if (
-        !this.snapshot.conflict?.reloadAvailable ||
-        !sameReviewDraft(this.current, this.base)
-      )
-        throw new Error(
-          "New local edits need review before reloading the file.",
-        );
-      await this.checkpoint(true);
-      if (!this.snapshot.conflict?.checkpointSaved)
-        throw new Error("Recovery must finish before reloading the file.");
-      const fresh = await this.api<SyncState<ComparisonReviewData>>(
-        `/${encodeURIComponent(this.snapshot.session.id)}/state`,
+  };
+  reloadFromFile = async () => {
+    this.adapter?.flush?.();
+    const generation = this.generation;
+    const uiSignature = JSON.stringify(this.adapter?.readUiDrafts() ?? {});
+    if (
+      !this.snapshot.conflict?.reloadAvailable ||
+      !sameReviewDraft(this.current, this.base)
+    )
+      throw new Error("New local edits need review before reloading the file.");
+    await this.checkpoint(true);
+    if (!this.snapshot.conflict?.checkpointSaved)
+      throw new Error("Recovery must finish before reloading the file.");
+    const fresh = await this.api<SyncState<ComparisonReviewData>>(
+      `/${encodeURIComponent(this.snapshot.session.id)}/state`,
+    );
+    if (!fresh || fresh.disk?.availability !== "available")
+      throw new Error(
+        "The latest file is unavailable. Your review remains here.",
       );
-      if (!fresh || fresh.disk?.availability !== "available")
-        throw new Error(
-          "The latest file is unavailable. Your review remains here.",
+    if (!this.noteDiskAdoptionState(fresh)) {
+      this.resumeLatestDiskAdoption();
+      return false;
+    }
+    const adoption = await this.incomingFor(fresh, true, "incoming");
+    if (adoption === undefined || !this.diskAdoptionStateMatches(fresh))
+      return false;
+    if (
+      generation !== this.generation ||
+      uiSignature !== JSON.stringify(this.adapter?.readUiDrafts() ?? {}) ||
+      !sameReviewDraft(this.current, this.base)
+    ) {
+      this.wait(
+        "waiting",
+        "You edited while the file was loading. Your new edits remain here. Retry the update or save separately.",
+        fresh,
+      );
+      return false;
+    }
+    const incoming =
+      adoption?.status === "merged" ? (adoption.draft as RevisionDraft) : null;
+    return this.serialize(async () => {
+      if (!this.diskAdoptionStateMatches(fresh)) {
+        this.resumeLatestDiskAdoption();
+        return false;
+      }
+      if (
+        generation !== this.generation ||
+        uiSignature !== JSON.stringify(this.adapter?.readUiDrafts() ?? {}) ||
+        !sameReviewDraft(this.current, this.base)
+      ) {
+        this.wait(
+          "waiting",
+          "You edited while the file was loading. Your new edits remain here. Retry the update or save separately.",
+          fresh,
         );
-      const adoption = this.incomingFor(fresh, true, "incoming");
-      const incoming =
-        adoption?.status === "merged"
-          ? (adoption.draft as RevisionDraft)
-          : null;
+        return false;
+      }
       if (
         !incoming ||
         !(await this.applyDraft(incoming, adoption ?? undefined, fresh))
@@ -2964,6 +3270,7 @@ export class RevisionSessionController {
       this.state = fresh;
       this.base = fresh.draft as RevisionDraft;
       this.baseRevision = fresh.revision;
+      this.rememberReflectedDisk(fresh, incoming);
       this.emit({
         writePaused: false,
         conflict: null,
@@ -2972,6 +3279,7 @@ export class RevisionSessionController {
       });
       return this.commit("adopt");
     });
+  };
   recreateFile = (expectedPath: string) =>
     this.serialize(async () => {
       this.adapter?.flush?.();
@@ -3052,7 +3360,8 @@ export class RevisionSessionController {
     return !recoveredState.publishing;
   };
   retry = async () => {
-    this.diskAdoption = null;
+    this.invalidateDiskAdoption();
+    this.latestDiskAdoptionInputs = null;
     this.emit({ recoveryError: "" });
     if (this.operation && !(await this.resolvePending())) return false;
     this.emit({ writePaused: false, conflict: null });
@@ -3113,6 +3422,8 @@ export class RevisionSessionController {
   };
   setCopyLocked = (locked: boolean) => this.emit({ copyLocked: locked });
   copy = async (path: string, relativeLinksAcknowledged: boolean) => {
+    this.invalidateDiskAdoption();
+    this.latestDiskAdoptionInputs = null;
     this.adapter?.flush?.();
     if (!this.state) await this.refresh(true);
     if (!this.state)
@@ -3207,6 +3518,10 @@ export class RevisionSessionController {
   ) {
     const state = result.state;
     if (!state) return;
+    this.invalidateDiskAdoption();
+    this.latestDiskAdoptionInputs = null;
+    this.latestDiskAdoptionState = null;
+    this.latestDiskAdoptionRevision = -1;
     const oldKey = this.key();
     // An uncertain ordinary publication still belongs to the original review.
     // Preserve its recovery there before switching to the independently saved copy.
@@ -3280,14 +3595,35 @@ export class RevisionSessionController {
       if (!this.state) await this.refresh(true);
       if (this.snapshot.writePaused)
         throw new Error("Resolve the waiting update before sending feedback.");
-      const sent = await this.serialize(async () => {
-        if (this.operation && !(await this.resolvePending())) return false;
-        return this.commit(
-          "send",
-          undefined,
-          (fields as { comment?: string })?.comment,
-        );
-      });
+      const reviewId = this.snapshot.session.id;
+      const send = () =>
+        this.serialize(async () => {
+          if (this.operation && !(await this.resolvePending())) return false;
+          return this.commit(
+            "send",
+            undefined,
+            (fields as { comment?: string })?.comment,
+          );
+        });
+      let sent = await send();
+      while (
+        !sent &&
+        !this.stopped &&
+        this.snapshot.session.id === reviewId &&
+        !this.snapshot.writePaused
+      ) {
+        const pending = this.diskAdoption;
+        if (
+          !pending ||
+          (pending.ready && this.state && this.diskSourceReady(this.state))
+        )
+          break;
+        await pending.outcome;
+        if (this.stopped || this.snapshot.session.id !== reviewId) break;
+        await this.refresh(true);
+        if (this.snapshot.writePaused) break;
+        sent = await send();
+      }
       if (!sent)
         throw new Error(
           "Feedback has not been sent yet. Resolve the waiting update or retry; your review is preserved.",

@@ -91,7 +91,10 @@ import {
   remapCommentHistory,
   restoreCommentHistory,
 } from "./revision-comment-history";
-import { adoptRevisionDisk } from "./revision-disk-adoption";
+import {
+  adoptRevisionDisk,
+  adoptRevisionDiskAsync,
+} from "./revision-disk-adoption";
 import { equalRevisionDraft } from "./revision-draft";
 import {
   recordReviewedChange,
@@ -112,7 +115,7 @@ import {
   withDocumentMetadata,
 } from "./revision-metadata";
 import { outcomeDocument } from "./revision-outcomes";
-import { measureRevision } from "./revision-performance";
+import { measureRevision, measureRevisionAsync } from "./revision-performance";
 import {
   type RevisionView,
   useRevisionPreferences,
@@ -781,6 +784,17 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
       adopt: (base, markdown, force, diskBase) =>
         measureRevision("disk-adoption", () =>
           adoptRevisionDisk(
+            base,
+            markdown,
+            editor.schema,
+            force,
+            diskBase,
+            editor.state.doc,
+          ),
+        ),
+      adoptAsync: (base, markdown, force, diskBase) =>
+        measureRevisionAsync("disk-adoption", () =>
+          adoptRevisionDiskAsync(
             base,
             markdown,
             editor.schema,

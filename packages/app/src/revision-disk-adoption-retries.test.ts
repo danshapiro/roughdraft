@@ -36,7 +36,13 @@ const draft = (markdown: string): RevisionDraft => ({
   decisions: {},
   reviewComments: [],
 });
-async function fixture(evaluate: RevisionRemoteAdapter["adopt"] = () => null) {
+type AsyncAdoption = (
+  ...args: Parameters<RevisionRemoteAdapter["adopt"]>
+) => Promise<ReturnType<RevisionRemoteAdapter["adopt"]>>;
+async function fixture(
+  evaluate: RevisionRemoteAdapter["adopt"] = () => null,
+  evaluateAsync?: AsyncAdoption,
+) {
   const initial = draft(original);
   let server: SyncState<ComparisonReviewData> = {
     review: {
@@ -81,19 +87,59 @@ async function fixture(evaluate: RevisionRemoteAdapter["adopt"] = () => null) {
     },
   };
   let holdApply = false;
+  let indeterminate = false;
+  let uiDrafts: Record<string, unknown> = {};
+  let heldRead: Promise<SyncState<ComparisonReviewData>> | null = null;
   const evaluated = vi.fn(evaluate);
+  const evaluatedAsync = evaluateAsync ? vi.fn(evaluateAsync) : undefined;
   const applied = vi.fn((value: RevisionDraft) =>
     holdApply && value.markdown.includes("outside") ? null : value,
   );
   const posts: ReconcileRequest[] = [];
+  const checkpoints: object[] = [];
   const controller = new RevisionSessionController(server.review, initial, {
     request: async <T>(route: string, body?: object) => {
-      if (!body) return structuredClone(server) as T;
-      if (route.endsWith("/checkpoint"))
+      if (!body) {
+        const held = heldRead;
+        heldRead = null;
+        return (held ? await held : structuredClone(server)) as T;
+      }
+      if (route.endsWith("/checkpoint")) {
+        checkpoints.push(structuredClone(body));
         return { checkpointId: "recovery-copy" } as T;
-      if (!route.endsWith("/reconcile")) throw new Error(`Unexpected ${route}`);
-      const request = body as ReconcileRequest;
+      }
+      if (route.endsWith("/copy")) {
+        const copy = body as { workingDraft: RevisionDraft; path: string };
+        return {
+          status: "committed",
+          savedPath: copy.path,
+          state: {
+            ...structuredClone(server),
+            draft: copy.workingDraft,
+            review: {
+              ...structuredClone(server.review),
+              id: "separate-review",
+              savedPath: copy.path,
+              destinationPath: copy.path,
+              savedText: copy.workingDraft.cleanMarkdown,
+            },
+          },
+        } as T;
+      }
+      if (!route.endsWith("/reconcile") && !route.endsWith("/send"))
+        throw new Error(`Unexpected ${route}`);
+      const request = {
+        ...body,
+        ...(route.endsWith("/send") ? { reason: "send" } : {}),
+      } as ReconcileRequest;
       posts.push(structuredClone(request));
+      if (indeterminate)
+        return { status: "indeterminate", state: structuredClone(server) } as T;
+      if (request.expectedDisk?.version !== server.disk?.version)
+        return {
+          status: "incoming-changed",
+          state: structuredClone(server),
+        } as T;
       server = {
         ...server,
         draft: request.draft,
@@ -141,7 +187,8 @@ async function fixture(evaluate: RevisionRemoteAdapter["adopt"] = () => null) {
   const adapter = (): RevisionRemoteAdapter => ({
     apply: applied,
     adopt: evaluated,
-    readUiDrafts: () => ({}),
+    ...(evaluatedAsync ? { adoptAsync: evaluatedAsync } : {}),
+    readUiDrafts: () => uiDrafts,
     restoreUiDrafts: () => {},
   });
   controller.setAdapter(adapter());
@@ -187,14 +234,30 @@ async function fixture(evaluate: RevisionRemoteAdapter["adopt"] = () => null) {
   return {
     controller,
     evaluated,
+    evaluatedAsync,
     applied,
     posts,
+    checkpoints,
     publish,
     changedDisk,
     registryNotice,
     adapter,
     blockApply: (value: boolean) => {
       holdApply = value;
+    },
+    setUiDrafts: (value: Record<string, unknown>) => {
+      uiDrafts = value;
+    },
+    indeterminateSaves: () => {
+      indeterminate = true;
+    },
+    state: () => structuredClone(server),
+    notice: async (value: typeof server) => {
+      notifications.get("review")?.({ reason: "changed", state: value });
+      await vi.advanceTimersByTimeAsync(0);
+    },
+    holdRead: (value: Promise<typeof server>) => {
+      heldRead = value;
     },
   };
 }
@@ -229,6 +292,238 @@ test.each([
   expect(f.evaluated).toHaveBeenCalledTimes(1);
   expect(f.controller.readDraft().markdown.match(/typing/g)).toHaveLength(7);
   expect(f.controller.getSnapshot().writePaused).toBe(true);
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+
+test("async adoption deduplicates in-flight checkpoint notices and merges typing received while it yields", async () => {
+  const pending = deferred<RevisionDraft | null>();
+  const f = await fixture(
+    () => null,
+    () => pending.promise,
+  );
+  await f.changedDisk();
+  for (let index = 2; index <= 4; index++) await f.registryNotice(index);
+  f.controller.updateDraft((current) => ({
+    ...current,
+    markdown: current.markdown.replace(
+      "First owner: ready.",
+      "First owner: newer typing.",
+    ),
+    cleanMarkdown: current.cleanMarkdown?.replace(
+      "First owner: ready.",
+      "First owner: newer typing.",
+    ),
+  }));
+  expect(f.evaluatedAsync).toHaveBeenCalledTimes(1);
+  expect(f.evaluated).not.toHaveBeenCalled();
+  pending.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.controller.readDraft().markdown).toContain(
+    "First owner: newer typing.",
+  );
+  expect(f.controller.readDraft().markdown).toContain("Last owner: outside.");
+  expect(f.controller.getSnapshot().conflict).toBeNull();
+});
+
+test.each([
+  "disk",
+  "review",
+  "binding",
+] as const)("a newer authoritative %s update supersedes an in-flight result without displaying or saving the stale text", async (changed) => {
+  const first = deferred<RevisionDraft | null>();
+  const second = deferred<RevisionDraft | null>();
+  let count = 0;
+  const f = await fixture(
+    () => null,
+    () => (++count === 1 ? first.promise : second.promise),
+  );
+  await f.changedDisk();
+  const latest = outside.replace("outside.", "newer outside.");
+  await f.publish((current) => {
+    if (!current.disk) throw new Error("Expected source");
+    if (changed === "disk")
+      current.disk = { ...current.disk, text: latest, version: "3", hash: "3" };
+    if (changed === "binding")
+      current.disk = { ...current.disk, path: "/moved.md" };
+    if (changed === "review") {
+      current.revision++;
+      current.review.revision++;
+      current.draft = draft(
+        original.replace("First owner: ready.", "First owner: peer update."),
+      );
+      current.signature = reviewDraftSignature(current.draft);
+    }
+    return current;
+  });
+  first.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(
+    f.applied.mock.calls.some(([value]) => value.markdown === outside),
+  ).toBe(false);
+  expect(f.posts.some((body) => body.draft.markdown === outside)).toBe(false);
+  expect(f.evaluatedAsync).toHaveBeenCalledTimes(2);
+  second.resolve(draft(latest));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.controller.readDraft().markdown).toContain("newer outside.");
+  expect(f.controller.getSnapshot().conflict).toBeNull();
+});
+
+test("replacing an adapter discards its unfinished async evaluation", async () => {
+  const first = deferred<RevisionDraft | null>();
+  const second = deferred<RevisionDraft | null>();
+  let count = 0;
+  const f = await fixture(
+    () => null,
+    () => (++count === 1 ? first.promise : second.promise),
+  );
+  await f.changedDisk();
+  f.controller.setAdapter(f.adapter());
+  await vi.advanceTimersByTimeAsync(0);
+  first.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(
+    f.applied.mock.calls.some(([value]) => value.markdown === outside),
+  ).toBe(false);
+  second.resolve(draft(outside.replace("outside.", "replacement adapter.")));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.controller.readDraft().markdown).toContain("replacement adapter.");
+});
+
+test("Save separately captures the current draft without applying an unfinished disk result to either review", async () => {
+  const pending = deferred<RevisionDraft | null>();
+  const f = await fixture(
+    () => null,
+    () => pending.promise,
+  );
+  await f.changedDisk();
+  const copying = f.controller.copy("/separate.md", true);
+  expect(f.evaluatedAsync).toHaveBeenCalledTimes(1);
+  pending.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect((await copying).status).toBe("committed");
+  expect(f.controller.getSnapshot().session.id).toBe("separate-review");
+  expect(f.controller.readDraft().markdown).toBe(original);
+  expect(
+    f.applied.mock.calls.some(([value]) => value.markdown === outside),
+  ).toBe(false);
+  expect(f.posts).toEqual([]);
+});
+
+test("Save separately completes while the async disk parser is still unresolved", async () => {
+  const pending = deferred<RevisionDraft | null>();
+  const f = await fixture(
+    () => null,
+    () => pending.promise,
+  );
+  await f.changedDisk();
+  let copied = false;
+  const copying = f.controller.copy("/separate.md", true).then((result) => {
+    copied = true;
+    return result;
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(copied).toBe(true);
+  expect((await copying).status).toBe("committed");
+  expect(f.controller.getSnapshot().session.id).toBe("separate-review");
+  pending.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.controller.readDraft().markdown).toBe(original);
+});
+
+test("a newer recovery checkpoint can save while explicit Reload is still awaiting its parser", async () => {
+  const pending = deferred<RevisionDraft | null>();
+  const f = await fixture(
+    () => null,
+    (_base, _text, force) => (force ? pending.promise : Promise.resolve(null)),
+  );
+  await f.changedDisk();
+  const reloading = f.controller.reloadFromFile();
+  await vi.advanceTimersByTimeAsync(0);
+  const before = f.checkpoints.length;
+  f.controller.updateDraft(() =>
+    draft(original.replace("ready.", "private new edit.")),
+  );
+  let flushed = false;
+  const saving = f.controller.flush(false).then((value) => {
+    flushed = true;
+    return value;
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(flushed).toBe(true);
+  expect(f.checkpoints.length).toBeGreaterThan(before);
+  pending.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  await saving;
+  expect(await reloading).toBe(false);
+  expect(f.controller.readDraft().markdown).toContain("private new edit.");
+});
+
+test("explicit Reload does not overwrite a new local edit made during asynchronous source parsing", async () => {
+  const pending = deferred<RevisionDraft | null>();
+  const f = await fixture(
+    () => null,
+    (_base, _text, force) => (force ? pending.promise : Promise.resolve(null)),
+  );
+  await f.changedDisk();
+  await vi.advanceTimersByTimeAsync(0);
+  const reloading = f.controller.reloadFromFile();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(
+    f.evaluatedAsync?.mock.calls.some(
+      (call) => call[2] === true && call[3]?.resolution === "incoming",
+    ),
+  ).toBe(true);
+  f.controller.updateDraft((current) => ({
+    ...current,
+    markdown: current.markdown.replace("ready.", "my newer input."),
+    cleanMarkdown: current.cleanMarkdown?.replace("ready.", "my newer input."),
+  }));
+  pending.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(await reloading).toBe(false);
+  expect(f.controller.readDraft().markdown).toContain("my newer input.");
+  expect(f.controller.getSnapshot().writePaused).toBe(true);
+  expect(f.posts).toEqual([]);
+});
+
+test("an async parser error is cached until explicit Retry without falling back to synchronous parsing", async () => {
+  let attempts = 0;
+  const f = await fixture(
+    () => {
+      throw new Error("No synchronous fallback");
+    },
+    async () => {
+      attempts++;
+      throw new Error("Async parser unavailable");
+    },
+  );
+  await f.publish(
+    (current) => ({
+      ...current,
+      disk: current.disk
+        ? { ...current.disk, text: outside, version: "2", hash: "2" }
+        : null,
+    }),
+    false,
+  );
+  await f.controller.refresh(true);
+  await f.controller.refresh(true);
+  expect(attempts).toBe(1);
+  expect(f.controller.getSnapshot().recoveryError).toContain(
+    "Async parser unavailable",
+  );
+  await f.controller.retry();
+  expect(attempts).toBe(2);
+  expect(f.evaluated).not.toHaveBeenCalled();
 });
 
 test("a cached successful adoption still retries editor application after composition ends and preserves local typing", async () => {
@@ -322,16 +617,24 @@ test("explicit Retry reevaluates the same waiting source", async () => {
   expect(f.evaluated).toHaveBeenCalledTimes(2);
 });
 
-test("explicit Reload evaluates its force and incoming choice instead of reusing automatic refusal", async () => {
-  const f = await fixture((_base, text, force) => (force ? draft(text) : null));
-  await f.changedDisk();
-  await f.registryNotice(2);
-  expect(await f.controller.reloadFromFile()).toBe(true);
-  expect(f.evaluated).toHaveBeenCalledTimes(2);
-  expect(f.evaluated.mock.calls[1]?.[2]).toBe(true);
-  expect(f.evaluated.mock.calls[1]?.[3]?.resolution).toBe("incoming");
-  expect(f.controller.readDraft().markdown).toBe(outside);
-});
+for (const asynchronous of [false, true])
+  test(`explicit Reload evaluates its force and incoming choice instead of reusing automatic refusal (async: ${asynchronous})`, async () => {
+    const evaluate: RevisionRemoteAdapter["adopt"] = (_base, text, force) =>
+      force ? draft(text) : null;
+    const f = await fixture(
+      asynchronous ? () => null : evaluate,
+      asynchronous ? async (...args) => evaluate(...args) : undefined,
+    );
+    const evaluated = asynchronous ? f.evaluatedAsync : f.evaluated;
+    await f.changedDisk();
+    await f.registryNotice(2);
+    expect(await f.controller.reloadFromFile()).toBe(true);
+    expect(evaluated).toHaveBeenCalledTimes(2);
+    expect(evaluated?.mock.calls[1]?.[2]).toBe(true);
+    expect(evaluated?.mock.calls[1]?.[3]?.resolution).toBe("incoming");
+    expect(f.controller.readDraft().markdown).toBe(outside);
+    expect(f.posts.some((request) => request.reason === "adopt")).toBe(true);
+  });
 
 test("an evaluator error remains visible without rerunning expensive work on every refresh, and Retry reevaluates it", async () => {
   const f = await fixture(() => {
@@ -355,10 +658,239 @@ test("an evaluator error remains visible without rerunning expensive work on eve
   expect(f.evaluated).toHaveBeenCalledTimes(2);
 });
 
+for (const asynchronous of [false, true])
+  test.each([
+    "local",
+    "incoming",
+  ] as const)(`the explicit %s conflict choice evaluates that resolution and preserves its chosen text (async: ${asynchronous})`, async (choice) => {
+    const peer = original.replace(
+      "First owner: ready.",
+      "First owner: browser wording.",
+    );
+    const disk = original.replace(
+      "First owner: ready.",
+      "First owner: outside wording.",
+    );
+    const evaluate: RevisionRemoteAdapter["adopt"] = (
+      base,
+      markdown,
+      _force,
+      diskBase,
+    ) => ({
+      ...mergeReviewDrafts(draft(original), base, draft(markdown), {
+        server: false,
+        budgetMs: 1000,
+        resolution: diskBase?.resolution,
+      }),
+      diskCleanMarkdown: markdown,
+    });
+    const f = await fixture(
+      asynchronous ? () => null : evaluate,
+      asynchronous ? async (...args) => evaluate(...args) : undefined,
+    );
+    const evaluated = asynchronous ? f.evaluatedAsync : f.evaluated;
+    await f.publish((current) => ({
+      ...current,
+      draft: draft(peer),
+      signature: reviewDraftSignature(draft(peer)),
+      disk: current.disk
+        ? { ...current.disk, text: disk, version: "2", hash: "2" }
+        : null,
+    }));
+    await f.registryNotice(2);
+    expect(evaluated).toHaveBeenCalledTimes(1);
+    const conflict = f.controller.getSnapshot().conflict;
+    if (!conflict || conflict.kind !== "conflict")
+      throw new Error("Expected a genuine overlap");
+    expect(await f.controller.resolveConflict(choice, conflict.signature)).toBe(
+      true,
+    );
+    expect(
+      evaluated?.mock.calls.some((call) => call[3]?.resolution === choice),
+    ).toBe(true);
+    expect(f.controller.readDraft().markdown).toBe(
+      choice === "local" ? peer : disk,
+    );
+  });
+
+test("Retry during an unfinished async adoption discards its old result and completes without a deadlock", async () => {
+  const first = deferred<RevisionDraft | null>();
+  const second = deferred<RevisionDraft | null>();
+  let count = 0;
+  const f = await fixture(
+    () => null,
+    () => (++count === 1 ? first.promise : second.promise),
+  );
+  await f.changedDisk();
+  const retrying = f.controller.retry();
+  await vi.advanceTimersByTimeAsync(0);
+  first.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(
+    f.applied.mock.calls.some(([value]) => value.markdown === outside),
+  ).toBe(false);
+  expect(f.evaluatedAsync).toHaveBeenCalledTimes(2);
+  second.resolve(null);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(await retrying).toBe(false);
+  expect(f.controller.readDraft().markdown).toBe(original);
+  expect(f.controller.getSnapshot().writePaused).toBe(true);
+});
+
+test("an older review notice cannot replace a newer review already being prepared", async () => {
+  const pending = deferred<RevisionDraft | null>();
+  const f = await fixture(
+    () => null,
+    () => pending.promise,
+  );
+  await f.publish((current) => ({
+    ...current,
+    revision: 3,
+    review: { ...current.review, revision: 3 },
+    disk: current.disk
+      ? { ...current.disk, text: outside, version: "3", hash: "3" }
+      : null,
+  }));
+  const older = f.state();
+  older.revision = older.review.revision = 2;
+  older.disk = older.disk
+    ? { ...older.disk, text: "Stale source.", version: "2", hash: "2" }
+    : null;
+  await f.notice(older);
+  pending.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.evaluatedAsync).toHaveBeenCalledTimes(1);
+  expect(f.controller.readDraft().markdown).toBe(outside);
+});
+
+test("explicit Reload protects private UI edits even when the adapter has no UI change subscription", async () => {
+  const pending = deferred<RevisionDraft | null>();
+  const f = await fixture(
+    () => null,
+    (_base, _text, force) => (force ? pending.promise : Promise.resolve(null)),
+  );
+  await f.changedDisk();
+  const reloading = f.controller.reloadFromFile();
+  await vi.advanceTimersByTimeAsync(0);
+  const ui = {
+    comments: {
+      c1: { value: "My private newer comment", original: "", editing: true },
+    },
+  };
+  f.setUiDrafts(ui);
+  pending.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(await reloading).toBe(false);
+  expect(f.controller.readDraft().markdown).toBe(original);
+  expect(f.checkpoints).toEqual(
+    expect.arrayContaining([expect.objectContaining({ uiDrafts: ui })]),
+  );
+});
+
+test("a pending own publication created during preparation keeps the incoming result off its baseline", async () => {
+  const pending = deferred<RevisionDraft | null>();
+  const f = await fixture(
+    () => null,
+    () => pending.promise,
+  );
+  await f.changedDisk();
+  const local = original.replace(
+    "First owner: ready.",
+    "First owner: unpublished typing.",
+  );
+  f.controller.updateDraft(() => draft(local));
+  f.indeterminateSaves();
+  expect(await f.controller.flush(false)).toBe(false);
+  pending.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.controller.readDraft().markdown).toBe(local);
+  expect(
+    f.applied.mock.calls.some(([value]) => value.markdown.includes("outside")),
+  ).toBe(false);
+  expect(f.controller.getSnapshot().conflict?.kind).toBe("indeterminate");
+});
+
+test("Send waits outside the queue and preserves its original feedback through asynchronous adoption", async () => {
+  const pending = deferred<RevisionDraft | null>();
+  const f = await fixture(
+    () => null,
+    () => pending.promise,
+  );
+  await f.changedDisk();
+  f.controller.updateDraft(() =>
+    draft(
+      original.replace("First owner: ready.", "First owner: my feedback edit."),
+    ),
+  );
+  let completed = false;
+  const sending = f.controller
+    .run("send", f.controller.readDraft(), {
+      comment: "Send this complete feedback to the agent.",
+    })
+    .then((value) => {
+      completed = true;
+      return value;
+    });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(completed).toBe(false);
+  pending.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect((await sending).id).toBe("review");
+  const sent = f.posts.filter((item) => item.reason === "send").at(-1);
+  expect(sent?.comment).toBe("Send this complete feedback to the agent.");
+  expect(sent?.draft.markdown).toContain("First owner: my feedback edit.");
+  expect(sent?.draft.markdown).toContain("Last owner: outside.");
+});
+
+test("a delayed state read cannot roll back a same-revision disk notice received while that read was in flight", async () => {
+  const parsing = deferred<RevisionDraft | null>();
+  const read = deferred<SyncState<ComparisonReviewData>>();
+  const f = await fixture(
+    () => null,
+    () => parsing.promise,
+  );
+  const older = f.state();
+  f.holdRead(read.promise);
+  const refreshing = f.controller.refresh(true);
+  await vi.advanceTimersByTimeAsync(0);
+  await f.changedDisk();
+  read.resolve(older);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.evaluatedAsync).toHaveBeenCalledTimes(1);
+  expect(f.posts).toEqual([]);
+  parsing.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  await refreshing;
+  expect(f.controller.readDraft().markdown).toBe(outside);
+  expect(f.evaluatedAsync).toHaveBeenCalledTimes(1);
+});
+
+test("repeated autosaves cannot acknowledge unreflected disk prose while async preparation is unfinished", async () => {
+  const parsing = deferred<RevisionDraft | null>();
+  const f = await fixture(
+    () => null,
+    () => parsing.promise,
+  );
+  await f.changedDisk();
+  f.controller.updateDraft(() =>
+    draft(original.replace("First owner: ready.", "First owner: my typing.")),
+  );
+  await f.controller.flush(false);
+  await f.controller.flush(false);
+  expect(f.posts.filter((item) => item.reason === "adopt")).toEqual([]);
+  parsing.resolve(draft(outside));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(f.controller.readDraft().markdown).toContain(
+    "First owner: my typing.",
+  );
+  expect(f.controller.readDraft().markdown).toContain("Last owner: outside.");
+});
+
 test.each([
   "local",
   "incoming",
-] as const)("the explicit %s conflict choice evaluates that resolution and preserves its chosen text", async (choice) => {
+] as const)("ordinary refresh during an async %s choice cannot cancel that choice", async (choice) => {
+  const pending = deferred<ReturnType<RevisionRemoteAdapter["adopt"]>>();
   const peer = original.replace(
     "First owner: ready.",
     "First owner: browser wording.",
@@ -367,14 +899,30 @@ test.each([
     "First owner: ready.",
     "First owner: outside wording.",
   );
-  const f = await fixture((base, markdown, _force, diskBase) => ({
-    ...mergeReviewDrafts(draft(original), base, draft(markdown), {
+  const evaluate: RevisionRemoteAdapter["adopt"] = (
+    base,
+    text,
+    _force,
+    diskBase,
+  ) => ({
+    ...mergeReviewDrafts(draft(original), base, draft(text), {
       server: false,
       budgetMs: 1000,
       resolution: diskBase?.resolution,
     }),
-    diskCleanMarkdown: markdown,
-  }));
+    diskCleanMarkdown: text,
+  });
+  let chosen = false;
+  const f = await fixture(
+    () => null,
+    (base, text, force, diskBase) => {
+      if (diskBase?.resolution === choice && !chosen) {
+        chosen = true;
+        return pending.promise;
+      }
+      return Promise.resolve(evaluate(base, text, force, diskBase));
+    },
+  );
   await f.publish((current) => ({
     ...current,
     draft: draft(peer),
@@ -383,18 +931,27 @@ test.each([
       ? { ...current.disk, text: disk, version: "2", hash: "2" }
       : null,
   }));
-  await f.registryNotice(2);
-  expect(f.evaluated).toHaveBeenCalledTimes(1);
   const conflict = f.controller.getSnapshot().conflict;
-  if (!conflict || conflict.kind !== "conflict")
-    throw new Error("Expected a genuine overlap");
-  expect(await f.controller.resolveConflict(choice, conflict.signature)).toBe(
-    true,
+  if (!conflict) throw new Error("Expected overlap");
+  const resolving = f.controller.resolveConflict(choice, conflict.signature);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(chosen).toBe(true);
+  await f.registryNotice(2);
+  pending.resolve(
+    evaluate(draft(peer), disk, false, {
+      path: "/practice.md",
+      markdown: original,
+      resolution: choice,
+    }),
   );
-  expect(
-    f.evaluated.mock.calls.some((call) => call[3]?.resolution === choice),
-  ).toBe(true);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(await resolving).toBe(true);
   expect(f.controller.readDraft().markdown).toBe(
     choice === "local" ? peer : disk,
   );
+  expect(
+    f.evaluatedAsync?.mock.calls.filter(
+      (call) => call[3]?.resolution === undefined,
+    ),
+  ).toHaveLength(1);
 });
