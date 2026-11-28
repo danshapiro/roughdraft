@@ -1,7 +1,9 @@
 import { defineConfig } from "vitest/config";
 import { fileURLToPath, URL } from "node:url";
+import { deferredEntries } from "./deferred-entries";
 
 export default defineConfig({
+  plugins: [deferredEntries()],
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),

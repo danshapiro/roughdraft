@@ -1,8 +1,9 @@
 import { reviewDraftSignature } from "@roughdraft/rfm";
-import { act } from "react";
+import { act, StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { ComparisonReview } from "./ComparisonReview";
+import { preloadComparison } from "./comparison-bootstrap";
 import type { ComparisonReviewData } from "./comparison-types";
 
 // Keep the actual route, unified editor, controller and live transport mounted.
@@ -97,6 +98,59 @@ function review(unified: boolean): ComparisonReviewData {
   };
 }
 
+function syncState(initial: ComparisonReviewData) {
+  if (!initial.draft) throw new Error("Expected a file-backed draft");
+  const draft = { ...initial.draft, reviewComments: [] };
+  return {
+    review: initial,
+    draft,
+    revision: initial.revision,
+    signature: reviewDraftSignature(draft),
+    registryGeneration: "unchanged",
+    disk: {
+      path: initial.targetPath,
+      version: "file-v1",
+      hash: "file-hash",
+      text: draft.markdown,
+      availability: "available",
+    },
+    operationContext: {
+      owner: "test",
+      epoch: "one",
+      acceptUntil: Date.now() + 120_000,
+    },
+  };
+}
+
+test("Strict Mode startup shares the pending authoritative state read", async () => {
+  const initial = review(true);
+  const reads: string[] = [];
+  const finishes: Array<() => void> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string) => {
+      const url = new URL(input, window.location.origin);
+      if (!url.pathname.endsWith("/state")) return Response.json(initial);
+      reads.push(url.pathname);
+      return new Promise<Response>((resolve) =>
+        finishes.push(() => resolve(Response.json(syncState(initial)))),
+      );
+    }),
+  );
+  await act(async () =>
+    root.render(
+      <StrictMode>
+        <ComparisonReview id={initial.id} />
+      </StrictMode>,
+    ),
+  );
+  const count = reads.length;
+  await act(async () => {
+    for (const finish of finishes) finish();
+  });
+  expect(count).toBe(1);
+});
+
 test.each([
   true,
   false,
@@ -139,6 +193,11 @@ test.each([
   await act(async () => root.render(<ComparisonReview id={initial.id} />));
   const fullRequests = () => paths.filter((path) => path === fullReviewPath);
   expect(fullRequests()).toHaveLength(1);
+  if (unified) {
+    expect(paths.filter((path) => path.endsWith("/state"))).toHaveLength(1);
+    await act(async () => window.dispatchEvent(new Event("online")));
+    expect(paths.filter((path) => path.endsWith("/state"))).toHaveLength(2);
+  }
   await act(async () => vi.advanceTimersByTimeAsync(10_000));
   expect(fullRequests()).toHaveLength(unified ? 1 : 3);
   expect(paths.some((path) => path.endsWith("/state"))).toBe(unified);
@@ -147,4 +206,119 @@ test.each([
   await act(async () => vi.advanceTimersByTimeAsync(10_000));
   expect(paths).toHaveLength(requestCount);
   root = createRoot(container);
+});
+
+test("mounting a review in Strict Mode shares its pending initial read", async () => {
+  const initial = review(false);
+  let finish!: (response: Response) => void;
+  const fetcher = vi.fn(
+    () =>
+      new Promise<Response>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  vi.stubGlobal("fetch", fetcher);
+  await act(async () => {
+    root.render(
+      <StrictMode>
+        <ComparisonReview id={initial.id} />
+      </StrictMode>,
+    );
+  });
+  expect(fetcher).toHaveBeenCalledOnce();
+  await act(async () => finish(Response.json(initial)));
+  expect(container.textContent).toContain(initial.targetPath);
+  expect(container.textContent).not.toContain("Loading comparison");
+});
+
+test("consumes the route's completed early read without another request and reads fresh on a later visit", async () => {
+  const initial = review(false);
+  const fetcher = vi.fn(async () => Response.json(initial));
+  vi.stubGlobal("fetch", fetcher);
+  const early = preloadComparison(initial.id);
+  await early;
+  await act(async () =>
+    root.render(<ComparisonReview id={initial.id} initialReview={early} />),
+  );
+  expect(fetcher).toHaveBeenCalledOnce();
+  expect(container.textContent).toContain(initial.targetPath);
+  await act(async () => root.unmount());
+  root = createRoot(container);
+  await act(async () => root.render(<ComparisonReview id={initial.id} />));
+  expect(fetcher).toHaveBeenCalledTimes(2);
+});
+
+test("an older navigation's delayed read cannot replace the current review", async () => {
+  const initial = review(false);
+  const old = { ...initial, id: "old", targetPath: "/practice/old.md" };
+  const current = {
+    ...initial,
+    id: "current",
+    targetPath: "/practice/current.md",
+  };
+  let finishOld!: (response: Response) => void;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string) =>
+      input.endsWith("/old")
+        ? new Promise<Response>((resolve) => {
+            finishOld = resolve;
+          })
+        : Response.json(current),
+    ),
+  );
+  await act(async () => root.render(<ComparisonReview id={old.id} />));
+  await act(async () => root.render(<ComparisonReview id={current.id} />));
+  expect(container.textContent).toContain(current.targetPath);
+  await act(async () => finishOld(Response.json(old)));
+  expect(container.textContent).toContain(current.targetPath);
+  expect(container.textContent).not.toContain(old.targetPath);
+});
+
+test("a failed early read reports its error and does not cache that failure", async () => {
+  const initial = review(false);
+  const fetcher = vi
+    .fn()
+    .mockResolvedValueOnce(
+      Response.json({ error: "Review server unavailable" }, { status: 503 }),
+    )
+    .mockResolvedValueOnce(Response.json(initial));
+  vi.stubGlobal("fetch", fetcher);
+  const early = preloadComparison(initial.id);
+  await expect(early).rejects.toThrow("Review server unavailable");
+  await act(async () =>
+    root.render(<ComparisonReview id={initial.id} initialReview={early} />),
+  );
+  expect(
+    container.querySelector('[data-testid="comparison-page"]')?.textContent,
+  ).toBe("Review server unavailable");
+  await act(async () => root.unmount());
+  root = createRoot(container);
+  await act(async () => root.render(<ComparisonReview id={initial.id} />));
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(container.textContent).toContain(initial.targetPath);
+});
+
+test("a stalled early read is bounded and the next attempt can fetch again", async () => {
+  const initial = review(false);
+  const fetcher = vi
+    .fn()
+    .mockImplementationOnce(
+      (_input: string, options: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          options.signal?.addEventListener("abort", () =>
+            reject(new DOMException("Read timed out", "AbortError")),
+          );
+        }),
+    )
+    .mockResolvedValueOnce(Response.json(initial));
+  vi.stubGlobal("fetch", fetcher);
+  const early = preloadComparison(initial.id);
+  const failure = expect(early).rejects.toThrow("Read timed out");
+  await vi.advanceTimersByTimeAsync(15_000);
+  await failure;
+  const fresh = await preloadComparison(initial.id);
+  expect(fresh).toEqual(initial);
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(vi.getTimerCount()).toBe(0);
 });

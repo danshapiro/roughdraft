@@ -86,7 +86,16 @@ function projectedFragments(doc: Node): ProjectedFragment[] {
 }
 
 export function cleanRevisionNode(doc: Node): string {
-  const body = projectedFragments(doc)
+  const fragments = projectedFragments(doc);
+  const hasFrontmatter =
+    fragments[0]?.nodes[0]?.type.name === "yamlFrontmatter";
+  const frontmatter = hasFrontmatter
+    ? fragments[0].clean
+    : doc.attrs.frontmatterInContent
+      ? ""
+      : (doc.attrs.sourceMetadata?.frontmatter ?? "");
+  const body = fragments
+    .slice(hasFrontmatter ? 1 : 0)
     .map((fragment) => fragment.clean)
     .filter((value) => value.trim())
     .map((value) => value.trimEnd())
@@ -99,7 +108,7 @@ export function cleanRevisionNode(doc: Node): string {
     : "";
   const projected = normalizeBlockSpacing(body ? `${body}\n` : "\n");
   const endmatter = tail.replace(/^\n+/, "");
-  return `${metadata?.frontmatter ?? ""}${projected}${endmatter ? `${projected.endsWith("\n\n") ? "" : "\n"}${endmatter}` : ""}`;
+  return `${frontmatter}${projected}${endmatter ? `${projected.endsWith("\n\n") ? "" : "\n"}${endmatter}` : ""}`;
 }
 
 /** Use the already-parsed model when projecting a source edit; do not parse it again. */

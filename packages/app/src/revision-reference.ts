@@ -1,4 +1,7 @@
 import type { JSONContent } from "@tiptap/core";
+import type { ReviewedChange } from "./comparison-types";
+import { criticFrontmatterToEditorState } from "./critic-markup";
+import { reviewedMetadataIncludesFrontmatter } from "./revision-history";
 import {
   type Fragment,
   type Node as ProseMirrorNode,
@@ -268,9 +271,25 @@ export function createReferenceComparison(
               if (local) localChanges.set(local, detail);
             }
             const { digest, kind, restore } = detail;
-            const pairId = `reference-${oldFrom}-${oldTo}-${digest}`;
+            const oldYamlSize =
+              before.firstChild?.type.name === "yamlFrontmatter"
+                ? before.firstChild.nodeSize
+                : 0;
+            const newYamlSize =
+              after.firstChild?.type.name === "yamlFrontmatter"
+                ? after.firstChild.nodeSize
+                : 0;
+            const yaml = oldFrom < oldYamlSize || newFrom < newYamlSize;
+            // Existing saved body decisions use body-only identity offsets.
+            // Adding editable YAML must not change those durable identities.
+            const oldIdentityFrom = yaml ? oldFrom : oldFrom - oldYamlSize;
+            const oldIdentityTo = yaml ? oldTo : oldTo - oldYamlSize;
+            const newIdentityFrom = yaml ? newFrom : newFrom - newYamlSize;
+            const newIdentityTo = yaml ? newTo : newTo - newYamlSize;
+            const prefix = yaml ? "reference-yaml" : "reference";
+            const pairId = `${prefix}-${oldIdentityFrom}-${oldIdentityTo}-${digest}`;
             const changeId = isOld
-              ? `reference-${newFrom}-${newTo}-${digest}`
+              ? `${prefix}-${newIdentityFrom}-${newIdentityTo}-${digest}`
               : pairId;
             projectedChanges.push({
               item: {
@@ -324,7 +343,37 @@ export function createReferenceComparison(
         overlapsSuggestion,
       };
     });
-    return groupReferenceChanges(current, mapped);
+    const legacyMetadataKept =
+      (current.attrs.kept ?? []).includes("document-metadata") &&
+      (current.attrs.reviewed ?? []).some((entry: ReviewedChange) => {
+        if (
+          entry.stale ||
+          !entry.metadata ||
+          !reviewedMetadataIncludesFrontmatter(entry)
+        )
+          return false;
+        const expected = entry.metadata.after.frontmatter;
+        const yaml =
+          edited.firstChild?.type.name === "yamlFrontmatter"
+            ? edited.firstChild
+            : null;
+        return expected === null
+          ? yaml === null
+          : yaml?.textContent ===
+              current.type.schema.nodeFromJSON(
+                criticFrontmatterToEditorState(expected, null).node,
+              ).textContent;
+      });
+    const yamlEnd =
+      current.firstChild?.type.name === "yamlFrontmatter"
+        ? current.firstChild.nodeSize
+        : 0;
+    return groupReferenceChanges(
+      current,
+      legacyMetadataKept
+        ? mapped.filter((change) => change.to > yamlEnd)
+        : mapped,
+    );
   };
 }
 

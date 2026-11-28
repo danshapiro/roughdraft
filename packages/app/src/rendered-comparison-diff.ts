@@ -29,7 +29,12 @@ type DifferenceObserver = (
   localDifference?: RenderedSourceDifference,
 ) => void;
 
-const TEXT_BLOCKS = new Set(["paragraph", "heading", "codeBlock"]);
+const TEXT_BLOCKS = new Set([
+  "paragraph",
+  "heading",
+  "codeBlock",
+  "yamlFrontmatter",
+]);
 const POSITIONAL_CHILDREN = new Set([
   "bulletList",
   "orderedList",
@@ -67,6 +72,15 @@ function semanticAttributes(
   type: string | undefined,
   attrs: NonNullable<JSONContent["attrs"]> = {},
 ) {
+  if (type === "yamlFrontmatter") {
+    const {
+      lineEnding: _lineEnding,
+      opening: _opening,
+      closing: _closing,
+      ...attributes
+    } = attrs;
+    return attributes;
+  }
   if (type === "endnoteDefinition") {
     const { source: _source, original: _original, ...attributes } = attrs;
     return attributes;

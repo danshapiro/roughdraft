@@ -8,6 +8,7 @@ import {
 import {
   createMarkdownProject,
   removeMarkdownProject,
+  richTextEditor,
   writeProjectFile,
 } from "./helpers";
 
@@ -59,20 +60,25 @@ test("YAML-only changes remain reviewable and reopenable after refresh", async (
     const revised = before.replace("Old", "New");
     const { newPath } = await open(page, request, project, original, revised);
     await expect(page.getByTestId("revision-pending")).toHaveText("1");
-    await expect(page.getByTestId("revision-metadata")).toContainText(
-      "title: Old",
-    );
-    await page.getByTestId("revision-metadata-reject").click();
+    await expect(
+      richTextEditor(page).getByTestId("yaml-frontmatter"),
+    ).toContainText("title: New");
+    await page.getByTestId(/^comment-rail-.*-action-reject$/).click();
     await saved(page);
     expect(fs.readFileSync(newPath, "utf8")).toBe(original);
     await page.reload();
-    await expect(page.getByTestId("revision-metadata")).toHaveCount(0);
+    await expect(
+      richTextEditor(page).getByTestId("yaml-frontmatter"),
+    ).toContainText("title: Old");
+    await expect(page.getByTestId("revision-pending")).toBeEmpty();
     await page.getByTestId("revision-reviewed").click();
     await page.getByTestId("revision-reopen-change").click();
-    await expect(page.getByTestId("revision-metadata")).toBeVisible();
+    await expect(
+      richTextEditor(page).getByTestId("yaml-frontmatter"),
+    ).toBeVisible();
     await saved(page);
     expect(fs.readFileSync(newPath, "utf8")).toBe(revised);
-    await page.getByTestId("revision-metadata-accept").click();
+    await page.getByTestId(/^comment-rail-.*-action-accept$/).click();
     await saved(page);
     await page.reload();
     await expect(page.getByTestId("revision-pending")).toHaveText("");

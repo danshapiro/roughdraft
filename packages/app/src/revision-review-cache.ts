@@ -30,7 +30,11 @@ const skeletons = new WeakMap<object, Skeleton>();
 function info(node: Node): NodeInfo {
   const cached = information.get(node);
   if (cached) return cached;
-  const result: NodeInfo = { ids: new Set(), annotated: false, edge: false };
+  const result: NodeInfo = {
+    ids: new Set(),
+    annotated: node.type.name === "yamlFrontmatter",
+    edge: false,
+  };
   const visit = (child: Node) => {
     if (
       child.type.name === "criticChangeBlock" ||
@@ -178,7 +182,7 @@ export function serializeRevisionNode(
     skeleton.some((node, index) => node !== cache.nodes[index])
   ) {
     cache.markdown = editorStateToCriticMarkdown(
-      doc.type.create(null, skeleton).toJSON(),
+      doc.type.create(doc.attrs, skeleton).toJSON(),
       comments,
       options,
     );

@@ -345,6 +345,16 @@ async function renderPageCard(
 
       await Promise.resolve();
     });
+    if (props.editorViewMode === "code") {
+      await vi.waitFor(async () => {
+        await flushReact();
+        expect(
+          queryByTestId(container, "markdown-code-editor")?.querySelector(
+            ".cm-content",
+          ),
+        ).toBeTruthy();
+      });
+    }
   };
 
   await render();

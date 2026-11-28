@@ -67,14 +67,17 @@ function yaml(prefix: string, source: string, suffix: string): ReviewYaml {
   };
 }
 
-export function splitReviewSource(source: string): ReviewSourceParts {
+export function splitReviewSource(
+  source: string,
+  frontmatterAsText = false,
+): ReviewSourceParts {
   let body = source;
   let frontmatter: ReviewYaml | null = null;
   let endmatter: ReviewYaml | null = null;
   const front = /^(---[ \t]*\r?\n)([\s\S]*?)(^---[ \t]*(?:\r?\n|$))/m.exec(
     body,
   );
-  if (front?.index === 0) {
+  if (front?.index === 0 && !frontmatterAsText) {
     frontmatter = yaml(front[1], front[2], front[3]);
     body = body.slice(front[0].length);
   }

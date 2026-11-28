@@ -80,6 +80,113 @@ describe("durable save outcomes", () => {
     expect(metadata.operations.length).toBeLessThanOrEqual(18);
   });
 
+  it("indexes direct denials with the same exact ACK retention and sequence coverage", () => {
+    operations.begin(identity("unresolved-copy", 10), "review");
+    let acknowledged: string[] = [];
+    for (let sequence = 11; sequence < 32; sequence++) {
+      const id = `denied-${sequence}`;
+      const result = operations.deny(
+        {
+          ...identity(id, sequence),
+          // A caller cannot acknowledge this response before receiving it.
+          acknowledgedOperationIds: [...acknowledged, id],
+        },
+        "review",
+        { status: "retry-later", retryAfter: 100 },
+      );
+      expect(operations.read(id)).toMatchObject({
+        phase: "done",
+        reviewId: "review",
+        result,
+      });
+      acknowledged = [...acknowledged, id].slice(-16);
+    }
+    expect(operations.read("unresolved-copy")?.phase).toBe("running");
+    expect(operations.lost(identity("unresolved-copy", 10))).toBe(false);
+    expect(operations.read("denied-11")).toBeNull();
+    expect(operations.wasPruned("page", 11)).toBe(true);
+    expect(operations.lost(identity("denied-11", 11))).toBe(true);
+    expect(operations.lost(identity("never-received", 32))).toBe(false);
+    expect(operations.lost(identity("another-page", 11, "other"))).toBe(false);
+    const pages = fs
+      .readdirSync(path.join(root, "reviews", "operations"))
+      .filter((name) => name.startsWith("page-"));
+    const metadata = JSON.parse(
+      fs.readFileSync(
+        path.join(root, "reviews", "operations", pages[0]),
+        "utf8",
+      ),
+    );
+    expect(metadata.operations.at(-1)).toEqual({
+      id: "denied-31",
+      sequence: 31,
+    });
+    expect(metadata.pruned).toEqual([[11, 14]]);
+    expect(metadata.operations).toHaveLength(18);
+  });
+
+  it("replays a direct denial if its page write fails and fences the orphan before eventual cleanup", () => {
+    const operation = identity("denied-before-page", 1);
+    const rename = fs.renameSync;
+    const failedPage = vi
+      .spyOn(fs, "renameSync")
+      .mockImplementation((...args: Parameters<typeof fs.renameSync>) => {
+        if (path.basename(String(args[1])).startsWith("page-"))
+          throw Object.assign(new Error("interrupted page write"), {
+            code: "EIO",
+          });
+        rename(...args);
+      });
+    expect(() =>
+      operations.deny(operation, "review", {
+        status: "retry-later",
+        retryAfter: 123,
+      }),
+    ).toThrow("interrupted page write");
+    failedPage.mockRestore();
+    const result = {
+      status: "retry-later",
+      retryAfter: 123,
+      operationId: operation.operationId,
+    };
+    expect(operations.read(operation.operationId)).toMatchObject({
+      operation,
+      reviewId: "review",
+      phase: "done",
+      result,
+    });
+    expect(
+      fs.readdirSync(path.join(root, "reviews", "operations")),
+    ).not.toContainEqual(expect.stringMatching(/^page-/));
+
+    let fencedBeforeRemoval = false;
+    operations = new ComparisonOperations(
+      path.join(root, "reviews"),
+      path.join(root, "process"),
+      (record) => {
+        fencedBeforeRemoval = operations.wasPruned(
+          record.operation.pageInstanceId,
+          record.operation.operationSequence,
+        );
+        return true;
+      },
+    );
+    expect(operations.read(operation.operationId)?.result).toEqual(result);
+    const filename = path.join(
+      root,
+      "reviews",
+      "operations",
+      `${operation.operationId}.json`,
+    );
+    const header = JSON.parse(fs.readFileSync(filename, "utf8"));
+    header.createdAt = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    fs.writeFileSync(filename, JSON.stringify(header));
+    operations.maintenance();
+    expect(fencedBeforeRemoval).toBe(true);
+    expect(operations.read(operation.operationId)).toBeNull();
+    expect(operations.lost(operation)).toBe(true);
+  });
+
   it("does not confuse a missing expected journal with a never-used operation", () => {
     fs.rmSync(path.join(root, "reviews", "operations"), { recursive: true });
     const restarted = new ComparisonOperations(

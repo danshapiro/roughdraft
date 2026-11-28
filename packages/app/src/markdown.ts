@@ -66,12 +66,18 @@ function transformOutsideCode(
 ): string {
   // Marked normalizes CRLF and omits reference definitions from its token list.
   // Use its code boundaries, but always transform slices of the original source.
-  const originalOffsets = [0];
-  for (let offset = 0; offset < markdown.length; offset += 1) {
-    if (markdown[offset] === "\r" && markdown[offset + 1] === "\n") offset += 1;
-    originalOffsets.push(offset + 1);
-  }
-  const normalized = markdown.replace(/\r\n?/g, "\n");
+  // LF positions are already identical to the lexer's. Allocate the mapping
+  // only when normalization can actually change the source's line endings.
+  const originalOffsets = markdown.includes("\r") ? [0] : null;
+  if (originalOffsets)
+    for (let offset = 0; offset < markdown.length; offset += 1) {
+      if (markdown[offset] === "\r" && markdown[offset + 1] === "\n")
+        offset += 1;
+      originalOffsets.push(offset + 1);
+    }
+  const normalized = originalOffsets
+    ? markdown.replace(/\r\n?/g, "\n")
+    : markdown;
   const ranges: Array<{ start: number; end: number }> = [];
   let tokenOffset = 0;
   for (const token of marked.lexer(normalized)) {
@@ -80,14 +86,14 @@ function transformOutsideCode(
     tokenOffset = start + token.raw.length;
     let literalOffset = start;
     marked.walkTokens([token], (nested) => {
-      if (nested.type !== "code" && nested.type !== "codespan") return;
-      if (nested.type === "codespan" && options.inline === false) return;
+      if (nested.type !== "code" && nested.type !== "codespan") return [];
+      if (nested.type === "codespan" && options.inline === false) return [];
       if (
         nested.type === "code" &&
         nested.codeBlockStyle === "indented" &&
         options.indented === false
       )
-        return;
+        return [];
       let literalStart = normalized.indexOf(nested.raw, literalOffset);
       let literalEnd = literalStart + nested.raw.length;
       if (literalStart < 0 || literalEnd > tokenOffset) {
@@ -99,12 +105,13 @@ function transformOutsideCode(
         const match = normalized
           .slice(literalOffset, tokenOffset)
           .match(new RegExp(pattern));
-        if (!match || match.index === undefined) return;
+        if (!match || match.index === undefined) return [];
         literalStart = literalOffset + match.index;
         literalEnd = literalStart + match[0].length;
       }
       ranges.push({ start: literalStart, end: literalEnd });
       literalOffset = literalEnd;
+      return [];
     });
   }
   const transformSlice = (start: number, end: number) => {
@@ -119,8 +126,12 @@ function transformOutsideCode(
   let output = "";
   let sourceOffset = 0;
   for (const range of ranges) {
-    const originalStart = originalOffsets[range.start];
-    const originalEnd = originalOffsets[range.end];
+    const originalStart = originalOffsets
+      ? originalOffsets[range.start]
+      : range.start;
+    const originalEnd = originalOffsets
+      ? originalOffsets[range.end]
+      : range.end;
     output += transformSlice(sourceOffset, originalStart);
     output += markdown.slice(originalStart, originalEnd);
     sourceOffset = originalEnd;
@@ -393,7 +404,7 @@ export function splitYamlDocumentMetadata(
   if (!isRoughdraftReviewEndmatter(candidate)) {
     return { frontmatter, body, endmatter: null };
   }
-  if (!precedingBody.includes("{#")) {
+  if (!precedingBody.includes("{#") && !frontmatter?.includes("{#")) {
     const yamlText = candidate.replace(/^---[ \t]*(?:\r\n|\n)/, "");
     const parsed = parseYaml(yamlText) as Record<string, unknown> | null;
     if (!hasDocumentLevelComment(parsed?.comments)) {

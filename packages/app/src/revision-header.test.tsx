@@ -240,6 +240,12 @@ test("the Markdown icon exposes its action and active state", async () => {
   expect(byId("revision-format")?.getAttribute("aria-label")).toBe(
     "Show formatted document",
   );
+  await vi.waitFor(async () => {
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(byId("revision-markdown")?.querySelector(".cm-editor")).toBeTruthy();
+  });
   const host =
     byId("revision-markdown")?.querySelector<HTMLElement>(".cm-editor");
   expect(host).toBeTruthy();

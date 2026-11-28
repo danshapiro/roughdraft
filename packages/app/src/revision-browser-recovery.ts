@@ -50,19 +50,32 @@ function delta(
   anchor: string,
   name: StringDelta["anchor"],
 ): StringDelta {
+  const chunk = 1024;
+  const shared = Math.min(value.length, anchor.length);
   let prefix = 0;
   if (value === anchor) prefix = value.length;
-  else
+  else {
     while (
-      prefix < value.length &&
-      prefix < anchor.length &&
+      prefix + chunk <= shared &&
+      value.slice(prefix, prefix + chunk) ===
+        anchor.slice(prefix, prefix + chunk)
+    )
+      prefix += chunk;
+    while (
+      prefix < shared &&
       value.charCodeAt(prefix) === anchor.charCodeAt(prefix)
     )
       prefix++;
+  }
   let suffix = 0;
   while (
-    suffix < value.length - prefix &&
-    suffix < anchor.length - prefix &&
+    suffix + chunk <= shared - prefix &&
+    value.slice(value.length - suffix - chunk, value.length - suffix) ===
+      anchor.slice(anchor.length - suffix - chunk, anchor.length - suffix)
+  )
+    suffix += chunk;
+  while (
+    suffix < shared - prefix &&
     value.charCodeAt(value.length - suffix - 1) ===
       anchor.charCodeAt(anchor.length - suffix - 1)
   )

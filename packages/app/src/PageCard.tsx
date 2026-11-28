@@ -1,4 +1,3 @@
-import { EditorView as CodeMirrorView } from "@codemirror/view";
 import { reviewHistoryProposalIds } from "@roughdraft/rfm";
 import { Extension, type JSONContent } from "@tiptap/core";
 import { closeHistory, isHistoryTransaction } from "@tiptap/pm/history";
@@ -70,10 +69,8 @@ import {
 } from "./editor-extensions";
 import { LinkAffordances } from "./LinkAffordances";
 import { cn } from "./lib/utils";
-import {
-  canApplyMarkdownSourceUpdate,
-  MarkdownCodeEditor,
-} from "./MarkdownCodeEditor";
+import { MarkdownCodeEditor } from "./DeferredMarkdownCodeEditor";
+import { markdownSourceGuard } from "./markdown-source-guard";
 import { splitYamlDocumentMetadata, toHtml } from "./markdown";
 import { resolveSuggestionsSource } from "./resolve-suggestion";
 import {
@@ -88,6 +85,7 @@ import {
 } from "./revision-clean-cache";
 import {
   createReviewedChangesPlugin,
+  hydrateReviewedChanges,
   mapRemoteReviewedChanges,
   reviewedChanges,
 } from "./revision-history";
@@ -108,7 +106,10 @@ import {
 } from "./revision-private-anchors";
 import { publicRevisionNode } from "./revision-private-comments";
 import { suggestionPositions } from "./revision-projection";
-import { documentProposalIdentities } from "./revision-proposal-identities";
+import {
+  documentProposalIdentities,
+  literalFrontmatterReviewIds,
+} from "./revision-proposal-identities";
 import { rebaseRemoteMetadata } from "./revision-remote-metadata";
 import {
   parseRemoteRevision,
@@ -565,7 +566,7 @@ function addCommentIdsToAnchor(
 function getDocumentCriticChanges(
   editor: Editor,
 ): Array<Pick<CriticChangeAttrs, "changeId">> {
-  return documentProposalIdentities(editor.state.doc);
+  return documentProposalIdentities(editor.state.doc, true);
 }
 
 function suggestionText(
@@ -944,6 +945,8 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       }),
     [activeDocumentPath, backend, isEditableReview],
   );
+  const previewResolversRef = useRef({ resolveFileUrl, resolveLinkUrl });
+  previewResolversRef.current = { resolveFileUrl, resolveLinkUrl };
 
   const parsedContent = useMemo(
     () =>
@@ -1228,7 +1231,17 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const editor = useEditor(
     {
       extensions: [
-        ...createEditorExtensions("Start writing..."),
+        ...createEditorExtensions(
+          "Start writing...",
+          isEditableReview || isControlled
+            ? {
+                resolveFileUrl: (path) =>
+                  previewResolversRef.current.resolveFileUrl(path),
+                resolveLinkUrl: (path) =>
+                  previewResolversRef.current.resolveLinkUrl(path),
+              }
+            : undefined,
+        ),
         ...(isEditableReview ? [ReviewDecisions, RevisionSource] : []),
       ],
       content:
@@ -1237,8 +1250,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           ? {
               ...parsedContent.doc,
               attrs: {
+                ...parsedContent.doc.attrs,
                 kept: editableReview.decisions,
-                reviewed: editableReview.reviewed ?? [],
+                reviewed: hydrateReviewedChanges(
+                  parsedContent.doc,
+                  editableReview.reviewed ?? [],
+                ),
                 sourceMetadata: {
                   markdown: sourceMarkdown,
                   sourceSpelling: sourceMarkdown,
@@ -2114,7 +2131,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         active instanceof HTMLElement ? active.closest(".cm-editor") : null;
       const source =
         sourceHost instanceof HTMLElement
-          ? CodeMirrorView.findFromDOM(sourceHost)
+          ? markdownSourceGuard(sourceHost)
           : null;
       if (
         options?.idRemap &&
@@ -2243,7 +2260,10 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           ),
         );
         const incomingDoc = parsed.doc.type.create(
-          { ...parsed.doc.attrs, reviewed: draft.reviewed ?? [] },
+          {
+            ...parsed.doc.attrs,
+            reviewed: hydrateReviewedChanges(parsed.doc, draft.reviewed ?? []),
+          },
           parsed.doc.content,
         );
         if (
@@ -2310,7 +2330,10 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
             transaction,
           ).map((change) => [change.id, change]),
         );
-        const history = (draft.reviewed ?? []).map((change) => {
+        const history = hydrateReviewedChanges(
+          parsed.doc,
+          draft.reviewed ?? [],
+        ).map((change) => {
           const local = localHistory.get(change.id);
           if (local && local.decision === change.decision) return local;
           const origin = change.originSignature
@@ -2395,7 +2418,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
               nextPrivateIds,
             ))
           : draft.markdown;
-        if (source && !canApplyMarkdownSourceUpdate(source, nextMarkdown))
+        if (source && !source.canApplyUpdate(nextMarkdown))
           return blocked("source-composing");
         transaction
           .setDocAttribute("kept", Object.keys(draft.decisions))
@@ -2972,7 +2995,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     const comment = createCriticComment(
       editableReviewRef.current ? { id: createPrivateCommentId() } : undefined,
       {
-        existingComments: commentsRef.current.values(),
+        existingComments: [
+          ...commentsRef.current.values(),
+          ...literalFrontmatterReviewIds(currentEditor.state.doc).map((id) => ({
+            id,
+          })),
+        ],
       },
     );
     const anchor = capturePrivateCommentAnchor(
@@ -3191,7 +3219,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
             : {}),
         },
         {
-          existingComments: commentsRef.current.values(),
+          existingComments: [
+            ...commentsRef.current.values(),
+            ...literalFrontmatterReviewIds(currentEditor.state.doc).map(
+              (id) => ({ id }),
+            ),
+          ],
         },
       );
       suppressNextMarkdownUpdateRef.current = true;
@@ -3377,7 +3410,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
             : {}),
         },
         {
-          existingComments: commentsRef.current.values(),
+          existingComments: [
+            ...commentsRef.current.values(),
+            ...literalFrontmatterReviewIds(currentEditor.state.doc).map(
+              (id) => ({ id }),
+            ),
+          ],
         },
       );
       suppressNextMarkdownUpdateRef.current = true;

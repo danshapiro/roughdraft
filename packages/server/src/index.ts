@@ -14,6 +14,7 @@ import express, {
   type Request,
   type Response,
 } from "express";
+import { jsonCompression } from "./json-compression.js";
 import { atomicWrite, FileChangedError } from "./atomic-write.js";
 import { comparisonRouter } from "./comparisons.js";
 import { logServerEvent } from "./diagnostics.js";
@@ -29,6 +30,7 @@ import {
 } from "./network.js";
 import { ReviewEventQueue } from "./review-events.js";
 import { resolveUpdateStatus } from "./update-status.js";
+import { staticAssets } from "./static-assets.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const staticDir = path.resolve(__dirname, "../../app/dist");
@@ -494,6 +496,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       ? options.remoteDocumentToken
       : null;
   const app = express();
+  app.use("/api", jsonCompression());
   const openRequestClients = new Set<OpenRequestClient>();
   const reviewEvents = new ReviewEventQueue();
   const remoteSessions = new Map<string, RemoteSession>();
@@ -1438,12 +1441,14 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         }
         res
           .type("html")
+          .set("Cache-Control", "no-cache")
           .send(html.replace(/<head>/i, `<head><base href="${base}">`));
       },
     );
   };
   app.get(["/", "/index.html"], sendIndex);
-  app.use(express.static(staticDirPath, { index: false }));
+  app.use(staticAssets(staticDirPath));
+  app.use("/assets", (_request, response) => response.sendStatus(404));
   app.get("/{*splat}", sendIndex);
 
   return {

@@ -16,6 +16,29 @@ export const noteKey = (label: string) =>
 export const noteId = (label: string) =>
   `endnote-${Array.from(noteKey(label), (c) => c.codePointAt(0)?.toString(16)).join("-")}`;
 
+function definitionStart(source: string) {
+  // Marked asks about every remaining suffix. Native candidate search avoids
+  // running a multiline regex through all ordinary prose for each paragraph.
+  for (
+    let at = source.indexOf("[^");
+    at >= 0;
+    at = source.indexOf("[^", at + 2)
+  ) {
+    let line = at;
+    while (line > 0 && at - line < 3 && source[line - 1] === " ") line--;
+    if (
+      line > 0 &&
+      source[line - 1] !== "\n" &&
+      source[line - 1] !== "\r" &&
+      source[line - 1] !== "\u2028" &&
+      source[line - 1] !== "\u2029"
+    )
+      continue;
+    if (/^\[\^[^\]\r\n]+\]:/.test(source.slice(at))) return line;
+  }
+  return -1;
+}
+
 // A caller parsing a display projection can retain the full-document numbering.
 export function endnoteExtension(
   numbers = new Map<string, number>(),
@@ -36,7 +59,7 @@ export function endnoteExtension(
       {
         name: "endnoteDefinition",
         level: "block",
-        start: (src: string) => src.search(/^ {0,3}\[\^[^\]\r\n]+\]:/m),
+        start: definitionStart,
         tokenizer(this: TokenizerThis, src: string) {
           const first =
             /^ {0,3}\[\^([^\]\r\n]+)\]:[ \t]*([^\r\n]*)(?:\r?\n|$)/.exec(src);

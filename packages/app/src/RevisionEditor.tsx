@@ -65,7 +65,7 @@ import {
   criticChangeHighlightPluginKey,
   explicitReviewEdit,
 } from "./editor-extensions";
-import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
+import { MarkdownCodeEditor } from "./DeferredMarkdownCodeEditor";
 import {
   type DocumentInteractionMode,
   RichTextEditorSurface,
@@ -848,10 +848,10 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
         );
         const publicCurrent = publicRevisionNode(current, privateIds);
         const metadata = documentMetadata(markdown);
-        const metadataChanged = !sameMetadata(
-          metadata,
-          documentMetadata(exactClean.current),
-        );
+        const previousMetadata = documentMetadata(exactClean.current);
+        const metadataChanged = current.attrs.frontmatterInContent
+          ? metadata.endmatter !== previousMetadata.endmatter
+          : !sameMetadata(metadata, previousMetadata);
         const canonicalClean = measureRevision("accepted-cache", () =>
           cleanRevisionNode(current),
         );
@@ -908,7 +908,14 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
             cleanMarkdown = preserved;
         }
         if (metadataChanged && origin !== "source")
-          cleanMarkdown = withDocumentMetadata(cleanMarkdown, metadata);
+          cleanMarkdown = withDocumentMetadata(cleanMarkdown, {
+            ...metadata,
+            // Editable YAML is already projected from the accepted model.
+            // Only out-of-tree endmatter may be restored from review source.
+            frontmatter: current.attrs.frontmatterInContent
+              ? documentMetadata(cleanMarkdown).frontmatter
+              : metadata.frontmatter,
+          });
         if (origin === "source" || metadataChanged) {
           exactClean.current = cleanMarkdown;
           canonicalCleanBaseline.current = canonicalClean;
@@ -1147,7 +1154,7 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
   const metadataPending =
     referenceMetadata !== null &&
     !decisions.includes("document-metadata") &&
-    !sameMetadata(workingMetadata, referenceMetadata);
+    workingMetadata.endmatter !== referenceMetadata.endmatter;
   const metadataOld =
     baseSide === "new"
       ? (referenceMetadata ?? workingMetadata)
@@ -1264,13 +1271,25 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     if (!passage || !editor || editor.isDestroyed || !formatted) return;
     const offset = (headerRef.current?.offsetHeight ?? 0) + 16;
     const position = Math.min(passage.position, editor.state.doc.content.size);
+    const resolved = editor.state.doc.resolve(position);
+    const yamlPosition =
+      resolved.parent.type.name === "yamlFrontmatter"
+        ? resolved.before()
+        : resolved.nodeAfter?.type.name === "yamlFrontmatter"
+          ? position
+          : null;
+    const yaml =
+      yamlPosition === null ? null : editor.view.nodeDOM(yamlPosition);
+    // YAML's visible fences and padding sit outside its text coordinates.
     const top = passage.metadata
       ? (documentRef.current
           ?.querySelector<HTMLElement>(
             '[data-review-rail-anchor="document-metadata"]',
           )
           ?.getBoundingClientRect().top ?? 0)
-      : editor.view.coordsAtPos(position).top;
+      : yaml instanceof HTMLElement
+        ? yaml.getBoundingClientRect().top
+        : editor.view.coordsAtPos(position).top;
     window.scrollTo({
       top: Math.max(0, top + window.scrollY - offset),
       behavior: "instant",
@@ -1968,22 +1987,20 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
                   data-review-rail-anchor="document-metadata"
                 >
                   <h2>Document metadata</h2>
-                  <p>YAML fields changed between these versions.</p>
+                  <p>Document endmatter changed between these versions.</p>
                   <div className="revision-metadata-versions">
                     <div>
                       <strong>Before</strong>
                       <pre>
-                        {[metadataOld.frontmatter, metadataOld.endmatter]
-                          .filter(Boolean)
-                          .join("\n") || "No metadata"}
+                        {[metadataOld.endmatter].filter(Boolean).join("\n") ||
+                          "No metadata"}
                       </pre>
                     </div>
                     <div>
                       <strong>After</strong>
                       <pre>
-                        {[metadataNew.frontmatter, metadataNew.endmatter]
-                          .filter(Boolean)
-                          .join("\n") || "No metadata"}
+                        {[metadataNew.endmatter].filter(Boolean).join("\n") ||
+                          "No metadata"}
                       </pre>
                     </div>
                   </div>

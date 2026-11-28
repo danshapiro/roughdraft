@@ -153,12 +153,75 @@ export function structuralSuggestion(before: EditorState, after: EditorState) {
     after.doc.content.cut(from, to),
     true,
   );
-  const existing = documentProposalIdentities(before.doc);
+  const existing = documentProposalIdentities(before.doc, true);
   const change =
     merged.values().next().value ??
     createCriticChange("substitution-old", undefined, {
       existingChanges: existing,
     });
+  const oldYaml =
+    original.doc.childCount === 1 &&
+    original.doc.firstChild?.type.name === "yamlFrontmatter"
+      ? original.doc.firstChild
+      : null;
+  const newYaml =
+    proposed.doc.childCount === 1 &&
+    proposed.doc.firstChild?.type.name === "yamlFrontmatter"
+      ? proposed.doc.firstChild
+      : null;
+  if (oldYaml && newYaml) {
+    let changedFrom = oldYaml.content.findDiffStart(newYaml.content);
+    const changedEnd = oldYaml.content.findDiffEnd(newYaml.content);
+    if (changedFrom !== null && changedEnd) {
+      const offset = changedFrom - Math.min(changedEnd.a, changedEnd.b);
+      if (offset > 0) {
+        changedEnd.a += offset;
+        changedEnd.b += offset;
+      }
+      if (
+        changedEnd.a === changedFrom &&
+        changedEnd.b > changedFrom &&
+        oldYaml.textContent[changedFrom - 1] === "\n" &&
+        newYaml.textContent[changedEnd.b - 1] === "\n"
+      ) {
+        // Equivalent newline placement keeps the original closing fence on
+        // its own source line while the proposed inserted line is pending.
+        changedFrom--;
+        changedEnd.a--;
+        changedEnd.b--;
+      }
+      const oldText = oldYaml.content.cut(changedFrom, changedEnd.a);
+      const newText = newYaml.content.cut(changedFrom, changedEnd.b);
+      const marked = (content: Fragment, kind: CriticChangeAttrs["kind"]) => {
+        const mark = after.schema.marks.criticChange.create({
+          ...change,
+          kind,
+        });
+        return content.content.map((node) =>
+          node.mark(mark.addToSet(node.marks)),
+        );
+      };
+      const content = [
+        ...oldYaml.content.cut(0, changedFrom).content,
+        ...marked(oldText, newText.size ? "substitution-old" : "deletion"),
+        ...marked(newText, oldText.size ? "substitution-new" : "addition"),
+        ...newYaml.content.cut(changedEnd.b).content,
+      ];
+      const yaml = newYaml.type.create(newYaml.attrs, content);
+      const transaction = after.tr.replaceWith(from, to, yaml);
+      transaction.setSelection(
+        TextSelection.create(
+          transaction.doc,
+          from + 1 + changedFrom + oldText.size + newText.size,
+        ),
+      );
+      return {
+        transaction: transaction.setMeta(explicitReviewEdit, true),
+        changeId: change.changeId,
+        mergedIds: [...merged.keys()],
+      };
+    }
+  }
   const oldBlocks = markedBlocks(original.doc, {
     ...change,
     kind: "substitution-old",

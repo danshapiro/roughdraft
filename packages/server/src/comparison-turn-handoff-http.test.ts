@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
+import { gunzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import type { SyncState } from "@roughdraft/rfm";
 import request from "supertest";
 import { afterAll, afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { Comparison } from "./comparisons.js";
+import { ComparisonOperations } from "./comparison-operations.js";
 import { createApp } from "./index.js";
 
 const parent = fileURLToPath(
@@ -341,5 +343,160 @@ test("a closed queued page does not block an otherwise valid current-base save a
   clock += 1;
   const saved = await retry("a-after-expiry", 5);
   expect(saved.body.status).toBe("committed");
+  expect(fs.readFileSync(target, "utf8")).toBe(nextText);
+});
+
+test("a denied compact peer's journal leaves the prepared holder within its unchanged turn", async () => {
+  const target = path.join(root, "source.md");
+  const text = original.slice(0, 20 * 1024);
+  fs.writeFileSync(target, text);
+  const opened = await request(host.app)
+    .post("/api/comparisons/document")
+    .send({ targetPath: target, autosave: target });
+  const route = `/api/comparisons/${opened.body.id}/reconcile`;
+  const state = (
+    await request(host.app).get(`/api/comparisons/${opened.body.id}/state`)
+  ).body as SyncState<Comparison>;
+  const candidate = text.replace("B: old", "B: prepared");
+  const heldBody = {
+    ...body(state, "prepared-holder", "b", candidate, 1),
+    baseSignature: "unavailable-browser-baseline",
+  };
+  const held = await request(host.app).post(route).send(heldBody);
+  expect(held.body.status).toBe("base-unavailable");
+  const turn = held.body.reservation;
+  clock += 200;
+
+  const realSync = fs.fsyncSync;
+  const flush = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+    realSync(fd);
+    // Charge slow storage at the real journal boundary. Six flushes exhaust
+    // the remaining 550 ms; the two required atomic writes leave 150 ms.
+    clock += 100;
+  });
+  const denied = await request(host.app)
+    .post(route)
+    .set("X-Roughdraft-Sync", "compact-v2")
+    .send(body(state, "denied-peer", "c", text, 1));
+  const flushes = flush.mock.calls.length;
+  flush.mockRestore();
+  expect(denied.body.status).toBe("retry-later");
+  expect(denied.body.retryAfter).toBeGreaterThan(0);
+  expect(denied.body.retryAfter).toBeLessThanOrEqual(550);
+
+  const replay = await request(host.app).post(route).send(heldBody);
+  expect(replay.body.reservation).toEqual(turn);
+  const saved = await request(host.app)
+    .post(route)
+    .send({
+      ...body(state, "prepared-holder-commit", "b", candidate, 2),
+      reservationToken: turn.token,
+    });
+  expect(saved.body.status).toBe("committed");
+  expect(flushes).toBe(4);
+  expect(fs.readFileSync(target, "utf8")).toBe(candidate);
+});
+
+test.each([
+  125, 250,
+])("the first delivered merge turn excludes real journal flushes costing %d ms each without renewing on replay or restart", async (flushCost) => {
+  const target = path.join(root, "source.md");
+  // The complete outcome still uses its compressed, separately durable payload.
+  const text = original.slice(0, 20 * 1024);
+  fs.writeFileSync(target, text);
+  const opened = await request(host.app)
+    .post("/api/comparisons/document")
+    .send({ targetPath: target, autosave: target });
+  expect(opened.status).toBe(201);
+  const route = `/api/comparisons/${opened.body.id}/reconcile`;
+  const state = (
+    await request(host.app).get(`/api/comparisons/${opened.body.id}/state`)
+  ).body as SyncState<Comparison>;
+  const operationId = "journal-handoff";
+  const sent = {
+    ...body(state, operationId, "b", text.replace("B: old", "B: waiting"), 2),
+    baseSignature: "unavailable-browser-baseline",
+  };
+  const journalStarted = clock;
+  const operationTime = state.operationContext.acceptUntil - 120_000;
+  let flushes = 0;
+  const originalPrepare = ComparisonOperations.prototype.prepare;
+  const realSync = fs.fsyncSync;
+  const preparing = vi
+    .spyOn(ComparisonOperations.prototype, "prepare")
+    .mockImplementation(function (...args) {
+      if (args[0].operation.operationId !== operationId)
+        return originalPrepare.apply(this, args);
+      const flush = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+        realSync(fd);
+        // Isolate slow storage at the actual durable-write boundary. Product
+        // and browser clocks remain unchanged; only this unit test owns time.
+        clock += flushCost;
+        flushes++;
+      });
+      try {
+        return originalPrepare.apply(this, args);
+      } finally {
+        flush.mockRestore();
+      }
+    });
+  const response = await request(host.app).post(route).send(sent);
+  preparing.mockRestore();
+  expect(response.body.status).toBe("base-unavailable");
+  expect(flushes).toBeGreaterThanOrEqual(4);
+  const turn = response.body.reservation;
+  const finishedAt = operationTime + clock - journalStarted;
+  expect(turn.expiresAt - finishedAt).toBe(750);
+
+  const journal = path.join(root, "comparisons", "operations");
+  const headerPath = path.join(journal, `${operationId}.json`);
+  const headerBefore = fs.readFileSync(headerPath);
+  const header = JSON.parse(headerBefore.toString());
+  const payloadPath = path.join(journal, "payloads", header.resultPayload.file);
+  const payloadBefore = fs.readFileSync(payloadPath);
+  const persisted = JSON.parse(gunzipSync(payloadBefore).toString());
+  expect(persisted.status).toBe(response.body.status);
+  expect(persisted.state.draft).toEqual(response.body.state.draft);
+  expect(persisted.reservation.token).toBe(turn.token);
+  expect(persisted.reservation.expiresAt).toBe(
+    turn.expiresAt - flushes * flushCost,
+  );
+
+  clock += 100;
+  const replay = await request(host.app).post(route).send(sent);
+  expect(replay.body.reservation).toEqual(turn);
+  const status = await request(host.app).get(
+    `/api/comparisons/operations/${operationId}`,
+  );
+  expect(status.body.reservation).toEqual(turn);
+  expect(status.body.state.draft).toEqual(response.body.state.draft);
+  expect(fs.readFileSync(headerPath)).toEqual(headerBefore);
+  expect(fs.readFileSync(payloadPath)).toEqual(payloadBefore);
+
+  // A process restart retains the outcome, not the ephemeral live lease.
+  host.dispose();
+  // Keep this restart inside the delivered lease in the isolated unit clock;
+  // real fixture I/O must not make a restored-turn regression pass by expiry.
+  vi.spyOn(Date, "now").mockReturnValue(finishedAt + 100);
+  host = createApp({
+    homeDir: root,
+    comparisonsDir: path.join(root, "comparisons"),
+    staticDirPath: root,
+  });
+  const restored = await request(host.app).get(
+    `/api/comparisons/operations/${operationId}`,
+  );
+  expect(restored.body.reservation).toEqual(persisted.reservation);
+  expect(restored.body.state.draft).toEqual(persisted.state.draft);
+  expect(
+    turn.expiresAt -
+      (restored.body.state.operationContext.acceptUntil - 120_000),
+  ).toBe(650);
+  const fresh = restored.body.state;
+  const nextText = text.replace("A: old", "A: after restart");
+  const next = await request(host.app)
+    .post(route)
+    .send(body(fresh, "after-journal-restart", "a", nextText, 1));
+  expect(next.body.status).toBe("committed");
   expect(fs.readFileSync(target, "utf8")).toBe(nextText);
 });

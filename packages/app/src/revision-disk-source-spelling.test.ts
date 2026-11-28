@@ -10,6 +10,13 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { ComparisonStore } from "../../server/src/comparisons";
 import type { ComparisonReviewData } from "./comparison-types";
 import { createEditorExtensions } from "./editor-extensions";
+import { EditorState } from "@tiptap/pm/state";
+import {
+  criticMarkdownToEditorState,
+  editorStateToCriticMarkdown,
+  createCriticChange,
+  createCriticComment,
+} from "./critic-markup";
 import { adoptRevisionDisk } from "./revision-disk-adoption";
 import { cleanRevisionSourceMarkdown } from "./revision-markdown";
 import {
@@ -484,3 +491,79 @@ test("ambiguous mixed endmatter waits without acknowledging or writing outside w
   expect(result.file).toBe(agent);
   expect(result.requests).not.toContain("sync:true");
 });
+
+for (const bound of [false, true]) {
+  for (const kind of ["comment", "suggestion"] as const) {
+    test(`${bound ? "bound" : "autosave none"}: an outside YAML field rewrite retains displaced ${kind} feedback without a write`, async () => {
+      const source =
+        "---\ntitle: Plan\nowner: Product team\n---\n\n# Plan\n\nKeep __this body__ unchanged.\n";
+      const parsed = criticMarkdownToEditorState(source);
+      const state = EditorState.create({
+        doc: schema.nodeFromJSON(parsed.doc),
+      });
+      const at = state.doc.firstChild?.textContent.indexOf("Plan") ?? -1;
+      const from = at + 1;
+      const tr = state.tr;
+      const comments = new Map(parsed.comments);
+      if (kind === "comment") {
+        const comment = createCriticComment({
+          id: "c1",
+          content: "Discuss this title.",
+          createdAt: "2026-11-28T01:00:00.000Z",
+        });
+        comments.set(comment.id, comment);
+        tr.addMark(
+          from,
+          from + 4,
+          schema.marks.commentRef.create({ commentIds: [comment.id] }),
+        );
+      } else {
+        const change = createCriticChange("substitution-old", {
+          changeId: "s1",
+          createdAt: "2026-11-28T01:00:00.000Z",
+        });
+        tr.addMark(from, from + 4, schema.marks.criticChange.create(change));
+        tr.insertText("Browser plan", from + 4);
+        tr.addMark(
+          from + 4,
+          from + 16,
+          schema.marks.criticChange.create({
+            ...change,
+            kind: "substitution-new",
+          }),
+        );
+      }
+      const annotated = editorStateToCriticMarkdown(tr.doc.toJSON(), comments);
+      const agent = source.replace("title: Plan", "title: Agent plan");
+      const result = await followOutsideEdit(
+        source,
+        annotated,
+        [...comments.values()].map((comment) => ({
+          ...comment,
+          changeId: "document",
+        })),
+        agent,
+        bound,
+      );
+      expect(result.conflict).toBeNull();
+      expect(result.file).toBe(agent);
+      expect(result.draft.cleanMarkdown).toBe(agent);
+      expect(result.requests).not.toContain("sync:true");
+      if (kind === "comment")
+        expect(
+          result.draft.reviewComments.find((comment) => comment.id === "c1"),
+        ).toMatchObject({
+          content: "Discuss this title.",
+          originalQuote: "Plan",
+          scope: "document",
+          detachedReason: expect.any(String),
+        });
+      else
+        expect(
+          result.draft.outdatedSuggestions?.find(
+            (proposal) => proposal.id === "s1",
+          ),
+        ).toMatchObject({ originalText: "Plan", proposedText: "Browser plan" });
+    });
+  }
+}

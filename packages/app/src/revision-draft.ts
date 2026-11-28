@@ -26,6 +26,7 @@ function commentValues(comments: ComparisonReviewComment[]) {
 function reviewValues(changes: ReviewedChange[] = []) {
   return changes.map((change) => [
     change.id,
+    Boolean(change.frontmatterInContent),
     change.decision,
     change.oldText,
     change.newText,

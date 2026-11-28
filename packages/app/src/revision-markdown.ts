@@ -98,6 +98,7 @@ export function needsSourceProjection(
   const code =
     inCode ||
     node.type === "codeBlock" ||
+    node.type === "yamlFrontmatter" ||
     Boolean(node.marks?.some((mark) => mark.type === "code"));
   return Boolean(
     node.type === "criticChangeBlock" ||
@@ -232,12 +233,13 @@ export function createSourceSpellingPreserver(
         start < sourceOffset ||
         end < start ||
         (removed &&
-          (crlf ? sourceText.replaceAll("\r\n", "\n") : sourceText) !== removed)
+          (crlf ? sourceText.replaceAll("\r\n", "\n") : sourceText) !==
+            (crlf ? removed.replaceAll("\r\n", "\n") : removed))
       )
         return null;
       result +=
         original.slice(sourceOffset, start) +
-        (crlf ? added.replaceAll("\n", "\r\n") : added);
+        (crlf ? added.replace(/\r?\n/g, "\r\n") : added);
       sourceOffset = end;
     }
     return result + original.slice(sourceOffset);

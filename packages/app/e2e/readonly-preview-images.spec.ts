@@ -60,6 +60,10 @@ for (const mode of ["document", "comparison"] as const) {
     const hashesBefore = sourceHashes();
     let currentView = "Changes";
     let comparisonId = "";
+    const imageRequests: string[] = [];
+    page.on("request", (request) => {
+      if (request.resourceType() === "image") imageRequests.push(request.url());
+    });
     try {
       const response = await request.post(
         mode === "document" ? `${api}/document` : api,
@@ -95,7 +99,11 @@ for (const mode of ["document", "comparison"] as const) {
       const changesImage = richTextEditor(page).getByRole("img", {
         name: "Test image",
       });
+      await changesImage.scrollIntoViewIfNeeded();
       await expect(changesImage).toHaveJSProperty("naturalWidth", finalWidth);
+      expect(imageRequests.map((url) => new URL(url).pathname)).toEqual(
+        imageRequests.map(() => "/api/files"),
+      );
       const initial = await read();
       const mutations: string[] = [];
       page.on("request", (request) => {
@@ -114,7 +122,11 @@ for (const mode of ["document", "comparison"] as const) {
         await expect(body).toHaveAttribute("contenteditable", "false");
         await expect(body).toContainText(wording);
         const image = preview.getByRole("img", { name: "Test image" });
+        await image.scrollIntoViewIfNeeded();
         await expect(image).toHaveJSProperty("naturalWidth", expectedWidth);
+        expect(imageRequests.map((url) => new URL(url).pathname)).toEqual(
+          imageRequests.map(() => "/api/files"),
+        );
         const imagePath = await image.getAttribute("src");
         expect(imagePath).toBeTruthy();
         const asset = await request.get(imagePath ?? "");
@@ -172,13 +184,15 @@ for (const mode of ["document", "comparison"] as const) {
       const image = page
         .getByTestId("revision-preview")
         .getByRole("img", { name: "Test image" });
-      const rendered = await image
-        .evaluate((node: HTMLImageElement) => ({
-          source: node.getAttribute("src"),
-          resolvedSource: node.src,
-          naturalWidth: node.naturalWidth,
-        }))
-        .catch(() => null);
+      const rendered = (await image.count())
+        ? await image
+            .evaluate((node: HTMLImageElement) => ({
+              source: node.getAttribute("src"),
+              resolvedSource: node.src,
+              naturalWidth: node.naturalWidth,
+            }))
+            .catch(() => null)
+        : null;
       const response = rendered
         ? await request.get(rendered.resolvedSource)
         : null;
@@ -209,3 +223,49 @@ for (const mode of ["document", "comparison"] as const) {
     }
   });
 }
+
+test("a sibling image below the reading viewport downloads only when brought into view", async ({
+  page,
+  request,
+}) => {
+  const project = createMarkdownProject("offscreen-images");
+  const markdown = `# A longer release plan\n\n${Array.from({ length: 100 }, (_, index) => `Section ${index + 1}. This paragraph leaves real reading distance before the diagram at the end of this document.`).join("\n\n")}\n\n![Deferred diagram](./below-fold.svg)\n`;
+  const target = writeProjectFile(project, "review.md", markdown);
+  writeProjectFile(
+    project,
+    "below-fold.svg",
+    '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="40" height="40" fill="green"/></svg>',
+  );
+  const imageRequests: string[] = [];
+  page.on("request", (request) => {
+    if (request.resourceType() === "image") imageRequests.push(request.url());
+  });
+  try {
+    const opened = await request.post(`${api}/document`, {
+      data: { targetPath: target, autosave: "none", handoff: "chat" },
+    });
+    await expect(opened).toBeOK();
+    const { id } = await opened.json();
+    await page.goto(`/?comparison=${id}`);
+    await expect(richTextEditor(page)).toBeVisible();
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    expect(imageRequests).toEqual([]);
+    const image = richTextEditor(page).getByRole("img", {
+      name: "Deferred diagram",
+    });
+    await image.scrollIntoViewIfNeeded();
+    await expect(image).toHaveJSProperty("naturalWidth", 40);
+    expect(imageRequests.map((url) => new URL(url).pathname)).toEqual([
+      "/api/files",
+    ]);
+    expect(fs.readFileSync(target, "utf8")).toBe(markdown);
+  } finally {
+    await page.goto("about:blank");
+    removeMarkdownProject(project);
+  }
+});

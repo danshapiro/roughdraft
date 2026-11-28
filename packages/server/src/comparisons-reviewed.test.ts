@@ -11,6 +11,7 @@ describe("persisted reviewed changes", () => {
   const reviewed = [
     {
       id: "reference-first",
+      frontmatterInContent: true,
       decision: "accept",
       oldText: "old",
       newText: "new",
@@ -137,6 +138,7 @@ describe("persisted reviewed changes", () => {
       reviewed: [{ ...reviewed[0], guard: { from: 1.5, to: 4, slice: null } }],
     },
     { reviewed: [{ ...reviewed[0], stale: "yes" }] },
+    { reviewed: [{ ...reviewed[0], frontmatterInContent: "yes" }] },
     { reviewed: [{ ...reviewed[2], metadata: null }] },
     { reviewed: [{ ...reviewed[2], metadata: { before: {}, after: {} } }] },
     {

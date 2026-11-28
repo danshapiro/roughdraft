@@ -80,6 +80,8 @@ export interface DocumentMetadata {
   endmatter: string | null;
 }
 export interface ReviewedChange {
+  /** Missing on stored records whose positions excluded frontmatter. */
+  frontmatterInContent?: boolean;
   id: string;
   decision: "accept" | "reject";
   oldText: string;
@@ -479,6 +481,14 @@ function reviewedField(value: unknown): ReviewedChange[] | undefined {
       );
     if (input.stale !== undefined && typeof input.stale !== "boolean")
       throw new ComparisonError(400, "Reviewed change stale must be boolean");
+    if (
+      input.frontmatterInContent !== undefined &&
+      typeof input.frontmatterInContent !== "boolean"
+    )
+      throw new ComparisonError(
+        400,
+        "Reviewed change frontmatterInContent must be boolean",
+      );
     const metadata =
       input.metadata === undefined ? undefined : objectBody(input.metadata);
     return {
@@ -492,6 +502,9 @@ function reviewedField(value: unknown): ReviewedChange[] | undefined {
         to: guard.to as number,
         slice: guard.slice,
       },
+      ...(input.frontmatterInContent !== undefined
+        ? { frontmatterInContent: input.frontmatterInContent as boolean }
+        : {}),
       ...(keptId !== undefined ? { keptId } : {}),
       ...(input.keptIds !== undefined
         ? { keptIds: [...(input.keptIds as string[])] }
@@ -1368,10 +1381,20 @@ export class ComparisonStore {
   }
   private liveOperationResult(
     result: SyncResult<Comparison>,
+    record: OperationRecord<Comparison>,
   ): SyncResult<Comparison> {
     const context = this.operations.context();
+    const reservation =
+      result.reservation && result.state?.review.id === record.reviewId
+        ? this.reservations.current(
+            record.reviewId,
+            record.operation.pageInstanceId,
+            result.reservation,
+          )
+        : null;
     return {
       ...result,
+      ...(reservation ? { reservation } : {}),
       ...(result.state
         ? { state: { ...result.state, operationContext: context } }
         : {}),
@@ -1398,12 +1421,12 @@ export class ComparisonStore {
             "Operation is unrecorded. Resolve its saved identity before retrying.",
         };
       if (record.phase === "done" && record.result)
-        return this.liveOperationResult(record.result);
+        return this.liveOperationResult(record.result, record);
       const review = this.readReview(record.reviewId);
       const marker =
         review.operationOutcomes?.[record.operation.pageInstanceId];
       if (marker?.id === id && record.result)
-        return this.liveOperationResult(record.result);
+        return this.liveOperationResult(record.result, record);
       return {
         status: "publishing",
         operationId: id,
@@ -1623,11 +1646,36 @@ export class ComparisonStore {
         !review.pendingApply
           ? admission()
           : null;
+      if (
+        capabilities.compactRetry &&
+        admitted?.blocked &&
+        !admitted.recoverToken
+      ) {
+        // This request cannot publish. Persist the exact denial and normal
+        // page coverage without a redundant running intent that would spend
+        // the selected page's remaining preparation window on journal I/O.
+        const completed = this.operations.deny(operation, id, {
+          status: "retry-later",
+          retryAfter: this.reservations.remaining(id) || 25,
+          retryRevision: review.revision,
+          operationContext: this.operations.context(),
+        });
+        log("sync-deferred", {
+          id,
+          operationId: operation.operationId,
+          revision: review.revision,
+          result: completed.status,
+          retryAfter: completed.retryAfter,
+          reason: typeof body.reason === "string" ? body.reason : "sync",
+        });
+        return completed;
+      }
       const record = this.operations.begin(operation, id);
       const reject = (
         result: SyncResult<Comparison>,
         allowCompactRetry = true,
       ) => {
+        const journalStartedAt = this.operations.now();
         if (
           capabilities.compactRetry &&
           allowCompactRetry &&
@@ -1640,17 +1688,29 @@ export class ComparisonStore {
             retryRevision: review.revision,
             operationContext: this.operations.context(),
           };
+        this.operations.prepare(record, result, { terminal: true });
+        const completed = this.operations.finish(record);
+        const reservation = completed.reservation
+          ? this.reservations.handOff(
+              id,
+              operation.pageInstanceId,
+              completed.reservation,
+              journalStartedAt,
+            )
+          : null;
+        const outgoing = reservation
+          ? { ...completed, reservation }
+          : completed;
         log("sync-deferred", {
           id,
           operationId: operation.operationId,
           revision: review.revision,
-          result: result.status,
-          retryAfter: result.retryAfter,
-          reservationExpiresAt: result.reservation?.expiresAt,
+          result: outgoing.status,
+          retryAfter: outgoing.retryAfter,
+          reservationExpiresAt: outgoing.reservation?.expiresAt,
           reason: typeof body.reason === "string" ? body.reason : "sync",
         });
-        this.operations.prepare(record, result, { terminal: true });
-        return this.operations.finish(record);
+        return outgoing;
       };
       if (review.pendingPublication?.owner === this.operations.owner) {
         this.recoverPublication(review);

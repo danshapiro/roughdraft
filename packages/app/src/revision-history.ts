@@ -1,8 +1,14 @@
+import { getSchema, type JSONContent } from "@tiptap/core";
 import { type Node, Slice } from "@tiptap/pm/model";
 import { EditorState, Plugin, type Transaction } from "@tiptap/pm/state";
-import { ReplaceStep, Step } from "@tiptap/pm/transform";
+import { Mapping, ReplaceStep, Step, StepMap } from "@tiptap/pm/transform";
 import type { ReviewedChange } from "./comparison-types";
-import { criticMarkdownToEditorState } from "./critic-markup";
+import {
+  criticFrontmatterToEditorState,
+  criticMarkdownToEditorState,
+} from "./critic-markup";
+import { splitYamlFrontmatter } from "./markdown";
+import { createEditorExtensions } from "./editor-extensions";
 import {
   documentMetadata,
   sameMetadata,
@@ -13,6 +19,58 @@ export function reviewedChanges(doc: Node): ReviewedChange[] {
   return doc.attrs.reviewed ?? [];
 }
 
+let migrationSchema: ReturnType<typeof getSchema> | undefined;
+
+/** Upgrade old body-only positions once, against an exact guarded document. */
+export function hydrateReviewedChanges(
+  content: Node | JSONContent,
+  changes: ReviewedChange[],
+): ReviewedChange[] {
+  if (changes.every((change) => change.frontmatterInContent === true))
+    return changes;
+  migrationSchema ??= getSchema(createEditorExtensions(""));
+  const doc =
+    "type" in content && typeof content.type === "object"
+      ? (content as Node)
+      : migrationSchema.nodeFromJSON(content);
+  const offset =
+    doc.firstChild?.type.name === "yamlFrontmatter"
+      ? doc.firstChild.nodeSize
+      : 0;
+  const mapping = new Mapping([StepMap.offset(offset)]);
+  return changes.map((change) => {
+    if (change.frontmatterInContent === true) return change;
+    if (change.metadata) return { ...change, frontmatterInContent: true };
+    try {
+      const inverse = change.inverse.map((json) =>
+        Step.fromJSON(doc.type.schema, json).map(mapping),
+      );
+      const shifted = {
+        ...change,
+        frontmatterInContent: true,
+        inverse: inverse
+          .filter((step) => step !== null)
+          .map((step) => step.toJSON()),
+        guard: {
+          ...change.guard,
+          from: change.guard.from + offset,
+          to: change.guard.to + offset,
+        },
+      };
+      return {
+        ...shifted,
+        stale: Boolean(
+          change.stale ||
+            inverse.some((step) => step === null) ||
+            !validateReviewedChange(doc, shifted),
+        ),
+      };
+    } catch {
+      return { ...change, frontmatterInContent: true, stale: true };
+    }
+  });
+}
+
 export function createReviewedChangeId() {
   const value =
     globalThis.crypto?.randomUUID?.() ??
@@ -20,15 +78,34 @@ export function createReviewedChangeId() {
   return `decision-${value}`;
 }
 
+export function reviewedMetadataIncludesFrontmatter(
+  change: ReviewedChange,
+): boolean {
+  return Boolean(
+    change.metadata &&
+      (change.metadata.before.frontmatter !==
+        change.metadata.after.frontmatter ||
+        splitYamlFrontmatter(change.oldText).frontmatter !==
+          splitYamlFrontmatter(change.newText).frontmatter),
+  );
+}
+
 function matches(doc: Node, change: ReviewedChange) {
-  if (change.metadata)
-    return (
-      !change.stale &&
-      sameMetadata(
-        documentMetadata(doc.attrs.sourceMetadata?.markdown ?? ""),
-        change.metadata.after,
-      )
-    );
+  if (change.metadata) {
+    const current = documentMetadata(doc.attrs.sourceMetadata?.markdown ?? "");
+    if (change.stale || current.endmatter !== change.metadata.after.endmatter)
+      return false;
+    if (!reviewedMetadataIncludesFrontmatter(change)) return true;
+    const expected = change.metadata.after.frontmatter;
+    const yaml =
+      doc.firstChild?.type.name === "yamlFrontmatter" ? doc.firstChild : null;
+    return expected === null
+      ? yaml === null
+      : yaml?.textContent ===
+          doc.type.schema.nodeFromJSON(
+            criticFrontmatterToEditorState(expected, null).node,
+          ).textContent;
+  }
   const { from, to, slice } = change.guard;
   return (
     !change.stale &&
@@ -146,6 +223,7 @@ export function recordReviewedChange(
     ...mapReviewedChanges(previous, transaction),
     {
       id: createReviewedChangeId(),
+      frontmatterInContent: true,
       ...detail,
       inverse,
       guard: { from, to, slice: transaction.doc.slice(from, to).toJSON() },
@@ -162,11 +240,34 @@ export function reopenReviewedChange(
   if (!change || !matches(state.doc, change)) return null;
   const transaction = state.tr;
   if (change.metadata) {
+    const includeFrontmatter = reviewedMetadataIncludesFrontmatter(change);
+    const currentMetadata = documentMetadata(
+      state.doc.attrs.sourceMetadata?.markdown ?? "",
+    );
     const markdown = withDocumentMetadata(
       state.doc.attrs.sourceMetadata?.markdown ?? "",
-      change.metadata.before,
+      includeFrontmatter
+        ? change.metadata.before
+        : {
+            ...change.metadata.before,
+            frontmatter: currentMetadata.frontmatter,
+          },
     );
     const parsed = criticMarkdownToEditorState(markdown);
+    const nextFrontmatter =
+      parsed.doc.content?.[0]?.type === "yamlFrontmatter"
+        ? state.schema.nodeFromJSON(parsed.doc.content[0])
+        : null;
+    const previousFrontmatter =
+      transaction.doc.firstChild?.type.name === "yamlFrontmatter"
+        ? transaction.doc.firstChild
+        : null;
+    if (includeFrontmatter && (previousFrontmatter || nextFrontmatter))
+      transaction.replaceWith(
+        0,
+        previousFrontmatter?.nodeSize ?? 0,
+        nextFrontmatter ? [nextFrontmatter] : [],
+      );
     transaction.setDocAttribute("sourceMetadata", {
       ...transaction.doc.attrs.sourceMetadata,
       sourceSpelling: undefined,

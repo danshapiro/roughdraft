@@ -34,6 +34,8 @@ export interface DocumentMetadata {
   endmatter: string | null;
 }
 export interface ReviewedChange {
+  /** Missing on stored records whose positions excluded frontmatter. */
+  frontmatterInContent?: boolean;
   id: string;
   decision: "accept" | "reject";
   oldText: string;

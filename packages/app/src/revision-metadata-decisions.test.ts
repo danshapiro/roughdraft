@@ -1,7 +1,10 @@
 import { Extension, getSchema } from "@tiptap/core";
 import { EditorState } from "@tiptap/pm/state";
 import { expect, test } from "vitest";
-import { criticMarkdownToEditorState } from "./critic-markup";
+import {
+  criticMarkdownToEditorState,
+  editorStateToCriticMarkdown,
+} from "./critic-markup";
 import { createEditorExtensions } from "./editor-extensions";
 import { RevisionSource } from "./revision-source";
 import { decideReviewChanges } from "./revision-bulk";
@@ -11,7 +14,6 @@ import {
   reopenReviewedChange,
   reviewedChanges,
 } from "./revision-history";
-import { documentMetadata } from "./revision-metadata";
 
 const schema = getSchema([
   ...createEditorExtensions(""),
@@ -31,6 +33,7 @@ const doc = (markdown: string) => {
   return schema.nodeFromJSON({
     ...parsed.doc,
     attrs: {
+      ...parsed.doc.attrs,
       sourceMetadata: {
         markdown,
         frontmatter: parsed.frontmatter,
@@ -41,19 +44,18 @@ const doc = (markdown: string) => {
 };
 const before = "---\ntitle: Old\n---\n\nUse red.\n";
 const after = "---\ntitle: New\n---\n\nUse blue.\n";
+const markdown = (node: ReturnType<typeof doc>) =>
+  editorStateToCriticMarkdown(node.toJSON(), new Map());
 
-test("complete outcome previews choose YAML and body from the same comparison side", () => {
+test("complete outcome previews and bulk decisions choose editable YAML and body from the same side", () => {
   for (const base of ["old", "new"] as const) {
     const current = doc(base === "old" ? before : after);
     const reference = doc(base === "old" ? after : before);
     for (const decision of ["accept", "reject"] as const) {
+      const expected = decision === "accept" ? after : before;
       const projected = outcomeDocument(current, reference, base, decision);
-      expect(projected.textContent).toBe(
-        decision === "accept" ? "Use blue." : "Use red.",
-      );
-      expect(projected.attrs.sourceMetadata.frontmatter).toContain(
-        decision === "accept" ? "New" : "Old",
-      );
+      expect(markdown(projected)).toBe(expected);
+      expect(projected.firstChild?.type.name).toBe("yamlFrontmatter");
       const chosen = decideReviewChanges(
         EditorState.create({ doc: current }),
         reference,
@@ -61,45 +63,48 @@ test("complete outcome previews choose YAML and body from the same comparison si
         decision,
         true,
       ).doc;
-      expect(chosen.attrs.sourceMetadata.frontmatter).toBe(
-        projected.attrs.sourceMetadata.frontmatter,
+      expect(markdown(chosen)).toBe(expected);
+      expect(reviewedChanges(chosen).every((change) => !change.metadata)).toBe(
+        true,
       );
     }
   }
 });
 
-test("metadata decisions reopen after unrelated body edits and become stale after YAML rewrites", () => {
+test("frontmatter decisions reopen after unrelated body edits and become stale after YAML rewrites", () => {
   let state = EditorState.create({ doc: doc(after) });
   state = state.apply(
-    decideReviewChanges(state, doc(before), "new", "reject", true, "metadata"),
+    decideReviewChanges(
+      state,
+      doc(before.replace("red", "blue")),
+      "new",
+      "reject",
+      true,
+    ),
   );
   const archived = reviewedChanges(state.doc)[0];
-  const edit = state.tr.insertText("Please ", 1);
-  edit.setDocAttribute("sourceMetadata", {
-    ...state.doc.attrs.sourceMetadata,
-    markdown: state.doc.attrs.sourceMetadata.markdown.replace(
-      "Use blue",
-      "Please Use blue",
-    ),
-  });
+  expect(archived.metadata).toBeUndefined();
+  expect(markdown(state.doc)).toBe(before.replace("red", "blue"));
+  const edit = state.tr.insertText(
+    "Please ",
+    (state.doc.firstChild?.nodeSize ?? 0) + 1,
+  );
   edit.setDocAttribute(
     "reviewed",
     mapReviewedChanges(reviewedChanges(state.doc), edit),
   );
   state = state.apply(edit);
   const reopened = reopenReviewedChange(state, archived.id);
-  expect(reopened?.doc.textContent).toBe("Please Use blue.");
-  expect(
-    documentMetadata(reopened?.doc.attrs.sourceMetadata.markdown ?? "")
-      .frontmatter,
-  ).toContain("New");
-  const changed = state.tr.setDocAttribute("sourceMetadata", {
-    ...state.doc.attrs.sourceMetadata,
-    markdown: state.doc.attrs.sourceMetadata.markdown.replace(
-      "title: Old",
-      "title: Custom",
-    ),
-  });
+  expect(reopened).not.toBeNull();
+  if (!reopened)
+    throw new Error(
+      "An unrelated body edit must leave the YAML decision reopenable",
+    );
+  expect(markdown(reopened.doc)).toBe(
+    after.replace("Use blue", "Please Use blue"),
+  );
+  const titleAt = state.doc.firstChild?.textContent.indexOf("Old") ?? -1;
+  const changed = state.tr.insertText("Custom", titleAt + 1, titleAt + 4);
   const [stale] = mapReviewedChanges(reviewedChanges(state.doc), changed);
   expect(stale.stale).toBe(true);
 });

@@ -113,7 +113,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 const settle = () => vi.advanceTimersByTimeAsync(0);
-function install(initial = state()) {
+function install(initial = state(), withAdapter = true) {
   const fixture = {
     server: initial,
     hold: false,
@@ -148,15 +148,16 @@ function install(initial = state()) {
     },
   );
   active.push(controller);
-  controller.setAdapter({
-    apply: (draft) => ({
-      ...draft,
-      cleanMarkdown: draft.cleanMarkdown ?? draft.markdown,
-    }),
-    adopt: () => null,
-    readUiDrafts: () => ({}),
-    restoreUiDrafts: () => {},
-  });
+  if (withAdapter)
+    controller.setAdapter({
+      apply: (draft) => ({
+        ...draft,
+        cleanMarkdown: draft.cleanMarkdown ?? draft.markdown,
+      }),
+      adopt: () => null,
+      readUiDrafts: () => ({}),
+      restoreUiDrafts: () => {},
+    });
   controller.start();
   return { fixture, controller };
 }
@@ -166,6 +167,53 @@ function notice() {
 function push(state: SyncState<ComparisonReviewData>) {
   notices.get("review")?.({ reason: "changed", state });
 }
+
+test("an identical initial stream hint reuses the state read while a newer disk hint still refreshes", async () => {
+  const { fixture } = install(fileState());
+  await settle();
+  const initialReads = fixture.reads.length;
+  const initial = fixture.server;
+  const hint = {
+    reviewId: initial.review.id,
+    revision: initial.revision,
+    diskVersion: initial.disk?.version ?? null,
+    registryGeneration: initial.registryGeneration,
+  };
+  notices.get("review")?.({ reason: "changed", hint });
+  await settle();
+  expect(fixture.reads).toHaveLength(initialReads);
+  notices.get("review")?.({
+    reason: "changed",
+    hint: { ...hint, diskVersion: "v2" },
+  });
+  await settle();
+  expect(fixture.reads).toHaveLength(initialReads + 1);
+});
+
+test("stopping before the first state read settles cannot leave a live subscription", async () => {
+  const { controller } = install();
+  controller.stop();
+  await settle();
+  expect(notices.has("review")).toBe(false);
+});
+
+test("an editor that mounts after the first read reuses that authoritative state", async () => {
+  const { controller, fixture } = install(state(), false);
+  await settle();
+  const initialReads = fixture.reads.length;
+  controller.setAdapter({
+    apply: (draft) => ({
+      ...draft,
+      cleanMarkdown: draft.cleanMarkdown ?? draft.markdown,
+    }),
+    adopt: () => null,
+    readUiDrafts: () => ({}),
+    restoreUiDrafts: () => {},
+  });
+  await settle();
+  expect(fixture.reads).toHaveLength(initialReads);
+  expect(controller.getSnapshot().conflict).toBeNull();
+});
 
 test("live hints during an in-flight read coalesce into one trailing read", async () => {
   const { fixture, controller } = install();
