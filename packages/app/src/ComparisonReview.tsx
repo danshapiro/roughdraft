@@ -74,6 +74,7 @@ function NativeComparisonDocument({
       label.startsWith("/"),
     ) ??
     null;
+  const documentPath = getPathLeaf(contextPath);
   const backend = useMemo(
     () =>
       new ApiBackend({
@@ -94,11 +95,11 @@ function NativeComparisonDocument({
         resolveLinkUrl: (href) =>
           buildLocationForLinkedMarkdownDocument({
             projectPath: backend.info.projectPath,
-            currentDocumentPath: getPathLeaf(contextPath),
+            currentDocumentPath: documentPath,
             href,
           }),
       }) satisfies Parameters<typeof buildComparisonDocument>[1],
-    [backend, contextPath, formatted],
+    [backend, documentPath, formatted],
   );
   const model = useMemo(
     () => buildComparisonDocument(review, { ...markdownOptions, showReviewed }),
@@ -242,7 +243,7 @@ function NativeComparisonDocument({
               title: review.title,
               content: review.afterText,
             }}
-            activeDocumentPath={contextPath}
+            activeDocumentPath={documentPath}
             selected={true}
             layout="default"
             focusRequestKey={null}
@@ -274,7 +275,7 @@ function NativeComparisonDocument({
             title: review.title,
             content: "",
           }}
-          activeDocumentPath={contextPath}
+          activeDocumentPath={documentPath}
           selected={false}
           layout="default"
           focusRequestKey={null}
