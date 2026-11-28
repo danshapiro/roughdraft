@@ -167,6 +167,35 @@ function push(state: SyncState<ComparisonReviewData>) {
   notices.get("review")?.({ reason: "changed", state });
 }
 
+test("an identical initial stream hint reuses the state read while a newer disk hint still refreshes", async () => {
+  const { fixture } = install(fileState());
+  await settle();
+  const initialReads = fixture.reads.length;
+  const initial = fixture.server;
+  const hint = {
+    reviewId: initial.review.id,
+    revision: initial.revision,
+    diskVersion: initial.disk?.version ?? null,
+    registryGeneration: initial.registryGeneration,
+  };
+  notices.get("review")?.({ reason: "changed", hint });
+  await settle();
+  expect(fixture.reads).toHaveLength(initialReads);
+  notices.get("review")?.({
+    reason: "changed",
+    hint: { ...hint, diskVersion: "v2" },
+  });
+  await settle();
+  expect(fixture.reads).toHaveLength(initialReads + 1);
+});
+
+test("stopping before the first state read settles cannot leave a live subscription", async () => {
+  const { controller } = install();
+  controller.stop();
+  await settle();
+  expect(notices.has("review")).toBe(false);
+});
+
 test("live hints during an in-flight read coalesce into one trailing read", async () => {
   const { fixture, controller } = install();
   await settle();

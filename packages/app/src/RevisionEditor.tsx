@@ -65,7 +65,7 @@ import {
   criticChangeHighlightPluginKey,
   explicitReviewEdit,
 } from "./editor-extensions";
-import { MarkdownCodeEditor } from "./MarkdownCodeEditor";
+import { MarkdownCodeEditor } from "./DeferredMarkdownCodeEditor";
 import {
   type DocumentInteractionMode,
   RichTextEditorSurface,

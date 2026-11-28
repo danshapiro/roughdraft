@@ -1,6 +1,7 @@
 import type { SyncContext, SyncState } from "@roughdraft/rfm";
 import { browserBasePath } from "./browser-base-path";
 import type { ComparisonReviewData } from "./comparison-types";
+import { receiveSyncState } from "./revision-sync-transfer";
 
 const LIVE_TRANSPORT_PROTOCOL = 2;
 export interface ReviewVersionHint {
@@ -30,6 +31,8 @@ interface Subscription {
 export interface ReviewLiveTransportOptions {
   basePath?: string;
   authNamespace?: string;
+  /** The controller's completed first read seeds conditional polling. */
+  initialState?: SyncState<ComparisonReviewData>;
 }
 const hubs = new Map<string, ReviewLiveHub>();
 function namespaceHash(value: string) {
@@ -130,7 +133,11 @@ class ReviewLiveHub {
     window.addEventListener("pagehide", this.pagehide);
     window.addEventListener("pageshow", this.pageshow);
   }
-  add(id: string, listener: (notice: ReviewChangeNotice) => void): () => void {
+  add(
+    id: string,
+    listener: (notice: ReviewChangeNotice) => void,
+    initialState?: SyncState<ComparisonReviewData>,
+  ): () => void {
     let subscription = this.subscriptions.get(id);
     if (!subscription) {
       subscription = {
@@ -138,12 +145,18 @@ class ReviewLiveHub {
         timer: null,
         request: null,
         failed: false,
+        ...(initialState?.review.id === id
+          ? {
+              state: initialState,
+              etag: JSON.stringify(initialState.registryGeneration),
+            }
+          : {}),
       };
       this.subscriptions.set(id, subscription);
     }
     subscription.listeners.add(listener);
     if (!this.worker && !this.fallback) this.connect();
-    if (this.fallback) void this.poll(id);
+    if (this.fallback) this.beginPolling(id);
     else this.sendSubscriptions();
     const registered = subscription;
     let stopped = false;
@@ -341,9 +354,23 @@ class ReviewLiveHub {
     this.fallback = true;
     if (first) {
       report("fallback", reason);
-      for (const id of this.subscriptions.keys()) void this.poll(id);
+      for (const id of this.subscriptions.keys()) this.beginPolling(id);
     }
     if (!keepWorker && retryWorker) this.retryWorker();
+  }
+  private beginPolling(id: string) {
+    const subscription = this.subscriptions.get(id);
+    if (!subscription || subscription.timer || subscription.request) return;
+    if (!subscription.state) {
+      void this.poll(id);
+      return;
+    }
+    // A newly mounted controller has just read this state. Its next fallback
+    // check belongs at the ordinary interval, with a conditional request.
+    subscription.timer = setTimeout(() => {
+      subscription.timer = null;
+      void this.poll(id);
+    }, 1000);
   }
   private async poll(id: string) {
     const subscription = this.subscriptions.get(id);
@@ -380,9 +407,15 @@ class ReviewLiveHub {
         cache: "no-store",
         credentials: "same-origin",
         signal: controller.signal,
-        ...(subscription.etag
-          ? { headers: { "If-None-Match": subscription.etag } }
-          : {}),
+        headers: {
+          ...(subscription.etag ? { "If-None-Match": subscription.etag } : {}),
+          ...(previous?.review.referenceVersion
+            ? {
+                "X-Roughdraft-Sync": "compact-v2",
+                "X-Roughdraft-Reference": previous.review.referenceVersion,
+              }
+            : {}),
+        },
       });
       if (
         this.subscriptions.get(id) !== subscription ||
@@ -411,8 +444,10 @@ class ReviewLiveHub {
       if (!response.ok) throw new Error("Live state request failed");
       const payload = await response.json();
       if (payload?.unchanged) return;
-      const state = (payload?.state ??
-        payload) as SyncState<ComparisonReviewData>;
+      const incoming = payload?.state ?? payload;
+      const state = previous?.review.referenceVersion
+        ? receiveSyncState(incoming, previous.review)
+        : (incoming as SyncState<ComparisonReviewData>);
       if (
         typeof state.revision !== "number" ||
         !state.draft ||
@@ -530,5 +565,5 @@ export function subscribeReviewChanges(
     hub = new ReviewLiveHub(key, basePath, authNamespace);
     hubs.set(key, hub);
   }
-  return hub.add(reviewId, onChange);
+  return hub.add(reviewId, onChange, options.initialState);
 }

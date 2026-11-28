@@ -2,6 +2,7 @@ import { browserPath } from "./browser-base-path";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiBackend } from "./api-backend";
+import { requestComparison } from "./comparison-bootstrap";
 import {
   buildLocationForLinkedMarkdownDocument,
   getPathLeaf,
@@ -33,38 +34,6 @@ type Choices = {
   comment?: string;
   reviewComments?: ComparisonReviewComment[];
 };
-
-class ComparisonError extends Error {
-  constructor(
-    message: string,
-    public status: number,
-  ) {
-    super(message);
-  }
-}
-
-async function requestComparison(id: string, action?: string, body?: unknown) {
-  const response = await fetch(
-    browserPath(
-      `/api/comparisons/${encodeURIComponent(id)}${action ? `/${action}` : ""}`,
-    ),
-    body === undefined
-      ? undefined
-      : {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        },
-  );
-  const result = await response.json();
-  if (!response.ok) {
-    throw new ComparisonError(
-      result.error ?? "The review could not be saved.",
-      response.status,
-    );
-  }
-  return result as Comparison;
-}
 
 function applyLocalChoices(review: Comparison, choices: Choices): Comparison {
   return {
@@ -331,9 +300,11 @@ function NativeComparisonDocument({
 export function ComparisonReview({
   id,
   linkedPath,
+  initialReview,
 }: {
   id: string;
   linkedPath?: string;
+  initialReview?: Promise<Comparison>;
 }) {
   const [review, setReview] = useState<Comparison | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -435,14 +406,18 @@ export function ComparisonReview({
   const mountedRef = useRef(true);
 
   useEffect(() => {
+    let active = true;
     mountedRef.current = true;
-    requestComparison(
-      id,
-      undefined,
-      linkedPath ? { targetPath: linkedPath } : undefined,
+    (
+      initialReview ??
+      requestComparison(
+        id,
+        undefined,
+        linkedPath ? { targetPath: linkedPath } : undefined,
+      )
     )
       .then((next) => {
-        if (!mountedRef.current) return;
+        if (!active) return;
         if (linkedPath) {
           const url = new URL(window.location.href);
           url.search = new URLSearchParams({ comparison: next.id }).toString();
@@ -453,12 +428,13 @@ export function ComparisonReview({
         setError(null);
       })
       .catch((reason: Error) => {
-        if (mountedRef.current) setError(reason.message);
+        if (active) setError(reason.message);
       });
     return () => {
+      active = false;
       mountedRef.current = false;
     };
-  }, [id, linkedPath]);
+  }, [id, linkedPath, initialReview]);
 
   const drain = useCallback(async () => {
     if (savingRef.current || failedRef.current || !savedRef.current) return;

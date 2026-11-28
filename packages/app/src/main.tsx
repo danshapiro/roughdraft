@@ -1,7 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { App } from "./App";
+import { Application } from "./Application";
 import "./style.css";
 
 const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -24,7 +24,7 @@ if (!rootElement) {
 createRoot(rootElement).render(
   <StrictMode>
     <TooltipProvider>
-      <App />
+      <Application />
     </TooltipProvider>
   </StrictMode>,
 );

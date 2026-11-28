@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SyncState } from "@roughdraft/rfm";
+import type { ComparisonReviewData } from "./comparison-types";
 import {
   type ReviewChangeNotice,
   subscribeReviewChanges,
@@ -89,6 +91,68 @@ afterEach(() => {
 });
 
 describe("review change transport", () => {
+  it("uses the controller's first read for the initial conditional fallback check", async () => {
+    vi.stubGlobal("SharedWorker", undefined);
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { status: 304 }));
+    vi.stubGlobal("fetch", fetcher);
+    const initial = state() as SyncState<ComparisonReviewData>;
+    const callback = vi.fn();
+    const stop = subscribeReviewChanges("review-1", callback, {
+      initialState: initial,
+    });
+    stops.push(stop);
+    expect(fetcher).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetcher).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(fetcher.mock.calls[0][1].headers).toEqual({
+      "If-None-Match": '"reg1"',
+    });
+    expect(String(fetcher.mock.calls[0][0])).toContain("knownRevision=1");
+    expect(callback).not.toHaveBeenCalled();
+    stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("negotiates compact changed states using only the matching frozen references", async () => {
+    vi.stubGlobal("SharedWorker", undefined);
+    const initial = {
+      ...state(),
+      review: {
+        ...state().review,
+        referenceVersion: "frozen-v1",
+        beforeText: "Before",
+        afterText: "After",
+        segments: [],
+      },
+    } as unknown as SyncState<ComparisonReviewData>;
+    const incoming = {
+      ...state(2),
+      review: { id: "review-1", referenceVersion: "frozen-v1" },
+      reviewFormat: "compact-v2",
+    };
+    const fetcher = vi.fn().mockResolvedValue(Response.json(incoming));
+    vi.stubGlobal("fetch", fetcher);
+    const callback = vi.fn();
+    stops.push(
+      subscribeReviewChanges("review-1", callback, { initialState: initial }),
+    );
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetcher.mock.calls[0][1].headers).toEqual({
+      "If-None-Match": '"reg1"',
+      "X-Roughdraft-Sync": "compact-v2",
+      "X-Roughdraft-Reference": "frozen-v1",
+    });
+    expect(callback.mock.calls[0][0].state.review).toMatchObject({
+      beforeText: "Before",
+      afterText: "After",
+      draft: incoming.draft,
+    });
+    expect(callback.mock.calls[0][0].state.revision).toBe(2);
+  });
   it("shares one worker port for this page's review subscriptions and releases it last", () => {
     const one = subscribe("one"),
       two = subscribe("two");

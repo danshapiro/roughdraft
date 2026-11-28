@@ -1,4 +1,3 @@
-import { EditorView as CodeMirrorView } from "@codemirror/view";
 import { reviewHistoryProposalIds } from "@roughdraft/rfm";
 import { Extension, type JSONContent } from "@tiptap/core";
 import { closeHistory, isHistoryTransaction } from "@tiptap/pm/history";
@@ -70,10 +69,8 @@ import {
 } from "./editor-extensions";
 import { LinkAffordances } from "./LinkAffordances";
 import { cn } from "./lib/utils";
-import {
-  canApplyMarkdownSourceUpdate,
-  MarkdownCodeEditor,
-} from "./MarkdownCodeEditor";
+import { MarkdownCodeEditor } from "./DeferredMarkdownCodeEditor";
+import { markdownSourceGuard } from "./markdown-source-guard";
 import { splitYamlDocumentMetadata, toHtml } from "./markdown";
 import { resolveSuggestionsSource } from "./resolve-suggestion";
 import {
@@ -2114,7 +2111,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         active instanceof HTMLElement ? active.closest(".cm-editor") : null;
       const source =
         sourceHost instanceof HTMLElement
-          ? CodeMirrorView.findFromDOM(sourceHost)
+          ? markdownSourceGuard(sourceHost)
           : null;
       if (
         options?.idRemap &&
@@ -2395,7 +2392,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
               nextPrivateIds,
             ))
           : draft.markdown;
-        if (source && !canApplyMarkdownSourceUpdate(source, nextMarkdown))
+        if (source && !source.canApplyUpdate(nextMarkdown))
           return blocked("source-composing");
         transaction
           .setDocAttribute("kept", Object.keys(draft.decisions))

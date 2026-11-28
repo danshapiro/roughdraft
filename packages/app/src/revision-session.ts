@@ -367,6 +367,7 @@ export class RevisionSessionController {
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private publicationTimer: ReturnType<typeof setTimeout> | null = null;
   private unsubscribe: (() => void) | null = null;
+  private subscriptionGeneration = 0;
   private unsubscribeUi: (() => void) | null = null;
   private stopped = false;
   private started = false;
@@ -1127,40 +1128,68 @@ export class RevisionSessionController {
     });
   private subscribeToReview(reviewId: string) {
     this.unsubscribe?.();
-    this.unsubscribe = subscribeReviewChanges(reviewId, (notice) => {
-      if (this.stopped || this.snapshot.session.id !== reviewId) return;
-      if (notice.operationContext && this.state)
-        this.state = {
-          ...this.state,
-          operationContext: notice.operationContext,
-        };
-      if (notice.reason === "heartbeat") return;
-      if (notice.state)
-        void this.observe(notice.state).catch((error) => {
-          if (!this.stopped && this.snapshot.session.id === reviewId)
-            this.emit({
-              recoveryError: `Updates are temporarily unavailable. Your work remains in this tab. ${errorMessage(error)}`,
-            });
-        });
-      else void this.refresh();
-    });
+    this.unsubscribe = subscribeReviewChanges(
+      reviewId,
+      (notice) => {
+        if (this.stopped || this.snapshot.session.id !== reviewId) return;
+        if (notice.operationContext && this.state)
+          this.state = {
+            ...this.state,
+            operationContext: notice.operationContext,
+          };
+        if (notice.reason === "heartbeat") return;
+        // The stream sends the current version when it connects. Its exact
+        // already-observed version needs no second download of the document.
+        if (
+          notice.hint &&
+          this.state &&
+          notice.hint.reviewId === reviewId &&
+          notice.hint.revision === this.state.revision &&
+          notice.hint.registryGeneration === this.state.registryGeneration &&
+          notice.hint.diskVersion === (this.state.disk?.version ?? null)
+        )
+          return;
+        if (notice.state)
+          void this.observe(notice.state).catch((error) => {
+            if (!this.stopped && this.snapshot.session.id === reviewId)
+              this.emit({
+                recoveryError: `Updates are temporarily unavailable. Your work remains in this tab. ${errorMessage(error)}`,
+              });
+          });
+        else void this.refresh();
+      },
+      { initialState: this.state ?? undefined },
+    );
   }
   start() {
     if (this.started) return;
     this.started = true;
     this.stopped = false;
     prepareReviewMergeWorker(this.current.markdown);
-    this.subscribeToReview(this.snapshot.session.id);
+    const reviewId = this.snapshot.session.id;
+    const generation = ++this.subscriptionGeneration;
     this.heartbeat = setInterval(() => {
       this.persist();
       this.findOrphans();
     }, 3000);
     this.findOrphans();
-    void this.refresh(true);
+    // Complete one authoritative read before starting transport fallback, so
+    // neither the poller nor an initial stream hint races another full read.
+    const initialRead = this.refreshPromise ?? this.refresh(true);
+    void initialRead.finally(() => {
+      if (
+        !this.stopped &&
+        this.started &&
+        this.subscriptionGeneration === generation &&
+        this.snapshot.session.id === reviewId
+      )
+        this.subscribeToReview(reviewId);
+    });
   }
   stop() {
     this.stopped = true;
     this.started = false;
+    this.subscriptionGeneration++;
     this.refreshPromise = null;
     this.refreshReviewId = null;
     this.refreshRequested = false;
@@ -1237,7 +1266,9 @@ export class RevisionSessionController {
         this.emit({ draft: normalized });
         this.persist();
       }
-      void this.refresh(true);
+      // An initial read already in flight will observe the newly registered
+      // adapter. A second forced read only transfers the same draft again.
+      if (this.state || !this.refreshPromise) void this.refresh(true);
       this.schedule(0);
     }
   };

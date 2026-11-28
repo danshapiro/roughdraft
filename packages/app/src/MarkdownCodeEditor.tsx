@@ -15,8 +15,9 @@ import { diffChars, diffWordsWithSpace } from "diff";
 import { useEffect, useRef } from "react";
 import { cn } from "./lib/utils";
 import { splitYamlDocumentMetadata } from "./markdown";
+import { registerMarkdownSourceGuard } from "./markdown-source-guard";
 
-interface MarkdownCodeEditorProps {
+export interface MarkdownCodeEditorProps {
   value: string;
   onChange: (value: string) => void;
   onCompositionEnd?: () => void;
@@ -439,6 +440,9 @@ export function MarkdownCodeEditor({
     });
 
     editorViewRef.current = view;
+    const unregisterGuard = registerMarkdownSourceGuard(view.dom, {
+      canApplyUpdate: (next) => canApplyMarkdownSourceUpdate(view, next),
+    });
     lastValueRef.current = view.state.sliceDoc();
     let compositionTimer: ReturnType<typeof setTimeout> | undefined;
     const cancelCompositionEnd = () => {
@@ -472,6 +476,7 @@ export function MarkdownCodeEditor({
       editorViewRef.current = null;
       applyIncomingRef.current = null;
       sourceCompositions.delete(view);
+      unregisterGuard();
       view.destroy();
     };
   }, []);
