@@ -231,6 +231,8 @@ The original inline CriticMarkup workflow remains available through `open FILE.m
 
 ## CriticMarkup
 
+The [RFM format specification](docs/spec/roughdraft-flavored-markdown.md) describes escaping and declared frontmatter/code annotations.
+
 Use CriticMarkup when reading or writing inline review feedback in markdown:
 
 - Comment: `{>>comment<<}`

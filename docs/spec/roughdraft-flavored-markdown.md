@@ -81,6 +81,35 @@ To annotate code without confusing its literal contents with review delimiters, 
 
 The YAML entry also contains the comment's `body`, so readers that treat all code as literal can still return the feedback. An implementation MAY offer an explicit compatibility mode for historical unflagged code annotations. New writers MUST use the declaration rather than infer annotations from code examples.
 
+### Frontmatter annotations
+
+Frontmatter fields support comments and suggestions while retaining their literal YAML spelling. Review syntax inside frontmatter is literal by default. To identify actual feedback, its entry under final `comments:` or `suggestions:` MUST declare `frontmatterAnchor: true`. Readers MUST NOT reinterpret unregistered examples as feedback. Writers MUST allocate IDs that do not collide with literal review references already in the header.
+
+```markdown
+---
+title: {~~Working draft~>Release plan~~}{#s1}
+owner: {==Product team==}{>><<}{#c1}
+---
+
+Document body.
+
+---
+comments:
+  c1:
+    body: Please confirm the owner.
+    by: AI
+    at: "2026-11-28T00:00:00.000Z"
+    frontmatterAnchor: true
+    codeAnchorEncoding: backslash
+suggestions:
+  s1:
+    by: AI
+    at: "2026-11-28T00:00:00.000Z"
+    frontmatterAnchor: true
+```
+
+Generated frontmatter comment anchors use the declared `codeAnchorEncoding: backslash` extension above. For proposed literal text, the editor declares `literalChangeEncoding: backslash` on the suggestion entry and escapes backslashes, braces and the `~>` delimiter inside its payload. Readers decode those declared payloads once, without parsing the decoded text as more review syntax. Preserve these declarations when editing existing feedback. Accepted file content excludes pending proposals and review metadata; YAML field order, quoting and line endings remain unchanged unless edited.
+
 ## Suggestions
 
 Suggestions represent pending edits. Implementations MUST NOT silently collapse suggestions into normal prose while reading or writing Roughdraft Flavored Markdown.
@@ -220,6 +249,8 @@ Known metadata attributes:
 | `status` | Comments and suggestions | No | Review state. Roughdraft currently writes `resolved` when an item has been addressed. |
 | `resolved` | Comments and suggestions | No | Optional short resolution summary for an item whose `status` is `resolved`. |
 | `codeAnchorEncoding` | YAML comment entries | For generated code annotations | `backslash` explicitly identifies encoded code anchors; their feedback also appears in `body`. |
+| `frontmatterAnchor` | YAML comment and suggestion entries | For frontmatter annotations | `true` distinguishes review feedback from literal YAML examples. |
+| `literalChangeEncoding` | YAML suggestion entries | For generated literal YAML proposals | `backslash` identifies an escaped literal payload, decoded once. |
 
 Example:
 
