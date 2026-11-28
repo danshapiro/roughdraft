@@ -100,7 +100,9 @@ for (const profile of [
       );
       metrics.coldReadyMs = Date.now() - start;
       const cold = await readResources();
-      const scripts = cold.filter((resource) => resource.type === "script");
+      // Module preloads report initiatorType "other" in Chromium. Count their
+      // transferred JavaScript too, rather than understating the download.
+      const scripts = cold.filter((resource) => resource.name.endsWith(".js"));
       metrics.cold = cold;
       const bytes = scripts.reduce(
         (total, resource) => total + resource.transfer,
@@ -117,7 +119,7 @@ for (const profile of [
       const source = await readResources();
       const newScripts = source.filter(
         (resource) =>
-          resource.type === "script" &&
+          resource.name.endsWith(".js") &&
           !scripts.some((item) => item.name === resource.name),
       );
       metrics.sourceScripts = newScripts;
@@ -133,7 +135,7 @@ for (const profile of [
       expect
         .soft(
           warm
-            .filter((resource) => resource.type === "script")
+            .filter((resource) => resource.name.endsWith(".js"))
             .reduce((total, resource) => total + resource.transfer, 0),
         )
         .toBe(0);

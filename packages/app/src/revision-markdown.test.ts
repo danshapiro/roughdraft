@@ -49,6 +49,34 @@ describe("Markdown written or exported from a review", () => {
 });
 
 describe("preserving original Markdown when saving comparison choices", () => {
+  it("preserves CRLF header proposals when the canonical body uses LF", () => {
+    const original =
+      "---\r\ntitle: Original\r\nowner: Product team\r\n---\r\n\r\n# Body\r\n\r\nKeep __this body__ unchanged.\r\n";
+    const parsed = criticMarkdownToEditorState(original);
+    const canonical = editorStateToCriticMarkdown(parsed.doc, parsed.comments);
+    const addition = "Original{++\r\nrelease: next++}{#s1}";
+    expect(
+      createSourceSpellingPreserver(
+        original,
+        canonical,
+      )(canonical.replace("Original", addition)),
+    ).toBe(original.replace("Original", addition));
+  });
+
+  it("maps removal of an exact CRLF field while retaining unrelated source spelling", () => {
+    const original =
+      "---\r\ntitle: Original\r\nowner: Product team\r\nlabels: [one, two]\r\n---\r\n\r\n# Body\r\n\r\nKeep __this body__ unchanged.\r\n";
+    const parsed = criticMarkdownToEditorState(original);
+    const canonical = editorStateToCriticMarkdown(parsed.doc, parsed.comments);
+    const remove = "owner: Product team\r\n";
+    expect(
+      createSourceSpellingPreserver(
+        original,
+        canonical,
+      )(canonical.replace(remove, "")),
+    ).toBe(original.replace(remove, ""));
+  });
+
   it("keeps the original line endings and list markers when applying distant wording changes", () => {
     const original =
       "# Notes\r\n\r\n* Red apple\r\n* Leave this line.\r\n* Green pear\r\n";
