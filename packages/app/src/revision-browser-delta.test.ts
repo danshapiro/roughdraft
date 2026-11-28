@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import {
   decodeBrowserRecovery,
   encodeBrowserRecovery,
@@ -111,6 +111,85 @@ test("one pair of document strings fits near-identical pending recovery snapshot
   };
   expect(() => save(encodeBrowserRecovery(record))).not.toThrow();
   expect(JSON.parse(stored).draft.markdown).toBe(record.draft.markdown);
+  expect(decodeBrowserRecovery(stored)).toEqual(record);
+});
+
+test("near-identical recovery snapshots skip shared source runs without inspecting every UTF16 unit", () => {
+  const record = largeRecovery();
+  const charCodeAt = String.prototype.charCodeAt;
+  let inspected = 0;
+  const spy = vi
+    .spyOn(String.prototype, "charCodeAt")
+    .mockImplementation(function (this: string, index) {
+      inspected++;
+      return charCodeAt.call(this, index);
+    });
+  let stored: string;
+  try {
+    stored = encodeBrowserRecovery(record);
+  } finally {
+    spy.mockRestore();
+  }
+  expect(decodeBrowserRecovery(stored)).toEqual(record);
+  expect(
+    inspected,
+    "repeated recovery anchors should compare shared runs with native string equality",
+  ).toBeLessThan(record.draft.markdown.length);
+});
+
+test.each([
+  { name: "empty", before: "", after: "" },
+  { name: "insertion", before: "", after: "Inserted text." },
+  { name: "deletion", before: "Removed text.", after: "" },
+  { name: "literal short source", before: "short", after: "different" },
+  {
+    name: "identical source without overlapping suffix",
+    before: "x".repeat(2048),
+    after: "x".repeat(2048),
+    patch: { prefix: 2048, suffix: 0, text: "" },
+  },
+  {
+    name: "surrogate pair across a chunk boundary",
+    before: `${"x".repeat(1023)}😀${"y".repeat(1024)}`,
+    after: `${"x".repeat(1023)}😃${"y".repeat(1024)}`,
+    patch: { prefix: 1024, suffix: 1024, text: "\ude00" },
+  },
+  {
+    name: "common suffix after a changed surrogate",
+    before: `😀${"y".repeat(2048)}`,
+    after: `😃${"y".repeat(2048)}`,
+    patch: { prefix: 1, suffix: 2048, text: "\ude00" },
+  },
+  {
+    name: "changed surrogate at the end",
+    before: `${"x".repeat(2048)}😀`,
+    after: `${"x".repeat(2048)}😃`,
+    patch: { prefix: 2049, suffix: 0, text: "\ude00" },
+  },
+])("recovery deltas retain exact UTF16 boundaries: $name", ({
+  before,
+  after,
+  patch,
+}) => {
+  const draft = (markdown: string): RevisionDraft => ({
+    markdown,
+    cleanMarkdown: markdown,
+    decisions: {},
+    reviewComments: [],
+  });
+  const record: BrowserRecovery = {
+    version: 2,
+    pageInstanceId: "boundary-probe",
+    aliveAt: 1,
+    revision: 1,
+    draft: draft(after),
+    base: draft(before),
+  };
+  const stored = encodeBrowserRecovery(record);
+  const wire = JSON.parse(stored);
+  expect(wire.snapshots[0].markdownDelta).toEqual(
+    patch ? { anchor: "current", ...patch } : undefined,
+  );
   expect(decodeBrowserRecovery(stored)).toEqual(record);
 });
 
