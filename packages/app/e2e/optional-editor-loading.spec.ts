@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
+import ts from "typescript";
 import { richTextEditor } from "./helpers";
 
 test("a failed initial review download can reload before the editor is mounted", async ({
@@ -22,6 +23,7 @@ test("a failed initial review download can reload before the editor is mounted",
   const api = `http://127.0.0.1:${process.env.API_PORT ?? 4317}`;
   const counts = new Map<string, number>();
   let failedUrl = "";
+  let dependencyToFail: string | undefined;
   try {
     const shell = await request.get(api);
     const critical = new Set(
@@ -29,6 +31,33 @@ test("a failed initial review download can reload before the editor is mounted",
         (match) => new URL(match[1], `${api}/`).pathname,
       ),
     );
+    if (process.env.PLAYWRIGHT_PRODUCTION === "1") {
+      const assets = fileURLToPath(new URL("../dist/assets/", import.meta.url));
+      const entry = fs
+        .readdirSync(assets)
+        .find((name) => /^ComparisonReview-.*\.js$/.test(name));
+      if (!entry) throw new Error("Missing compiled review entry");
+      const module = ts.createSourceFile(
+        entry,
+        fs.readFileSync(path.join(assets, entry), "utf8"),
+        ts.ScriptTarget.Latest,
+        false,
+        ts.ScriptKind.JS,
+      );
+      dependencyToFail = module.statements
+        .flatMap((statement) =>
+          ts.isImportDeclaration(statement) &&
+          ts.isStringLiteral(statement.moduleSpecifier)
+            ? [
+                new URL(
+                  statement.moduleSpecifier.text,
+                  `${api}/assets/${entry}`,
+                ).href,
+              ]
+            : [],
+        )
+        .find((url) => !critical.has(new URL(url).pathname));
+    }
     await page.route(
       process.env.PLAYWRIGHT_PRODUCTION === "1"
         ? "**/assets/*.js"
@@ -36,6 +65,8 @@ test("a failed initial review download can reload before the editor is mounted",
       async (route) => {
         const url = route.request().url();
         if (critical.has(new URL(url).pathname)) return route.continue();
+        if (dependencyToFail && url !== dependencyToFail)
+          return route.continue();
         counts.set(url, (counts.get(url) ?? 0) + 1);
         if (!failedUrl) {
           failedUrl = url;
@@ -61,7 +92,11 @@ test("a failed initial review download can reload before the editor is mounted",
     expect(fs.readFileSync(filename, "utf8")).toBe(original);
   } finally {
     await testInfo.attach("initial-download-attempts", {
-      body: JSON.stringify({ failedUrl, attempts: Object.fromEntries(counts) }),
+      body: JSON.stringify({
+        failedUrl,
+        failedKind: dependencyToFail ? "shared dependency" : "entry",
+        attempts: Object.fromEntries(counts),
+      }),
       contentType: "application/json",
     });
     await page.goto("about:blank");
