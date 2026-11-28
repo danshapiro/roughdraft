@@ -297,6 +297,8 @@ contextual toolbar beside its selection. Include a narrow landscape viewport.
 
 Capture Changes, Original and Final with a mixture of earlier decisions and pending suggestions. Include the read-only preview label, disabled editing/decision controls, rendered and source previews, preserved YAML, and source-relative links/images from inputs in different folders. Verify Copy/Download match the visible outcome. Returning to Changes must restore the interaction mode and working source without adding preview text to Undo.
 
+In Original and Final, verify sibling images actually load through the source file's folder, including when the two inputs contain different images with the same filename. Repeat after switching views and refreshing. Saved and exported Markdown must retain its original relative image paths.
+
 Capture History after refresh, reopening an accepted and rejected passage, a related group of overlapping changes, and the disabled reopening explanation after that passage is edited. Include a long length-changing suggestion with later unrelated edits on both sides. Capture Read after clicking the document and typing: it must remain Read, keep focus in the document and leave the file unchanged.
 
 Reopen decisions from far away in a long document. After History closes, capture the restored passage below the sticky toolbar on desktop, a narrow phone and after unfolding. Include a native suggestion and a YAML-only decision, which returns to its metadata panel.

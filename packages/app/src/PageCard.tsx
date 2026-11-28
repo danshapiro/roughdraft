@@ -2481,7 +2481,9 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
 
   useLayoutEffect(() => {
     if (!editor || editor.isDestroyed) return;
-    if (!isEditableReview) {
+    // Outcome previews also receive source-relative models. Resolve only their
+    // displayed URLs, leaving the supplied document and Markdown unchanged.
+    if (!isEditableReview && !isControlled) {
       editor.unregisterPlugin(markdownPreviewUrlsKey);
       return;
     }
@@ -2494,7 +2496,7 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
         next,
       ],
     );
-  }, [editor, isEditableReview, resolveFileUrl, resolveLinkUrl]);
+  }, [editor, isControlled, isEditableReview, resolveFileUrl, resolveLinkUrl]);
 
   useEffect(() => {
     if (!editor || isControlled) return;

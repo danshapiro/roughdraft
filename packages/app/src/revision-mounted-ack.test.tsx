@@ -90,15 +90,22 @@ const bufferedSuffix = "klmnopqrstklmnopqrst";
 const privateComment = "Unfinished edit to the existing comment.";
 const privateReply = "Unfinished reply to the pending suggestion.";
 
+const draftFixtures = new Map<string, RevisionDraft>();
 function draft(markdown: string): RevisionDraft {
-  return {
-    markdown,
-    cleanMarkdown: cleanRevisionSourceMarkdown(markdown),
-    decisions: {},
-    reviewComments: [
-      ...criticMarkdownToEditorState(markdown).comments.values(),
-    ].map((comment) => ({ ...comment, changeId: "document" })),
-  };
+  let fixture = draftFixtures.get(markdown);
+  if (!fixture) {
+    fixture = {
+      markdown,
+      cleanMarkdown: cleanRevisionSourceMarkdown(markdown),
+      decisions: {},
+      reviewComments: [
+        ...criticMarkdownToEditorState(markdown).comments.values(),
+      ].map((comment) => ({ ...comment, changeId: "document" })),
+    };
+    draftFixtures.set(markdown, fixture);
+  }
+  // Repeated immutable source setup must not share mutable review/UI state.
+  return structuredClone(fixture);
 }
 function state(
   value = draft(original),
@@ -159,6 +166,7 @@ let root: ReturnType<typeof createRoot>;
 let container: HTMLDivElement;
 let controller: RevisionSessionController | null;
 beforeEach(() => {
+  draftFixtures.clear();
   controller = null;
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal(
