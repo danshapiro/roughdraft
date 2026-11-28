@@ -70,6 +70,7 @@ interface Turn {
   expiresAt: number;
   /** A queued handoff binds its revision when the selected page requests it. */
   reservation?: SyncReservation;
+  handedOff?: boolean;
 }
 const MAX_REVIEW_RESERVATION_MS = 750;
 export class ReviewReservations {
@@ -169,6 +170,47 @@ export class ReviewReservations {
       reservation,
     });
     return reservation;
+  }
+
+  /** Exclude only the original handoff's synchronous journal work, once. */
+  handOff(
+    id: string,
+    page: string,
+    reservation: SyncReservation,
+    journalStartedAt: number,
+  ): SyncReservation | null {
+    const turn = this.turns.get(id);
+    if (
+      !turn ||
+      turn.owner !== page ||
+      turn.token !== reservation.token ||
+      turn.reservation?.revision !== reservation.revision
+    )
+      return null;
+    if (turn.handedOff) return this.current(id, page, reservation);
+    // A turn that expired before this journal started must not be revived.
+    // An earlier queued handoff keeps the time already spent waiting.
+    if (turn.expiresAt <= journalStartedAt) return null;
+    const elapsed = Math.max(0, this.now() - journalStartedAt);
+    turn.expiresAt += elapsed;
+    turn.reservation = { ...turn.reservation, expiresAt: turn.expiresAt };
+    turn.handedOff = true;
+    return { ...turn.reservation };
+  }
+
+  /** Project an active ephemeral deadline without allocating or renewing it. */
+  current(
+    id: string,
+    page: string,
+    reservation: SyncReservation,
+  ): SyncReservation | null {
+    this.clean(id);
+    const turn = this.turns.get(id);
+    return turn?.owner === page &&
+      turn.token === reservation.token &&
+      turn.reservation?.revision === reservation.revision
+      ? { ...turn.reservation }
+      : null;
   }
 
   release(id: string, page: string): void {

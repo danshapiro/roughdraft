@@ -1381,10 +1381,20 @@ export class ComparisonStore {
   }
   private liveOperationResult(
     result: SyncResult<Comparison>,
+    record: OperationRecord<Comparison>,
   ): SyncResult<Comparison> {
     const context = this.operations.context();
+    const reservation =
+      result.reservation && result.state?.review.id === record.reviewId
+        ? this.reservations.current(
+            record.reviewId,
+            record.operation.pageInstanceId,
+            result.reservation,
+          )
+        : null;
     return {
       ...result,
+      ...(reservation ? { reservation } : {}),
       ...(result.state
         ? { state: { ...result.state, operationContext: context } }
         : {}),
@@ -1411,12 +1421,12 @@ export class ComparisonStore {
             "Operation is unrecorded. Resolve its saved identity before retrying.",
         };
       if (record.phase === "done" && record.result)
-        return this.liveOperationResult(record.result);
+        return this.liveOperationResult(record.result, record);
       const review = this.readReview(record.reviewId);
       const marker =
         review.operationOutcomes?.[record.operation.pageInstanceId];
       if (marker?.id === id && record.result)
-        return this.liveOperationResult(record.result);
+        return this.liveOperationResult(record.result, record);
       return {
         status: "publishing",
         operationId: id,
@@ -1641,6 +1651,7 @@ export class ComparisonStore {
         result: SyncResult<Comparison>,
         allowCompactRetry = true,
       ) => {
+        const journalStartedAt = this.operations.now();
         if (
           capabilities.compactRetry &&
           allowCompactRetry &&
@@ -1653,17 +1664,29 @@ export class ComparisonStore {
             retryRevision: review.revision,
             operationContext: this.operations.context(),
           };
+        this.operations.prepare(record, result, { terminal: true });
+        const completed = this.operations.finish(record);
+        const reservation = completed.reservation
+          ? this.reservations.handOff(
+              id,
+              operation.pageInstanceId,
+              completed.reservation,
+              journalStartedAt,
+            )
+          : null;
+        const outgoing = reservation
+          ? { ...completed, reservation }
+          : completed;
         log("sync-deferred", {
           id,
           operationId: operation.operationId,
           revision: review.revision,
-          result: result.status,
-          retryAfter: result.retryAfter,
-          reservationExpiresAt: result.reservation?.expiresAt,
+          result: outgoing.status,
+          retryAfter: outgoing.retryAfter,
+          reservationExpiresAt: outgoing.reservation?.expiresAt,
           reason: typeof body.reason === "string" ? body.reason : "sync",
         });
-        this.operations.prepare(record, result, { terminal: true });
-        return this.operations.finish(record);
+        return outgoing;
       };
       if (review.pendingPublication?.owner === this.operations.owner) {
         this.recoverPublication(review);
