@@ -120,6 +120,26 @@ describe("production static delivery", () => {
     }
   });
 
+  it("honors tied client preferences, wildcard support and explicit exclusions", async () => {
+    for (const [header, expected] of [
+      ["br,gzip", "br"],
+      ["gzip,br", "gzip"],
+      ["*;q=1,identity;q=0", "br"],
+      ["br;q=0,*;q=1,identity;q=0", "gzip"],
+    ]) {
+      const response = await get("/assets/app-Abcd1234.js", {
+        "Accept-Encoding": header,
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers["content-encoding"]).toBe(expected);
+      const decoded =
+        expected === "br"
+          ? brotliDecompressSync(response.body)
+          : gunzipSync(response.body);
+      expect(decoded.toString()).toBe(script);
+    }
+  });
+
   it("keeps identity clients and builds without compressed artifacts working", async () => {
     for (const header of [undefined, "identity", "br;q=0, gzip;q=0"]) {
       const response = await get(
