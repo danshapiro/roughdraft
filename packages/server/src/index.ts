@@ -14,7 +14,7 @@ import express, {
   type Request,
   type Response,
 } from "express";
-import compression from "compression";
+import { jsonCompression } from "./json-compression.js";
 import { atomicWrite, FileChangedError } from "./atomic-write.js";
 import { comparisonRouter } from "./comparisons.js";
 import { logServerEvent } from "./diagnostics.js";
@@ -496,17 +496,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       ? options.remoteDocumentToken
       : null;
   const app = express();
-  app.use(
-    "/api",
-    compression({
-      threshold: 1024,
-      level: 1,
-      filter: (request, response) =>
-        /^application\/(?:[\w.+-]*\+)?json(?:;|$)/i.test(
-          String(response.getHeader("Content-Type") ?? ""),
-        ) && compression.filter(request, response),
-    }),
-  );
+  app.use("/api", jsonCompression());
   const openRequestClients = new Set<OpenRequestClient>();
   const reviewEvents = new ReviewEventQueue();
   const remoteSessions = new Map<string, RemoteSession>();
