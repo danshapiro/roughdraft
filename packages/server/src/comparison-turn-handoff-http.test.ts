@@ -346,6 +346,57 @@ test("a closed queued page does not block an otherwise valid current-base save a
   expect(fs.readFileSync(target, "utf8")).toBe(nextText);
 });
 
+test("a denied compact peer's journal leaves the prepared holder within its unchanged turn", async () => {
+  const target = path.join(root, "source.md");
+  const text = original.slice(0, 20 * 1024);
+  fs.writeFileSync(target, text);
+  const opened = await request(host.app)
+    .post("/api/comparisons/document")
+    .send({ targetPath: target, autosave: target });
+  const route = `/api/comparisons/${opened.body.id}/reconcile`;
+  const state = (
+    await request(host.app).get(`/api/comparisons/${opened.body.id}/state`)
+  ).body as SyncState<Comparison>;
+  const candidate = text.replace("B: old", "B: prepared");
+  const heldBody = {
+    ...body(state, "prepared-holder", "b", candidate, 1),
+    baseSignature: "unavailable-browser-baseline",
+  };
+  const held = await request(host.app).post(route).send(heldBody);
+  expect(held.body.status).toBe("base-unavailable");
+  const turn = held.body.reservation;
+  clock += 200;
+
+  const realSync = fs.fsyncSync;
+  const flush = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+    realSync(fd);
+    // Charge slow storage at the real journal boundary. Six flushes exhaust
+    // the remaining 550 ms; the two required atomic writes leave 150 ms.
+    clock += 100;
+  });
+  const denied = await request(host.app)
+    .post(route)
+    .set("X-Roughdraft-Sync", "compact-v2")
+    .send(body(state, "denied-peer", "c", text, 1));
+  const flushes = flush.mock.calls.length;
+  flush.mockRestore();
+  expect(denied.body.status).toBe("retry-later");
+  expect(denied.body.retryAfter).toBeGreaterThan(0);
+  expect(denied.body.retryAfter).toBeLessThanOrEqual(550);
+
+  const replay = await request(host.app).post(route).send(heldBody);
+  expect(replay.body.reservation).toEqual(turn);
+  const saved = await request(host.app)
+    .post(route)
+    .send({
+      ...body(state, "prepared-holder-commit", "b", candidate, 2),
+      reservationToken: turn.token,
+    });
+  expect(saved.body.status).toBe("committed");
+  expect(flushes).toBe(4);
+  expect(fs.readFileSync(target, "utf8")).toBe(candidate);
+});
+
 test.each([
   125, 250,
 ])("the first delivered merge turn excludes real journal flushes costing %d ms each without renewing on replay or restart", async (flushCost) => {

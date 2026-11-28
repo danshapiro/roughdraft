@@ -346,6 +346,12 @@ export class ComparisonOperations<Review> {
       phase: "running",
     };
     this.write(record);
+    this.register(record);
+    return record;
+  }
+
+  private register(record: OperationRecord<Review>): void {
+    const { operation } = record;
     const page = this.page(operation.pageInstanceId);
     page.lastUsedAt = this.now();
     if (!page.operations.some((item) => item.id === operation.operationId))
@@ -357,6 +363,7 @@ export class ComparisonOperations<Review> {
       [operation.pageInstanceId, page],
     ]);
     for (const id of operation.acknowledgedOperationIds ?? []) {
+      if (id === operation.operationId) continue;
       let item = page.operations.find((entry) => entry.id === id);
       if (item?.acknowledged) continue;
       const previous = this.readHeader(id);
@@ -397,7 +404,26 @@ export class ComparisonOperations<Review> {
       atomicWrite(this.pageFile(pageId), JSON.stringify(values));
       for (const item of removed) this.prunePayload(item.id);
     }
-    return record;
+  }
+
+  /** A known no-effect denial needs its durable result, but no running intent. */
+  deny(
+    operation: SyncOperation,
+    reviewId: string,
+    result: SyncResult<Review> & { status: "retry-later" },
+  ): SyncResult<Review> {
+    const record: OperationRecord<Review> = {
+      operation,
+      reviewId,
+      createdAt: this.now(),
+      phase: "running",
+    };
+    this.prepare(record, result, { terminal: true });
+    // Preserve the existing page/ACK/pruned-coverage write before returning.
+    // A crash in between still leaves an exact terminal outcome for replay;
+    // maintenance fences its sequence before removing an orphaned header.
+    this.register(record);
+    return this.finish(record);
   }
 
   prepare(

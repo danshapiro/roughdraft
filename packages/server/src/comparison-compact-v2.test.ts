@@ -200,6 +200,9 @@ test("v2 retry markers preserve exact durable outcomes, fair merge turns and res
   expect(record.resultPayload).toBeUndefined();
   expect(record.result).toEqual(blocked.body);
   expect(Buffer.byteLength(raw)).toBeLessThan(4096);
+  // A known denial needs its complete outcome and page index, but no running
+  // publication intent: neither the review nor its file can be changed.
+  expect(v2Flushes).toBe(4);
   expect(v2Flushes).toBeLessThanOrEqual(v1Flushes - 2);
   metrics.push({
     packet: "retry-later",

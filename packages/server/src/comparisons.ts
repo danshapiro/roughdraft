@@ -1646,6 +1646,30 @@ export class ComparisonStore {
         !review.pendingApply
           ? admission()
           : null;
+      if (
+        capabilities.compactRetry &&
+        admitted?.blocked &&
+        !admitted.recoverToken
+      ) {
+        // This request cannot publish. Persist the exact denial and normal
+        // page coverage without a redundant running intent that would spend
+        // the selected page's remaining preparation window on journal I/O.
+        const completed = this.operations.deny(operation, id, {
+          status: "retry-later",
+          retryAfter: this.reservations.remaining(id) || 25,
+          retryRevision: review.revision,
+          operationContext: this.operations.context(),
+        });
+        log("sync-deferred", {
+          id,
+          operationId: operation.operationId,
+          revision: review.revision,
+          result: completed.status,
+          retryAfter: completed.retryAfter,
+          reason: typeof body.reason === "string" ? body.reason : "sync",
+        });
+        return completed;
+      }
       const record = this.operations.begin(operation, id);
       const reject = (
         result: SyncResult<Comparison>,
