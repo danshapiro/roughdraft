@@ -266,7 +266,7 @@ test("v2 publication deferrals retain the complete recoverable publication state
   review.pendingPublication = {
     owner: "another-owner",
     processInstance: "stopped-process",
-    startedAt: Date.now() - 31_000,
+    startedAt: state.operationContext.acceptUntil - 120_000 - 31_000,
     operation: {
       operationId: "unfinished-publication",
       pageInstanceId: "other-page",
