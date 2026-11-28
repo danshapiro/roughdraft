@@ -393,7 +393,7 @@ export function splitYamlDocumentMetadata(
   if (!isRoughdraftReviewEndmatter(candidate)) {
     return { frontmatter, body, endmatter: null };
   }
-  if (!precedingBody.includes("{#")) {
+  if (!precedingBody.includes("{#") && !frontmatter?.includes("{#")) {
     const yamlText = candidate.replace(/^---[ \t]*(?:\r\n|\n)/, "");
     const parsed = parseYaml(yamlText) as Record<string, unknown> | null;
     if (!hasDocumentLevelComment(parsed?.comments)) {

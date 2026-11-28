@@ -471,6 +471,8 @@ function serializeReviewEndmatter(
   changes: Map<string, CriticChangeAttrs>,
   enabled: boolean,
   encodedCodeComments: ReadonlySet<string>,
+  frontmatterComments: ReadonlySet<string> = new Set(),
+  frontmatterSuggestions: ReadonlySet<string> = new Set(),
 ): string | null {
   if (!enabled) return null;
 
@@ -496,6 +498,14 @@ function serializeReviewEndmatter(
     );
   }
 
+  for (const [id, entry] of commentEntries) {
+    if (frontmatterComments.has(id)) entry.frontmatterAnchor = true;
+    else delete entry.frontmatterAnchor;
+  }
+  for (const [id, entry] of suggestionEntries) {
+    if (frontmatterSuggestions.has(id)) entry.frontmatterAnchor = true;
+    else delete entry.frontmatterAnchor;
+  }
   if (
     areEndmatterMapsEqual(parsed.comments, commentEntries) &&
     areEndmatterMapsEqual(parsed.suggestions, suggestionEntries)
@@ -1283,7 +1293,7 @@ function addCriticCommentRule(
   };
 }
 
-function addCriticCodeBlockRule(
+function literalReviewSerializer(
   service: TurndownService,
   comments: Map<string, CriticComment>,
   useEndmatter: boolean,
@@ -1329,10 +1339,26 @@ function addCriticCodeBlockRule(
         [],
         useEndmatter,
         encodedCodeComments,
+        (element) => [...element.childNodes].map(serializeCode).join(""),
       );
     }
     return content;
   };
+  return serializeCode;
+}
+
+function addCriticCodeBlockRule(
+  service: TurndownService,
+  comments: Map<string, CriticComment>,
+  useEndmatter: boolean,
+  encodedCodeComments: ReadonlySet<string>,
+) {
+  const serializeCode = literalReviewSerializer(
+    service,
+    comments,
+    useEndmatter,
+    encodedCodeComments,
+  );
   service.addRule("criticCodeBlock", {
     filter: (node) => {
       if (node.nodeName !== "PRE") return false;
@@ -1439,6 +1465,7 @@ function serializeCriticChangeElement(
   extraCommentIds: string[] = [],
   useEndmatter = false,
   encodedCodeComments?: ReadonlySet<string>,
+  literalReplacement?: (element: HTMLElement) => string,
 ) {
   const change = getElementChangeAttrs(element);
 
@@ -1495,7 +1522,9 @@ function serializeCriticChangeElement(
       change.changeId,
     )
   ) {
-    const replacement = service.turndown(nextElement).trim();
+    const replacement = literalReplacement
+      ? literalReplacement(nextElement)
+      : service.turndown(nextElement).trim();
     return `{~~${body}~>${payload(replacement)}~~}${metadata}${commentBlocks}`;
   }
 
@@ -1893,6 +1922,140 @@ export function criticMarkdownToRenderedHtml(
   return { html, comments, changes, frontmatter, endmatter };
 }
 
+function renderFrontmatterReviewText(
+  text: string,
+  comments: Map<string, CriticComment>,
+  changes: Map<string, CriticChangeAttrs>,
+  review: ParsedEndmatter,
+): string {
+  if (
+    ![...review.comments.values(), ...review.suggestions.values()].some(
+      (entry) => entry.frontmatterAnchor === true,
+    )
+  )
+    return escapeHtml(text);
+  const lexer = {
+    inlineTokens: (value: string) => [
+      { type: "text", raw: value, text: value },
+    ],
+  } as unknown as TokenizerThis["lexer"];
+  const tokensText = (tokens: Token[] = []) =>
+    tokens.map((token) => ("text" in token ? token.text : token.raw)).join("");
+  const render = (value: string) =>
+    renderFrontmatterReviewText(value, comments, changes, review);
+  let html = "";
+  for (let offset = 0; offset < text.length; ) {
+    const source = text.slice(offset);
+    if (source.startsWith("\\")) {
+      html += escapeHtml(source.slice(0, 2));
+      offset += Math.min(2, source.length);
+      continue;
+    }
+    if (source.startsWith("{==")) {
+      const result = tokenizeCriticCommentAnchor(
+        lexer,
+        source,
+        comments.values(),
+        review,
+      );
+      if (
+        result?.comments.every(
+          (comment) =>
+            review.comments.get(comment.id)?.frontmatterAnchor === true,
+        )
+      ) {
+        for (const comment of result.comments)
+          comments.set(comment.id, comment);
+        const encoded = result.comments.some(
+          (comment) =>
+            review.comments.get(comment.id)?.codeAnchorEncoding === "backslash",
+        );
+        const anchor = tokensText(result.token.tokens);
+        html += `<span data-comment-ids="${escapeHtml(JSON.stringify(result.token.commentIds))}">${render(encoded ? decodeCodeAnchor(anchor) : anchor)}</span>`;
+        offset += result.token.raw.length;
+        continue;
+      }
+    }
+    if (/^\{(?:\+\+|--|~~)/.test(source)) {
+      const result = tokenizeCriticChange(
+        lexer,
+        source,
+        changes.values(),
+        comments.values(),
+        review,
+      );
+      if (
+        result &&
+        review.suggestions.get(result.token.change.changeId)
+          ?.frontmatterAnchor === true
+      ) {
+        const token = result.token;
+        changes.set(token.change.changeId, token.change);
+        for (const comment of result.comments)
+          comments.set(comment.id, comment);
+        const content =
+          token.change.kind === "substitution-old"
+            ? renderCriticChangeSpan(
+                token.change,
+                render(tokensText(token.oldTokens)),
+                "substitution-old",
+              ) +
+              renderCriticChangeSpan(
+                token.change,
+                render(tokensText(token.newTokens)),
+                "substitution-new",
+              )
+            : renderCriticChangeSpan(
+                token.change,
+                render(tokensText(token.tokens)),
+              );
+        html += token.commentIds.length
+          ? `<span data-comment-ids="${escapeHtml(JSON.stringify(token.commentIds))}">${content}</span>`
+          : content;
+        offset += token.raw.length;
+        continue;
+      }
+    }
+    html += escapeHtml(text[offset++]);
+  }
+  return html;
+}
+
+/** YAML text shares selection/review/history without being parsed as Markdown. */
+export function criticFrontmatterToEditorState(
+  frontmatter: string,
+  endmatter: string | null,
+): {
+  node: JSONContent;
+  comments: Map<string, CriticComment>;
+} {
+  const comments = new Map<string, CriticComment>();
+  const changes = new Map<string, CriticChangeAttrs>();
+  const opening = frontmatter.match(/^---[ \t]*\r?\n/)?.[0] ?? "---\n";
+  const closingMatch = /(?:^|\n)(?:---|\.\.\.)[ \t]*(?:\r?\n[\s\S]*)?$/.exec(
+    frontmatter.slice(opening.length),
+  );
+  const closingAt =
+    opening.length +
+    (closingMatch?.index ?? frontmatter.length - opening.length);
+  let text = frontmatter.slice(opening.length, closingAt);
+  let closing = frontmatter.slice(closingAt);
+  if (text.endsWith("\r") && closing.startsWith("\n")) {
+    text = text.slice(0, -1);
+    closing = `\r${closing}`;
+  }
+  const lineEnding =
+    frontmatter.includes("\r\n") &&
+    !frontmatter.replaceAll("\r\n", "").includes("\n")
+      ? "crlf"
+      : "lf";
+  const html = `<pre data-yaml-frontmatter="true" data-yaml-before="${escapeHtml(encodeURIComponent(opening))}" data-yaml-after="${escapeHtml(encodeURIComponent(closing))}" data-yaml-line-ending="${lineEnding}"><code>${renderFrontmatterReviewText(text.replaceAll("\r\n", "\n"), comments, changes, parseReviewEndmatter(endmatter))}</code></pre>`;
+  return {
+    node: parseHtml(html).content?.[0] ?? { type: "yamlFrontmatter" },
+    comments,
+  };
+}
+
 export function criticMarkdownToEditorState(
   markdown: string,
   options?: CriticMarkdownOptions,
@@ -1903,7 +2066,7 @@ export function criticMarkdownToEditorState(
   endmatter: string | null;
 } {
   const { frontmatter, body, endmatter } = splitYamlDocumentMetadata(markdown);
-  return criticMarkdownBodyToEditorState(
+  const parsed = criticMarkdownBodyToEditorState(
     body,
     {
       frontmatter,
@@ -1912,6 +2075,13 @@ export function criticMarkdownToEditorState(
     },
     options,
   );
+  parsed.doc.attrs = { ...parsed.doc.attrs, frontmatterInContent: true };
+  if (frontmatter) {
+    const yaml = criticFrontmatterToEditorState(frontmatter, endmatter);
+    parsed.doc.content = [yaml.node, ...(parsed.doc.content ?? [])];
+    for (const [id, comment] of yaml.comments) parsed.comments.set(id, comment);
+  }
+  return parsed;
 }
 
 /** Parse a body block using its containing document's already-read metadata. */
@@ -2013,9 +2183,28 @@ export function editorStateToCriticMarkdown(
   comments: Map<string, CriticComment>,
   options?: { frontmatter?: string | null; endmatter?: string | null },
 ): string {
-  const fragment = domSerializer.serializeFragment(
-    schema.nodeFromJSON(doc).content,
-  );
+  const model = schema.nodeFromJSON(doc);
+  const fragment = domSerializer.serializeFragment(model.content);
+  const yamlElement = fragment.firstElementChild?.hasAttribute(
+    "data-yaml-frontmatter",
+  )
+    ? (fragment.firstElementChild as HTMLElement)
+    : null;
+  const frontmatterComments = new Set<string>();
+  const frontmatterSuggestions = new Set<string>();
+  if (yamlElement) {
+    for (const element of yamlElement.querySelectorAll<HTMLElement>(
+      "[data-comment-ids]",
+    ))
+      for (const id of getElementCommentIds(element))
+        frontmatterComments.add(id);
+    for (const element of yamlElement.querySelectorAll<HTMLElement>(
+      "[data-critic-change-id]",
+    )) {
+      const id = element.getAttribute("data-critic-change-id");
+      if (id) frontmatterSuggestions.add(id);
+    }
+  }
   const encodedCodeComments = encodeCommentedCode(fragment);
   const service = createTurndownService();
   const escapeMarkdownText = service.escape.bind(service);
@@ -2028,7 +2217,7 @@ export function editorStateToCriticMarkdown(
       .replace(/~>/g, "~\\>")
       .replaceAll("~", "\\~")
       .replace(/[<&]/g, "\\$&");
-  const frontmatter =
+  let frontmatter =
     options?.frontmatter ??
     (doc as JSONContent & { yamlFrontmatter?: string }).yamlFrontmatter ??
     null;
@@ -2049,22 +2238,46 @@ export function editorStateToCriticMarkdown(
   }
   const useEndmatter =
     Boolean(sourceEndmatter) ||
+    frontmatterComments.size > 0 ||
+    frontmatterSuggestions.size > 0 ||
     encodedCodeComments.size > 0 ||
     splitComments ||
     [...comments.values()].some(needsCommentBody);
   addCriticCommentRule(service, comments, useEndmatter, encodedCodeComments);
   addCriticChangeRule(service, comments, useEndmatter, encodedCodeComments);
   addCriticCodeBlockRule(service, comments, useEndmatter, encodedCodeComments);
+  if (yamlElement) {
+    const code = yamlElement.firstElementChild;
+    const serializeLiteral = literalReviewSerializer(
+      service,
+      comments,
+      useEndmatter,
+      encodedCodeComments,
+    );
+    const yaml = [...(code?.childNodes ?? [])].map(serializeLiteral).join("");
+    frontmatter =
+      decodeURIComponent(yamlElement.dataset.yamlBefore ?? "---%0A") +
+      (yamlElement.dataset.yamlLineEnding === "crlf"
+        ? yaml.replaceAll("\n", "\r\n")
+        : yaml) +
+      decodeURIComponent(yamlElement.dataset.yamlAfter ?? "%0A---%0A%0A");
+    yamlElement.remove();
+  } else if (doc.attrs?.frontmatterInContent) {
+    frontmatter = null;
+  }
   const endmatter = serializeReviewEndmatter(
     sourceEndmatter,
     comments,
     changes,
     useEndmatter,
     encodedCodeComments,
+    frontmatterComments,
+    frontmatterSuggestions,
   );
+  const body = service.turndown(fragment).trimEnd();
   return appendYamlEndmatter(
     prependYamlFrontmatter(
-      normalizeBlockSpacing(`${service.turndown(fragment).trimEnd()}\n`),
+      body ? normalizeBlockSpacing(`${body}\n`) : frontmatter ? "" : "\n",
       frontmatter,
     ),
     endmatter,

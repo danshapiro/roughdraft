@@ -1179,6 +1179,71 @@ const HeadingTargets = Extension.create({
 });
 
 // Display projections share a source-block identity even when their layout differs.
+// YAML remains literal text, but lives in the same document as prose so
+// selection, review marks and document Undo all work on it normally.
+const YamlFrontmatter = Node.create({
+  name: "yamlFrontmatter",
+  group: "block",
+  content: "text*",
+  marks: "commentRef criticChange",
+  code: true,
+  defining: true,
+  addGlobalAttributes: () => [
+    {
+      types: ["doc"],
+      attributes: { frontmatterInContent: { default: false, rendered: false } },
+    },
+  ],
+  addAttributes: () => ({
+    opening: { default: "---\n", rendered: false },
+    closing: { default: "\n---\n\n", rendered: false },
+    lineEnding: { default: "\n", rendered: false },
+  }),
+  parseHTML: () => [
+    {
+      tag: "pre[data-yaml-frontmatter]",
+      priority: 1100,
+      preserveWhitespace: "full",
+      getAttrs: (element) => ({
+        opening: decodeURIComponent(
+          (element as HTMLElement).dataset.yamlBefore ?? "---%0A",
+        ),
+        closing: decodeURIComponent(
+          (element as HTMLElement).dataset.yamlAfter ?? "%0A---%0A%0A",
+        ),
+        lineEnding:
+          (element as HTMLElement).dataset.yamlLineEnding === "crlf"
+            ? "\r\n"
+            : "\n",
+      }),
+    },
+  ],
+  renderHTML: ({ node }) => [
+    "pre",
+    {
+      "data-yaml-frontmatter": "true",
+      "data-testid": "yaml-frontmatter",
+      "data-yaml-before": encodeURIComponent(node.attrs.opening),
+      "data-yaml-after": encodeURIComponent(node.attrs.closing),
+      "data-yaml-opening": node.attrs.opening.trim(),
+      "data-yaml-closing": node.attrs.closing.trim(),
+      "data-yaml-line-ending": node.attrs.lineEnding === "\r\n" ? "crlf" : "lf",
+      class: "yaml-frontmatter",
+    },
+    ["code", 0],
+  ],
+  addKeyboardShortcuts() {
+    return {
+      Enter: () =>
+        this.editor.isActive(this.name) &&
+        this.editor.commands.insertContent("\n"),
+      Tab: () =>
+        this.editor.isActive(this.name) &&
+        this.editor.commands.insertContent("  "),
+    };
+  },
+});
+
 const ComparisonReadingAnchor = Extension.create({
   name: "comparisonReadingAnchor",
   addGlobalAttributes() {
@@ -1188,6 +1253,7 @@ const ComparisonReadingAnchor = Extension.create({
           "paragraph",
           "heading",
           "codeBlock",
+          "yamlFrontmatter",
           "bulletList",
           "orderedList",
           "taskList",
@@ -1325,6 +1391,7 @@ export function createEditorExtensions(
     EndnoteDefinition,
     HeadingTargets,
     MarkdownCodeBlock,
+    YamlFrontmatter,
     CommentHighlight,
     CriticChangeHighlight,
     image.configure({

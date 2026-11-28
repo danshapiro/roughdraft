@@ -5,6 +5,7 @@ import { Marked } from "marked";
 import {
   type CriticComment,
   criticMarkdownBodyToEditorState,
+  criticFrontmatterToEditorState,
   criticMarkdownToEditorState,
   readReviewEndmatter,
 } from "./critic-markup";
@@ -243,6 +244,12 @@ export function parseRemoteRevision(
   const sourceRanges: NonNullable<ParsedSource["sourceBlocks"]> = [];
   const comments = new Map<string, CriticComment>();
   const used = new Set<string>();
+  if (frontmatter) {
+    const yaml = criticFrontmatterToEditorState(frontmatter, endmatter);
+    nodes.push(state.schema.nodeFromJSON(yaml.node));
+    sourceRanges.push({ from: 0, to: frontmatter.length, index: 0, count: 1 });
+    for (const [id, comment] of yaml.comments) comments.set(id, comment);
+  }
   const plainParagraph = state.schema.nodes.paragraph?.create();
   for (const span of blocks.spans) {
     const raw = body.slice(span.from, span.to);
@@ -353,7 +360,10 @@ export function parseRemoteRevision(
     return live?.eq(next) ? live : next;
   });
   return {
-    doc: state.schema.topNodeType.create(null, normalized),
+    doc: state.schema.topNodeType.create(
+      { frontmatterInContent: true },
+      normalized,
+    ),
     comments,
     frontmatter,
     endmatter,

@@ -85,6 +85,7 @@ import {
 } from "./revision-clean-cache";
 import {
   createReviewedChangesPlugin,
+  hydrateReviewedChanges,
   mapRemoteReviewedChanges,
   reviewedChanges,
 } from "./revision-history";
@@ -105,7 +106,10 @@ import {
 } from "./revision-private-anchors";
 import { publicRevisionNode } from "./revision-private-comments";
 import { suggestionPositions } from "./revision-projection";
-import { documentProposalIdentities } from "./revision-proposal-identities";
+import {
+  documentProposalIdentities,
+  literalFrontmatterReviewIds,
+} from "./revision-proposal-identities";
 import { rebaseRemoteMetadata } from "./revision-remote-metadata";
 import {
   parseRemoteRevision,
@@ -562,7 +566,7 @@ function addCommentIdsToAnchor(
 function getDocumentCriticChanges(
   editor: Editor,
 ): Array<Pick<CriticChangeAttrs, "changeId">> {
-  return documentProposalIdentities(editor.state.doc);
+  return documentProposalIdentities(editor.state.doc, true);
 }
 
 function suggestionText(
@@ -1246,8 +1250,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           ? {
               ...parsedContent.doc,
               attrs: {
+                ...parsedContent.doc.attrs,
                 kept: editableReview.decisions,
-                reviewed: editableReview.reviewed ?? [],
+                reviewed: hydrateReviewedChanges(
+                  parsedContent.doc,
+                  editableReview.reviewed ?? [],
+                ),
                 sourceMetadata: {
                   markdown: sourceMarkdown,
                   sourceSpelling: sourceMarkdown,
@@ -2252,7 +2260,10 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
           ),
         );
         const incomingDoc = parsed.doc.type.create(
-          { ...parsed.doc.attrs, reviewed: draft.reviewed ?? [] },
+          {
+            ...parsed.doc.attrs,
+            reviewed: hydrateReviewedChanges(parsed.doc, draft.reviewed ?? []),
+          },
           parsed.doc.content,
         );
         if (
@@ -2319,7 +2330,10 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
             transaction,
           ).map((change) => [change.id, change]),
         );
-        const history = (draft.reviewed ?? []).map((change) => {
+        const history = hydrateReviewedChanges(
+          parsed.doc,
+          draft.reviewed ?? [],
+        ).map((change) => {
           const local = localHistory.get(change.id);
           if (local && local.decision === change.decision) return local;
           const origin = change.originSignature
@@ -2981,7 +2995,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
     const comment = createCriticComment(
       editableReviewRef.current ? { id: createPrivateCommentId() } : undefined,
       {
-        existingComments: commentsRef.current.values(),
+        existingComments: [
+          ...commentsRef.current.values(),
+          ...literalFrontmatterReviewIds(currentEditor.state.doc).map((id) => ({
+            id,
+          })),
+        ],
       },
     );
     const anchor = capturePrivateCommentAnchor(
@@ -3200,7 +3219,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
             : {}),
         },
         {
-          existingComments: commentsRef.current.values(),
+          existingComments: [
+            ...commentsRef.current.values(),
+            ...literalFrontmatterReviewIds(currentEditor.state.doc).map(
+              (id) => ({ id }),
+            ),
+          ],
         },
       );
       suppressNextMarkdownUpdateRef.current = true;
@@ -3386,7 +3410,12 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
             : {}),
         },
         {
-          existingComments: commentsRef.current.values(),
+          existingComments: [
+            ...commentsRef.current.values(),
+            ...literalFrontmatterReviewIds(currentEditor.state.doc).map(
+              (id) => ({ id }),
+            ),
+          ],
         },
       );
       suppressNextMarkdownUpdateRef.current = true;

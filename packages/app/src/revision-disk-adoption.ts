@@ -7,6 +7,7 @@ import {
   reviewDraftSignature,
   reviewHistoryProposalIds,
   roughdraftAttachmentContexts,
+  roughdraftFrontmatterReviewIds,
   type SyncDraft,
   type SyncMerge,
 } from "@roughdraft/rfm";
@@ -17,6 +18,7 @@ import type { CriticComment } from "./critic-markup";
 import { rejectCriticChangeTransaction } from "./editor-extensions";
 import { splitYamlDocumentMetadata } from "./markdown";
 import { suggestionDetail } from "./revision-bulk";
+import { hydrateReviewedChanges } from "./revision-history";
 import { cleanRevisionNode, cleanSourceFromNode } from "./revision-clean-cache";
 import {
   cleanRevisionSourceMarkdown,
@@ -328,10 +330,12 @@ function* readDiskSidesWork(
   for (const source of [diskBase.markdown, markdown]) {
     for (const item of extractRoughdraftReviewIndex(source).items)
       rawIds.add(item.id);
+    for (const id of roughdraftFrontmatterReviewIds(source)) rawIds.add(id);
     yield;
   }
   const targets = new Set(Object.values(aliases));
   const used = new Set([
+    ...roughdraftFrontmatterReviewIds(review.markdown),
     ...rawIds,
     ...targets,
     ...Object.keys(aliases),
@@ -677,6 +681,9 @@ function* reloadRawDiskWork(
     ...reserved,
   ]);
   const used = new Set([
+    ...roughdraftFrontmatterReviewIds(review.markdown),
+    ...roughdraftFrontmatterReviewIds(markdown),
+    ...roughdraftFrontmatterReviewIds(diskBase.markdown),
     ...owned,
     ...diskFeedback.meanings.keys(),
     ...Object.keys(aliases),
@@ -826,6 +833,11 @@ function* adoptDiskWork(
 ): RevisionWork<SyncDraft | null> {
   let state = context ?? EditorState.create({ schema });
   const parsedBase = parseRemoteRevision(base.markdown, state);
+  if (base.reviewed?.some((change) => change.frontmatterInContent !== true))
+    base = {
+      ...base,
+      reviewed: hydrateReviewedChanges(parsedBase.doc, base.reviewed),
+    };
   yield;
   state = EditorState.create({
     schema,

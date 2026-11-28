@@ -55,6 +55,7 @@ function normalizedDraft(draft: SyncDraft) {
       unmappedSince: change.unmappedSince ?? null,
       originSignature: change.originSignature ?? null,
       metadata: change.metadata ?? null,
+      frontmatterInContent: Boolean(change.frontmatterInContent),
     })),
     outdatedSuggestions: draft.outdatedSuggestions ?? [],
     ...(draft.diskOrigin ? { diskOrigin: draft.diskOrigin } : {}),

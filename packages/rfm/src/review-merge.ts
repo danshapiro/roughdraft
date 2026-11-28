@@ -4,6 +4,7 @@ import {
   type RfmReviewItem,
   type RfmReviewRange,
   roughdraftAttachmentContexts,
+  roughdraftFrontmatterReviewIds,
   scanRoughdraftReview,
 } from "./index.js";
 import {
@@ -532,6 +533,9 @@ export function mergeReviewDrafts(
         .map((entry) => entry.id),
     );
     const used = new Set([
+      ...[base, local, incoming].flatMap((draft) =>
+        roughdraftFrontmatterReviewIds(draft.markdown),
+      ),
       ...indexes.flatMap((items) => [...items.keys()]),
       ...inverseIds.flatMap((ids) => [...ids]),
     ]);
@@ -609,8 +613,11 @@ export function mergeReviewDrafts(
       throw new UnsupportedReviewMerge(
         "The annotated and clean browser projections require client reconciliation.",
       );
+    const frontmatterAsText = scans.some((scan) =>
+      scan.items.some((item) => item.offset < scan.frontmatterEnd),
+    );
     const parts = [base, local, incoming].map((draft) =>
-      splitReviewSource(draft.markdown),
+      splitReviewSource(draft.markdown, frontmatterAsText),
     );
     check();
     const metadata = (key: "frontmatter" | "endmatter") => {

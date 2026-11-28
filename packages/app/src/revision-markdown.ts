@@ -98,6 +98,7 @@ export function needsSourceProjection(
   const code =
     inCode ||
     node.type === "codeBlock" ||
+    node.type === "yamlFrontmatter" ||
     Boolean(node.marks?.some((mark) => mark.type === "code"));
   return Boolean(
     node.type === "criticChangeBlock" ||

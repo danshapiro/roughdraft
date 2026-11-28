@@ -125,15 +125,25 @@ export function decideReviewChanges(
   const otherSource = reference?.attrs.sourceMetadata?.markdown;
   const beforeMetadata = documentMetadata(source ?? "");
   const otherMetadata = documentMetadata(otherSource ?? "");
+  const frontmatterInContent = Boolean(
+    state.doc.attrs.frontmatterInContent ||
+      state.doc.firstChild?.type.name === "yamlFrontmatter" ||
+      reference?.firstChild?.type.name === "yamlFrontmatter",
+  );
   const metadataPending =
     source !== undefined &&
     otherSource !== undefined &&
-    !sameMetadata(beforeMetadata, otherMetadata) &&
+    (frontmatterInContent
+      ? beforeMetadata.endmatter !== otherMetadata.endmatter
+      : !sameMetadata(beforeMetadata, otherMetadata)) &&
     !ignored.has("document-metadata");
-  const afterMetadata =
+  const selectedMetadata =
     (decision === "accept") === (base === "new")
       ? beforeMetadata
       : otherMetadata;
+  const afterMetadata = frontmatterInContent
+    ? { ...selectedMetadata, frontmatter: beforeMetadata.frontmatter }
+    : selectedMetadata;
   if (metadataPending) {
     const markdown = withDocumentMetadata(source, afterMetadata);
     const parsed = criticMarkdownToEditorState(markdown);
@@ -177,6 +187,7 @@ export function decideReviewChanges(
     const current = tr.doc.slice(from, to);
     return {
       id: createReviewedChangeId(),
+      frontmatterInContent: true,
       decision,
       oldText: group
         .map((item) => item.oldText)
@@ -196,6 +207,7 @@ export function decideReviewChanges(
   if (metadataPending)
     reviewed.push({
       id: createReviewedChangeId(),
+      frontmatterInContent: true,
       decision,
       oldText:
         [

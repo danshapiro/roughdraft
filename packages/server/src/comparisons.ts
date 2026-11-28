@@ -80,6 +80,8 @@ export interface DocumentMetadata {
   endmatter: string | null;
 }
 export interface ReviewedChange {
+  /** Missing on stored records whose positions excluded frontmatter. */
+  frontmatterInContent?: boolean;
   id: string;
   decision: "accept" | "reject";
   oldText: string;
@@ -479,6 +481,14 @@ function reviewedField(value: unknown): ReviewedChange[] | undefined {
       );
     if (input.stale !== undefined && typeof input.stale !== "boolean")
       throw new ComparisonError(400, "Reviewed change stale must be boolean");
+    if (
+      input.frontmatterInContent !== undefined &&
+      typeof input.frontmatterInContent !== "boolean"
+    )
+      throw new ComparisonError(
+        400,
+        "Reviewed change frontmatterInContent must be boolean",
+      );
     const metadata =
       input.metadata === undefined ? undefined : objectBody(input.metadata);
     return {
@@ -492,6 +502,9 @@ function reviewedField(value: unknown): ReviewedChange[] | undefined {
         to: guard.to as number,
         slice: guard.slice,
       },
+      ...(input.frontmatterInContent !== undefined
+        ? { frontmatterInContent: input.frontmatterInContent as boolean }
+        : {}),
       ...(keptId !== undefined ? { keptId } : {}),
       ...(input.keptIds !== undefined
         ? { keptIds: [...(input.keptIds as string[])] }

@@ -145,7 +145,7 @@ function renumberMarkdown(markdown: string, ids: Record<string, string>) {
       }
     }
   }
-  const parts = splitReviewSource(markdown);
+  const parts = splitReviewSource(markdown, true);
   if (parts.endmatter) {
     const block = parts.endmatter;
     patches.push(

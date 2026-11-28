@@ -210,7 +210,7 @@ test("History reveals reopened YAML fields from the bottom of a long document @s
     const { id } = await response.json();
     await page.goto(`/?comparison=${id}`);
     await expect(page.getByTestId("revision-pending")).toHaveText("1");
-    await page.getByTestId("revision-metadata-accept").click();
+    await page.getByTestId(/^comment-rail-.*-action-accept$/).click();
     await expect(page.getByTestId("revision-pending")).toBeEmpty();
     await expect(page.getByTestId("revision-file-status")).toHaveAttribute(
       "aria-label",
@@ -224,7 +224,7 @@ test("History reveals reopened YAML fields from the bottom of a long document @s
     await history.getByTestId("revision-reopen-change").click();
     await expect(history).toBeHidden();
     await expect(page.getByTestId("revision-pending")).toHaveText("1");
-    const fields = page.getByTestId("revision-metadata");
+    const fields = richTextEditor(page).getByTestId("yaml-frontmatter");
     await expect
       .poll(async () => {
         const position = await passagePosition(page, fields);

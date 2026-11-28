@@ -170,6 +170,61 @@ const dateTimePattern =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const attributeNamePattern = /^[A-Za-z][A-Za-z0-9_-]*$/;
 
+function frontmatterLength(markdown: string): number {
+  return (
+    markdown.match(
+      /^---[ \t]*\r?\n(?:[\s\S]*?\r?\n)?(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/,
+    )?.[0].length ?? 0
+  );
+}
+
+/** Literal YAML references remain reserved when allocating or aliasing review IDs. */
+export function roughdraftFrontmatterReviewIds(markdown: string): string[] {
+  const end = frontmatterLength(markdown);
+  if (!end) return [];
+  return [
+    ...new Set(
+      [
+        ...markdown
+          .slice(0, end)
+          .matchAll(
+            /\{#([A-Za-z][A-Za-z0-9_-]*)\}|\bid="([A-Za-z][A-Za-z0-9_-]*)"/g,
+          ),
+      ].map((match) => match[1] ?? match[2]),
+    ),
+  ];
+}
+
+// YAML values may quote literal CriticMarkup. Only entries explicitly written
+// by the editor as frontmatter anchors opt into review parsing in that region.
+function frontmatterReviewAt(
+  markdown: string,
+  offset: number,
+  endmatter: RoughdraftEndmatter,
+): boolean {
+  if (markdown[offset] !== "{") return false;
+  const noop = () => {};
+  if (markdown.startsWith("{==", offset)) {
+    const end = findRoughdraftDelimiter(markdown, "==}", offset + 3);
+    if (end < 0) return false;
+    return frontmatterReviewAt(markdown, end + 3, endmatter);
+  }
+  const comment = markdown.startsWith("{>>", offset)
+    ? parseComment(markdown, offset, noop)
+    : null;
+  if (comment)
+    return (
+      endmatter.comments.get(comment.metadata?.attrs.get("id") ?? "")
+        ?.frontmatterAnchor === true
+    );
+  const suggestion = parseSuggestion(markdown, offset, noop);
+  return Boolean(
+    suggestion &&
+      endmatter.suggestions.get(suggestion.metadata?.attrs.get("id") ?? "")
+        ?.frontmatterAnchor === true,
+  );
+}
+
 export function validateRoughdraftMarkdown(
   markdown: string,
 ): RfmValidationResult {
@@ -326,10 +381,18 @@ export function validateRoughdraftMarkdown(
 
   let offset = 0;
   const scanEndOffset = endmatter.offset ?? markdown.length;
+  const frontmatterEnd = frontmatterLength(markdown);
   let fence: FenceState | null = null;
 
   while (offset < scanEndOffset) {
-    if (isLineStart(markdown, offset)) {
+    if (
+      offset < frontmatterEnd &&
+      !frontmatterReviewAt(markdown, offset, endmatter)
+    ) {
+      offset++;
+      continue;
+    }
+    if (offset >= frontmatterEnd && isLineStart(markdown, offset)) {
       const fenceMatch = matchFence(markdown, offset, fence);
       if (fenceMatch) {
         fence = fence ? null : fenceMatch.fence;
@@ -348,7 +411,8 @@ export function validateRoughdraftMarkdown(
       continue;
     }
 
-    const codeSpanEnd = matchInlineCodeSpan(markdown, offset);
+    const codeSpanEnd =
+      offset < frontmatterEnd ? null : matchInlineCodeSpan(markdown, offset);
     if (codeSpanEnd !== null) {
       offset = codeSpanEnd;
       continue;
@@ -508,6 +572,7 @@ export interface RfmReviewRange {
 export function scanRoughdraftReview(markdown: string): {
   items: RfmReviewItem[];
   ranges: RfmReviewRange[];
+  frontmatterEnd: number;
 } {
   const lineStarts = createLineStarts(markdown);
   const endmatter = parseRoughdraftEndmatter(markdown);
@@ -523,6 +588,12 @@ export function scanRoughdraftReview(markdown: string): {
   ) => {
     ranges.push({ from: anchorFrom, to: parsed.endOffset });
     const attrs = hydrateMetadataAttrs(parsed.metadata, endmatter, "comment");
+    if (
+      anchorText !== undefined &&
+      parsed.offset < frontmatterEnd &&
+      attrs.get("codeAnchorEncoding") === "backslash"
+    )
+      anchorText = anchorText.replace(/\\([\\{}])/g, "$1");
     const id = attrs.get("id") ?? `comment-${parsed.offset.toString()}`;
     const parentId = attrs.get("re") ?? null;
     const text =
@@ -586,12 +657,20 @@ export function scanRoughdraftReview(markdown: string): {
 
   let offset = 0;
   const scanEndOffset = endmatter.offset ?? markdown.length;
+  const frontmatterEnd = frontmatterLength(markdown);
   // Line starts, escapes, inline code and review openers keep their parser path.
   const ordinary = /[^\\\n`{]+/y;
   let fence: FenceState | null = null;
 
   while (offset < scanEndOffset) {
-    if (isLineStart(markdown, offset)) {
+    if (
+      offset < frontmatterEnd &&
+      !frontmatterReviewAt(markdown, offset, endmatter)
+    ) {
+      offset++;
+      continue;
+    }
+    if (offset >= frontmatterEnd && isLineStart(markdown, offset)) {
       const fenceMatch = matchFence(markdown, offset, fence);
       if (fenceMatch) {
         fence = fence ? null : fenceMatch.fence;
@@ -610,7 +689,8 @@ export function scanRoughdraftReview(markdown: string): {
       continue;
     }
 
-    const codeSpanEnd = matchInlineCodeSpan(markdown, offset);
+    const codeSpanEnd =
+      offset < frontmatterEnd ? null : matchInlineCodeSpan(markdown, offset);
     if (codeSpanEnd !== null) {
       offset = codeSpanEnd;
       continue;
@@ -682,7 +762,7 @@ export function scanRoughdraftReview(markdown: string): {
     });
   }
 
-  return { items, ranges };
+  return { items, ranges, frontmatterEnd };
 }
 
 export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
@@ -718,10 +798,11 @@ export function roughdraftAttachmentContexts(
 function projectRoughdraftMarkdown(
   markdown: string,
   contextOffsets?: readonly number[],
+  literalFrontmatter?: RoughdraftEndmatter,
 ): { text: string; contexts: Map<number, string>; attachment: string } {
-  const endmatter = parseRoughdraftEndmatter(markdown);
+  const endmatter = literalFrontmatter ?? parseRoughdraftEndmatter(markdown);
   const end =
-    endmatter.offset === null
+    literalFrontmatter || endmatter.offset === null
       ? markdown.length
       : markdown[endmatter.offset - 1] === "\r"
         ? endmatter.offset - 1
@@ -748,17 +829,30 @@ function projectRoughdraftMarkdown(
   let fence: FenceState | null = null;
   const noopDiagnostic = () => {};
   // Frontmatter belongs to the document, even when a value quotes markup.
-  const frontmatter = markdown.match(
-    /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/,
-  );
-  if (frontmatter) {
-    result = frontmatter[0];
+  const frontmatterEnd = literalFrontmatter
+    ? markdown.length
+    : frontmatterLength(markdown);
+  const hasFrontmatterReview = [
+    ...endmatter.comments.values(),
+    ...endmatter.suggestions.values(),
+  ].some((entry) => entry.frontmatterAnchor === true);
+  if (frontmatterEnd && !hasFrontmatterReview) {
+    result = markdown.slice(0, frontmatterEnd);
     if (capture) attachment = result;
     offset = result.length;
   }
   while (offset < end) {
     capture?.();
-    if (isLineStart(markdown, offset)) {
+    if (
+      offset < frontmatterEnd &&
+      !frontmatterReviewAt(markdown, offset, endmatter)
+    ) {
+      result += markdown[offset];
+      if (capture) attachment += markdown[offset];
+      offset++;
+      continue;
+    }
+    if (offset >= frontmatterEnd && isLineStart(markdown, offset)) {
       const marker = matchFence(markdown, offset, fence);
       if (marker) fence = fence ? null : marker.fence;
       if (marker || fence) {
@@ -777,7 +871,8 @@ function projectRoughdraftMarkdown(
       offset += 2;
       continue;
     }
-    const codeEnd = matchInlineCodeSpan(markdown, offset);
+    const codeEnd =
+      offset < frontmatterEnd ? null : matchInlineCodeSpan(markdown, offset);
     if (codeEnd !== null) {
       const raw = markdown.slice(offset, codeEnd);
       result += raw;
@@ -791,9 +886,23 @@ function projectRoughdraftMarkdown(
         const content = projectRoughdraftMarkdown(
           markdown.slice(offset + 3, close),
           capture ? [] : undefined,
+          offset < frontmatterEnd ? endmatter : undefined,
         );
-        result += content.text;
-        if (capture) attachment += content.attachment;
+        const comment =
+          offset < frontmatterEnd
+            ? parseComment(markdown, close + 3, noopDiagnostic)
+            : null;
+        const encoded =
+          comment &&
+          endmatter.comments.get(comment.metadata?.attrs.get("id") ?? "")
+            ?.codeAnchorEncoding === "backslash";
+        result += encoded
+          ? content.text.replace(/\\([\\{}])/g, "$1")
+          : content.text;
+        if (capture)
+          attachment += encoded
+            ? content.attachment.replace(/\\([\\{}])/g, "$1")
+            : content.attachment;
         offset = close + 3;
         continue;
       }
@@ -814,6 +923,7 @@ function projectRoughdraftMarkdown(
             ? (suggestion.originalText ?? "")
             : suggestion.text,
         capture ? [] : undefined,
+        offset < frontmatterEnd ? endmatter : undefined,
       );
       result += content.text;
       if (capture) attachment += content.attachment;
@@ -849,7 +959,7 @@ function projectRoughdraftMarkdown(
   // Endmatter-only feedback attaches at the body boundary (including CRLF).
   while (point < points.length && points[point] >= end)
     contexts.set(points[point++], attachment.slice(-40));
-  if (endmatter.data) {
+  if (endmatter.data && !literalFrontmatter) {
     const {
       comments: _comments,
       suggestions: _suggestions,

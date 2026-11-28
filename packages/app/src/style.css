@@ -443,6 +443,30 @@
     color: var(--code-block-foreground);
   }
 
+  .tiptap pre.yaml-frontmatter {
+    border-radius: 0.5rem;
+    border-inline-start-width: 4px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-size: 1rem;
+    line-height: 1.5;
+  }
+
+  .tiptap pre.yaml-frontmatter::before,
+  .tiptap pre.yaml-frontmatter::after {
+    display: block;
+    color: var(--muted-foreground);
+    user-select: none;
+    pointer-events: none;
+  }
+
+  .tiptap pre.yaml-frontmatter::before {
+    content: attr(data-yaml-opening);
+  }
+  .tiptap pre.yaml-frontmatter::after {
+    content: attr(data-yaml-closing);
+  }
+
   .tiptap pre code {
     @apply bg-transparent p-0 text-inherit;
   }

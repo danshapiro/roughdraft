@@ -15,6 +15,8 @@ export interface SyncMetadata {
   endmatter: string | null;
 }
 export interface SyncHistory {
+  /** Missing on stored records whose positions excluded frontmatter. */
+  frontmatterInContent?: boolean;
   id: string;
   decision: "accept" | "reject";
   oldText: string;
