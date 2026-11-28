@@ -8,14 +8,27 @@ import {
 } from "react";
 import { Button } from "./components/ui/button";
 
-class LoadingBoundary extends Component<
-  { label: string; onRetry: () => void; children: ReactNode },
-  { failed: boolean }
-> {
-  state = { failed: false };
+class DeferredDownloadError extends Error {
+  constructor(error: unknown) {
+    super(error instanceof Error ? error.message : String(error), {
+      cause: error,
+    });
+  }
+}
 
-  static getDerivedStateFromError() {
-    return { failed: true };
+class LoadingBoundary extends Component<
+  {
+    label: string;
+    reloadOnRetry: boolean;
+    onRetry: () => boolean;
+    children: ReactNode;
+  },
+  { error: unknown }
+> {
+  state = { error: null as unknown };
+
+  static getDerivedStateFromError(error: unknown) {
+    return { error };
   }
 
   componentDidCatch(error: Error) {
@@ -30,7 +43,11 @@ class LoadingBoundary extends Component<
   }
 
   render() {
-    if (!this.state.failed) return this.props.children;
+    if (this.state.error === null) return this.props.children;
+    // A render error after editing must not become a reload action. Only an
+    // import failure, before that surface mounts, belongs to this boundary.
+    if (!(this.state.error instanceof DeferredDownloadError))
+      throw this.state.error;
     return (
       <div
         role="alert"
@@ -42,11 +59,10 @@ class LoadingBoundary extends Component<
           data-testid="feature-download-retry"
           className="mt-3 min-h-11"
           onClick={() => {
-            this.props.onRetry();
-            this.setState({ failed: false });
+            if (this.props.onRetry()) this.setState({ error: null });
           }}
         >
-          Retry
+          {this.props.reloadOnRetry ? "Reload page" : "Retry"}
         </Button>
       </div>
     );
@@ -57,18 +73,35 @@ class LoadingBoundary extends Component<
 export function deferredComponent<Props extends object>(
   load: (attempt: number) => Promise<{ default: ComponentType<Props> }>,
   label: string,
+  reloadOnRetry = false,
 ) {
   let attempt = 0;
-  let shared = lazy(() => load(0));
+  const download = async (attempt: number) => {
+    try {
+      return await load(attempt);
+    } catch (error) {
+      throw new DeferredDownloadError(error);
+    }
+  };
+  let shared = lazy(() => download(0));
   return function DeferredComponent(props: Props) {
     const [Loaded, setLoaded] = useState(() => shared);
     return (
       <LoadingBoundary
         label={label}
+        reloadOnRetry={reloadOnRetry}
         onRetry={() => {
+          // A failed route dependency is cached in the browser's module map.
+          // The editor has not mounted yet; reload resets that complete map.
+          // Optional source mode instead keeps the live document mounted.
+          if (reloadOnRetry) {
+            window.location.reload();
+            return false;
+          }
           const retry = ++attempt;
-          shared = lazy(() => load(retry));
+          shared = lazy(() => download(retry));
           setLoaded(() => shared);
+          return true;
         }}
       >
         <Suspense

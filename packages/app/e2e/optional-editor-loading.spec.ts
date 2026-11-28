@@ -4,6 +4,71 @@ import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
 import { richTextEditor } from "./helpers";
 
+test("a failed initial review download can reload before the editor is mounted", async ({
+  page,
+  request,
+}, testInfo) => {
+  const scratch = fileURLToPath(
+    new URL("../../../.test-tmp/", import.meta.url),
+  );
+  fs.mkdirSync(scratch, { recursive: true });
+  const project = fs.mkdtempSync(
+    path.join(scratch, "initial-review-download-"),
+  );
+  const filename = path.join(project, "plan.md");
+  const original =
+    "# Plan\n\nThe saved document survives a failed initial download.\n";
+  fs.writeFileSync(filename, original);
+  const api = `http://127.0.0.1:${process.env.API_PORT ?? 4317}`;
+  const counts = new Map<string, number>();
+  let failedUrl = "";
+  try {
+    const shell = await request.get(api);
+    const critical = new Set(
+      [...(await shell.text()).matchAll(/(?:src|href)="([^"]+\.js)"/g)].map(
+        (match) => new URL(match[1], `${api}/`).pathname,
+      ),
+    );
+    await page.route(
+      process.env.PLAYWRIGHT_PRODUCTION === "1"
+        ? "**/assets/*.js"
+        : "**/src/ComparisonReview.tsx",
+      async (route) => {
+        const url = route.request().url();
+        if (critical.has(new URL(url).pathname)) return route.continue();
+        counts.set(url, (counts.get(url) ?? 0) + 1);
+        if (!failedUrl) {
+          failedUrl = url;
+          await route.abort("failed");
+        } else await route.continue();
+      },
+    );
+    const created = await request.post(`${api}/api/comparisons/document`, {
+      data: { targetPath: filename, autosave: "none", handoff: "chat" },
+    });
+    await expect(created).toBeOK();
+    const { id } = await created.json();
+    await page.goto(`/?comparison=${id}`);
+    await expect(page.getByTestId("feature-download-error")).toBeVisible();
+    await expect(richTextEditor(page)).toHaveCount(0);
+    const reload = page.getByTestId("feature-download-retry");
+    await expect(reload).toHaveText("Reload page");
+    await Promise.all([page.waitForEvent("domcontentloaded"), reload.click()]);
+    await expect(richTextEditor(page)).toContainText(
+      "survives a failed initial download",
+    );
+    expect(counts.get(failedUrl)).toBeGreaterThanOrEqual(2);
+    expect(fs.readFileSync(filename, "utf8")).toBe(original);
+  } finally {
+    await testInfo.attach("initial-download-attempts", {
+      body: JSON.stringify({ failedUrl, attempts: Object.fromEntries(counts) }),
+      contentType: "application/json",
+    });
+    await page.goto("about:blank");
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test("retries a failed Markdown download while retaining the working document", async ({
   page,
   request,

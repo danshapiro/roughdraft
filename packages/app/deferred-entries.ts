@@ -8,10 +8,6 @@ const resolvedId = `\0${publicId}`;
 /** Expose compiled optional entry URLs without downloading their modules. */
 export function deferredEntries(
   entries: Record<string, string> = {
-    comparisonEntryUrl: fileURLToPath(
-      new URL("./src/ComparisonReview.tsx", import.meta.url),
-    ),
-    documentsEntryUrl: fileURLToPath(new URL("./src/App.tsx", import.meta.url)),
     markdownEntryUrl: fileURLToPath(
       new URL("./src/MarkdownCodeEditor.tsx", import.meta.url),
     ),

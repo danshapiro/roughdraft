@@ -1,8 +1,6 @@
 /// <reference types="vite/client" />
 
 declare module "virtual:roughdraft-deferred-entries" {
-  export const comparisonEntryUrl: string;
-  export const documentsEntryUrl: string;
   export const markdownEntryUrl: string;
 }
 
