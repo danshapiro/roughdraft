@@ -78,6 +78,7 @@ function reviewRanges(body: string) {
   };
   let fence: { char: string; size: number } | null = null;
   let inline = 0;
+  const ordinary = /[^\\\n`{~+\-=<>]+/y;
   for (let at = 0; at < body.length; at++) {
     if (at === 0 || body[at - 1] === "\n") {
       const line = body.slice(
@@ -97,7 +98,11 @@ function reviewRanges(body: string) {
         continue;
       }
     }
-    if (fence) continue;
+    if (fence) {
+      const end = body.indexOf("\n", at);
+      at = end < 0 ? body.length : end;
+      continue;
+    }
     if (body[at] === "\\") {
       at++;
       continue;
@@ -111,7 +116,13 @@ function reviewRanges(body: string) {
       at = end - 1;
       continue;
     }
-    if (inline) continue;
+    ordinary.lastIndex = at;
+    const run = ordinary.exec(body);
+    if (run) {
+      at = ordinary.lastIndex - 1;
+      continue;
+    }
+    if (inline || body[at] === "\n") continue;
     const marker = body.slice(at, at + 3);
     if (stack.length && marker === stack.at(-1)?.close) {
       const open = stack.pop();

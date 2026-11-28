@@ -481,9 +481,30 @@ export function mergeReviewDrafts(
       throw new UnsupportedReviewMerge(
         "Large documents use the bounded browser merge path.",
       );
-    const scans = [base, local, incoming].map((draft) =>
-      scanRoughdraftReview(draft.markdown),
-    );
+    // Disk feedback merges often compare three identical sources with distinct
+    // sidecars. Share source-only work within this call, never draft semantics.
+    const scanCache = new Map<
+      string,
+      ReturnType<typeof scanRoughdraftReview>
+    >();
+    const scan = (markdown: string) => {
+      let result = scanCache.get(markdown);
+      if (!result) {
+        result = scanRoughdraftReview(markdown);
+        scanCache.set(markdown, result);
+      }
+      return result;
+    };
+    const cleanCache = new Map<string, string>();
+    const clean = (markdown: string) => {
+      let result = cleanCache.get(markdown);
+      if (result === undefined) {
+        result = cleanRoughdraftMarkdown(markdown);
+        cleanCache.set(markdown, result);
+      }
+      return result;
+    };
+    const scans = [base, local, incoming].map((draft) => scan(draft.markdown));
     const parsed = scans.map((scan) => scan.items);
     // Older inline feedback can omit its date. Parsing it on two pages invents
     // two import times; that is one existing comment, not two new comments.
@@ -599,15 +620,14 @@ export function mergeReviewDrafts(
     if (Object.keys(mapping).length) {
       local = renumberReviewDraft(local, mapping);
       idRemap = mapping;
-      scans[1] = scanRoughdraftReview(local.markdown);
+      scans[1] = scan(local.markdown);
     }
     check();
     let parity: boolean | undefined;
     const hasParity = () =>
       (parity ??= [base, local, incoming].every(
         (draft) =>
-          cleanRoughdraftMarkdown(draft.markdown) ===
-          (draft.cleanMarkdown ?? draft.markdown),
+          clean(draft.markdown) === (draft.cleanMarkdown ?? draft.markdown),
       ));
     if (options.server && !hasParity())
       throw new UnsupportedReviewMerge(
@@ -616,9 +636,15 @@ export function mergeReviewDrafts(
     const frontmatterAsText = scans.some((scan) =>
       scan.items.some((item) => item.offset < scan.frontmatterEnd),
     );
-    const parts = [base, local, incoming].map((draft) =>
-      splitReviewSource(draft.markdown, frontmatterAsText),
-    );
+    const partCache = new Map<string, ReturnType<typeof splitReviewSource>>();
+    const parts = [base, local, incoming].map((draft) => {
+      let result = partCache.get(draft.markdown);
+      if (!result) {
+        result = splitReviewSource(draft.markdown, frontmatterAsText);
+        partCache.set(draft.markdown, result);
+      }
+      return result;
+    });
     check();
     const metadata = (key: "frontmatter" | "endmatter") => {
       const [b, l, r] = parts.map((part) => part[key]);
@@ -755,7 +781,11 @@ export function mergeReviewDrafts(
       reviewed.push(entry);
       historyOrigins.set(id, basis.source);
     }
-    const origin = reviewDraftSignature(base);
+    let origin: string | undefined;
+    const baseOrigin = () => {
+      origin ??= reviewDraftSignature(base);
+      return origin;
+    };
     const mapped = reviewed.map((item): SyncHistory => {
       const from = historyOrigins.get(item.id) ?? local;
       if (from.markdown === markdown) return item;
@@ -766,7 +796,7 @@ export function mergeReviewDrafts(
           item.stale && item.staleReason !== "needs-remap"
             ? item.staleReason
             : "needs-remap",
-        unmappedSince: item.unmappedSince ?? origin,
+        unmappedSince: item.unmappedSince ?? baseOrigin(),
         originSignature: item.originSignature ?? reviewDraftSignature(from),
       };
     });
@@ -815,8 +845,7 @@ export function mergeReviewDrafts(
       result.cleanMarkdown = options.projectedCleanMarkdown;
     else if (!options.server && typeof exact?.cleanMarkdown === "string")
       result.cleanMarkdown = exact.cleanMarkdown;
-    else if (hasParity())
-      result.cleanMarkdown = cleanRoughdraftMarkdown(markdown);
+    else if (hasParity()) result.cleanMarkdown = clean(markdown);
     else if (exact) result.cleanMarkdown = exact.cleanMarkdown;
     check();
     const signature = conflicts.length

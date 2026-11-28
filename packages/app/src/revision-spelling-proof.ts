@@ -47,6 +47,9 @@ function literalCode(markdown: string) {
         String("lang" in token ? (token.lang ?? "") : ""),
         String(token.text),
       ]);
+    // Marked concatenates every callback result, including undefined. This
+    // side-effect-only walk needs no accumulated values as the document grows.
+    return [];
   });
   return JSON.stringify(code);
 }
