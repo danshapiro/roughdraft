@@ -1271,13 +1271,25 @@ export function RevisionEditor({ initial }: { initial: ComparisonReviewData }) {
     if (!passage || !editor || editor.isDestroyed || !formatted) return;
     const offset = (headerRef.current?.offsetHeight ?? 0) + 16;
     const position = Math.min(passage.position, editor.state.doc.content.size);
+    const resolved = editor.state.doc.resolve(position);
+    const yamlPosition =
+      resolved.parent.type.name === "yamlFrontmatter"
+        ? resolved.before()
+        : resolved.nodeAfter?.type.name === "yamlFrontmatter"
+          ? position
+          : null;
+    const yaml =
+      yamlPosition === null ? null : editor.view.nodeDOM(yamlPosition);
+    // YAML's visible fences and padding sit outside its text coordinates.
     const top = passage.metadata
       ? (documentRef.current
           ?.querySelector<HTMLElement>(
             '[data-review-rail-anchor="document-metadata"]',
           )
           ?.getBoundingClientRect().top ?? 0)
-      : editor.view.coordsAtPos(position).top;
+      : yaml instanceof HTMLElement
+        ? yaml.getBoundingClientRect().top
+        : editor.view.coordsAtPos(position).top;
     window.scrollTo({
       top: Math.max(0, top + window.scrollY - offset),
       behavior: "instant",

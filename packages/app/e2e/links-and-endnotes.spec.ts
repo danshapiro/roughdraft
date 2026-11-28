@@ -223,6 +223,15 @@ for (const navigation of ["document link", "endnote preview link"] as const) {
       const savedBeforeTyping = readProjectFile(directory, "Draft.md");
       await page.keyboard.type("Pending edit. ");
       expect(readProjectFile(directory, "Draft.md")).toBe(savedBeforeTyping);
+      const destination = target.replace(/Draft\.md$/, "Next.md");
+      let savedWhenNavigating: string | undefined;
+      page.on("request", (request) => {
+        if (
+          request.isNavigationRequest() &&
+          new URL(request.url()).searchParams.get("path") === destination
+        )
+          savedWhenNavigating = readProjectFile(directory, "Draft.md");
+      });
       if (navigation === "endnote preview link") {
         await editor
           .getByRole("link", { name: "Endnote 1", exact: true })
@@ -240,6 +249,17 @@ for (const navigation of ["document link", "endnote preview link"] as const) {
           .first()
           .click();
       }
+      await page.waitForURL(
+        (url) => url.searchParams.get("path") === destination,
+        { waitUntil: "commit" },
+      );
+      expect(savedWhenNavigating).toContain("Pending edit. Opening paragraph");
+      expect(readProjectFile(directory, "Draft.md")).toContain(
+        "Pending edit. Opening paragraph",
+      );
+      // The frozen clock proves the original page flushed its pending save.
+      // Let the destination's deferred editor mount after navigation commits.
+      await page.clock.resume();
       await expect(editor).toContainText("The neighboring document.");
       expect(readProjectFile(directory, "Draft.md")).toContain(
         "Pending edit. Opening paragraph",
