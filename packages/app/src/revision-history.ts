@@ -240,9 +240,18 @@ export function reopenReviewedChange(
   if (!change || !matches(state.doc, change)) return null;
   const transaction = state.tr;
   if (change.metadata) {
+    const includeFrontmatter = reviewedMetadataIncludesFrontmatter(change);
+    const currentMetadata = documentMetadata(
+      state.doc.attrs.sourceMetadata?.markdown ?? "",
+    );
     const markdown = withDocumentMetadata(
       state.doc.attrs.sourceMetadata?.markdown ?? "",
-      change.metadata.before,
+      includeFrontmatter
+        ? change.metadata.before
+        : {
+            ...change.metadata.before,
+            frontmatter: currentMetadata.frontmatter,
+          },
     );
     const parsed = criticMarkdownToEditorState(markdown);
     const nextFrontmatter =
@@ -253,7 +262,7 @@ export function reopenReviewedChange(
       transaction.doc.firstChild?.type.name === "yamlFrontmatter"
         ? transaction.doc.firstChild
         : null;
-    if (previousFrontmatter || nextFrontmatter)
+    if (includeFrontmatter && (previousFrontmatter || nextFrontmatter))
       transaction.replaceWith(
         0,
         previousFrontmatter?.nodeSize ?? 0,

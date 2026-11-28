@@ -197,6 +197,33 @@ export function roughdraftFrontmatterReviewIds(markdown: string): string[] {
 
 // YAML values may quote literal CriticMarkup. Only entries explicitly written
 // by the editor as frontmatter anchors opt into review parsing in that region.
+function frontmatterAnchorProposals(
+  markdown: string,
+  from: number,
+  to: number,
+  endmatter: RoughdraftEndmatter,
+): ParsedSuggestion[] {
+  const proposals: ParsedSuggestion[] = [];
+  for (let at = from; at < to; ) {
+    if (markdown[at] === "\\") {
+      at += 2;
+      continue;
+    }
+    const proposal =
+      markdown[at] === "{" ? parseSuggestion(markdown, at, () => {}) : null;
+    if (
+      proposal &&
+      proposal.endOffset <= to &&
+      endmatter.suggestions.get(proposal.metadata?.attrs.get("id") ?? "")
+        ?.frontmatterAnchor === true
+    ) {
+      proposals.push(proposal);
+      at = proposal.endOffset;
+    } else at++;
+  }
+  return proposals;
+}
+
 function frontmatterReviewAt(
   markdown: string,
   offset: number,
@@ -431,6 +458,16 @@ export function validateRoughdraftMarkdown(
         continue;
       }
 
+      if (offset < frontmatterEnd)
+        for (const proposal of frontmatterAnchorProposals(
+          markdown,
+          offset + 3,
+          end,
+          endmatter,
+        )) {
+          summary.suggestions++;
+          validateMetadata(proposal.metadata, "suggestion", proposal.offset);
+        }
       let nextOffset = end + 3;
       let anchoredComments = 0;
       while (markdown.startsWith("{>>", nextOffset)) {
@@ -593,7 +630,12 @@ export function scanRoughdraftReview(markdown: string): {
       parsed.offset < frontmatterEnd &&
       attrs.get("codeAnchorEncoding") === "backslash"
     )
-      anchorText = anchorText.replace(/\\([\\{}])/g, "$1");
+      anchorText = projectRoughdraftMarkdown(
+        anchorText,
+        undefined,
+        endmatter,
+        true,
+      ).text;
     const id = attrs.get("id") ?? `comment-${parsed.offset.toString()}`;
     const parentId = attrs.get("re") ?? null;
     const text =
@@ -629,13 +671,17 @@ export function scanRoughdraftReview(markdown: string): {
       referencedComments.set(id, item);
   };
 
-  const addSuggestion = (parsed: ParsedSuggestion) => {
-    ranges.push({ from: parsed.offset, to: parsed.endOffset });
+  const addSuggestion = (parsed: ParsedSuggestion, range = true) => {
+    if (range) ranges.push({ from: parsed.offset, to: parsed.endOffset });
     const attrs = hydrateMetadataAttrs(
       parsed.metadata,
       endmatter,
       "suggestion",
     );
+    const literal = (text: string | undefined) =>
+      text !== undefined && attrs.get("literalChangeEncoding") === "backslash"
+        ? text.replace(/\\([\\{}>])/g, "$1")
+        : text;
     const id = attrs.get("id") ?? `suggestion-${parsed.offset.toString()}`;
 
     items.push({
@@ -646,9 +692,9 @@ export function scanRoughdraftReview(markdown: string): {
       author: attrs.get("by") ?? null,
       createdAt: attrs.get("at") ?? null,
       status: attrs.get("status") ?? null,
-      text: parsed.text,
-      originalText: parsed.originalText,
-      replacementText: parsed.replacementText,
+      text: literal(parsed.text) ?? "",
+      originalText: literal(parsed.originalText),
+      replacementText: literal(parsed.replacementText),
       offset: parsed.offset,
       endOffset: parsed.endOffset,
       ...locationForOffset(lineStarts, parsed.offset),
@@ -712,6 +758,14 @@ export function scanRoughdraftReview(markdown: string): {
       }
 
       const anchorText = markdown.slice(offset + 3, end);
+      if (offset < frontmatterEnd)
+        for (const proposal of frontmatterAnchorProposals(
+          markdown,
+          offset + 3,
+          end,
+          endmatter,
+        ))
+          addSuggestion(proposal, false);
       let nextOffset = end + 3;
       let anchoredComments = 0;
       while (markdown.startsWith("{>>", nextOffset)) {
@@ -799,6 +853,7 @@ function projectRoughdraftMarkdown(
   markdown: string,
   contextOffsets?: readonly number[],
   literalFrontmatter?: RoughdraftEndmatter,
+  decodeLiteral = false,
 ): { text: string; contexts: Map<number, string>; attachment: string } {
   const endmatter = literalFrontmatter ?? parseRoughdraftEndmatter(markdown);
   const end =
@@ -847,9 +902,14 @@ function projectRoughdraftMarkdown(
       offset < frontmatterEnd &&
       !frontmatterReviewAt(markdown, offset, endmatter)
     ) {
-      result += markdown[offset];
-      if (capture) attachment += markdown[offset];
-      offset++;
+      const escaped =
+        decodeLiteral &&
+        markdown[offset] === "\\" &&
+        /[\\{}>]/.test(markdown[offset + 1] ?? "");
+      const text = markdown[offset + (escaped ? 1 : 0)];
+      result += text;
+      if (capture) attachment += text;
+      offset += escaped ? 2 : 1;
       continue;
     }
     if (offset >= frontmatterEnd && isLineStart(markdown, offset)) {
@@ -866,8 +926,9 @@ function projectRoughdraftMarkdown(
     }
     if (markdown[offset] === "\\") {
       const raw = markdown.slice(offset, Math.min(offset + 2, end));
-      result += raw;
-      if (capture) attachment += raw;
+      const text = decodeLiteral && /[\\{}>]/.test(raw[1] ?? "") ? raw[1] : raw;
+      result += text;
+      if (capture) attachment += text;
       offset += 2;
       continue;
     }
@@ -883,26 +944,23 @@ function projectRoughdraftMarkdown(
     if (markdown.startsWith("{==", offset)) {
       const close = markdown.indexOf("==}", offset + 3);
       if (close !== -1) {
-        const content = projectRoughdraftMarkdown(
-          markdown.slice(offset + 3, close),
-          capture ? [] : undefined,
-          offset < frontmatterEnd ? endmatter : undefined,
-        );
         const comment =
           offset < frontmatterEnd
             ? parseComment(markdown, close + 3, noopDiagnostic)
             : null;
-        const encoded =
+        const encoded = Boolean(
           comment &&
-          endmatter.comments.get(comment.metadata?.attrs.get("id") ?? "")
-            ?.codeAnchorEncoding === "backslash";
-        result += encoded
-          ? content.text.replace(/\\([\\{}])/g, "$1")
-          : content.text;
-        if (capture)
-          attachment += encoded
-            ? content.attachment.replace(/\\([\\{}])/g, "$1")
-            : content.attachment;
+            endmatter.comments.get(comment.metadata?.attrs.get("id") ?? "")
+              ?.codeAnchorEncoding === "backslash",
+        );
+        const content = projectRoughdraftMarkdown(
+          markdown.slice(offset + 3, close),
+          capture ? [] : undefined,
+          offset < frontmatterEnd ? endmatter : undefined,
+          encoded,
+        );
+        result += content.text;
+        if (capture) attachment += content.attachment;
         offset = close + 3;
         continue;
       }
@@ -916,18 +974,35 @@ function projectRoughdraftMarkdown(
     }
     const suggestion = parseSuggestion(markdown, offset, noopDiagnostic);
     if (suggestion) {
-      const content = projectRoughdraftMarkdown(
+      const encoded =
+        endmatter.suggestions.get(suggestion.metadata?.attrs.get("id") ?? "")
+          ?.literalChangeEncoding === "backslash";
+      let payload =
         suggestion.suggestionKind === "addition"
           ? ""
           : suggestion.suggestionKind === "substitution"
             ? (suggestion.originalText ?? "")
-            : suggestion.text,
+            : suggestion.text;
+      const candidate =
+        suggestion.suggestionKind === "addition" ? suggestion.text : payload;
+      const framed = encoded && candidate.startsWith("\n---");
+      const unframed = framed
+        ? candidate.slice(1).replace(/\n$/, "")
+        : candidate;
+      const headerEnd = framed ? frontmatterLength(unframed) : 0;
+      const pureHeader = headerEnd > 0 && !unframed.slice(headerEnd).trim();
+      if (pureHeader && suggestion.suggestionKind !== "addition")
+        payload = unframed;
+      const content = projectRoughdraftMarkdown(
+        payload,
         capture ? [] : undefined,
-        offset < frontmatterEnd ? endmatter : undefined,
+        offset < frontmatterEnd || pureHeader ? endmatter : undefined,
+        encoded,
       );
       result += content.text;
       if (capture) attachment += content.attachment;
       offset = suggestion.endOffset;
+      if (pureHeader && markdown.startsWith("\n\n", offset)) offset += 2;
       continue;
     }
     if (ordinary) {

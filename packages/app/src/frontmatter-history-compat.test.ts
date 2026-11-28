@@ -213,3 +213,27 @@ test("a legacy metadata decision cannot replace newer YAML while the source snap
     source.replace("New", "Custom"),
   );
 });
+
+test("reopening an endmatter-only choice preserves newer in-document YAML fields", async () => {
+  const { decideReviewChanges } = await import("./revision-bulk");
+  const source =
+    "---\ntitle: Original\n---\n\nBody.\n\n---\nsource: New metadata\ncomments:\n  c1:\n    body: Document feedback\n    by: user\n    at: 2026-11-28T01:00:00.000Z\n";
+  let state = EditorState.create({ doc: parse(source) });
+  state = state.apply(
+    decideReviewChanges(
+      state,
+      parse(source.replace("New metadata", "Old metadata")),
+      "new",
+      "accept",
+      true,
+      "metadata",
+    ),
+  );
+  const [archived] = reviewedChanges(state.doc);
+  expect(archived.metadata).toBeDefined();
+  const at = state.doc.firstChild?.textContent.indexOf("Original") ?? -1;
+  state = state.apply(state.tr.insertText("Custom", at + 1, at + 9));
+  const reopened = reopenReviewedChange(state, archived.id);
+  expect(reopened).not.toBeNull();
+  expect(reopened?.doc.firstChild?.textContent).toBe("title: Custom");
+});

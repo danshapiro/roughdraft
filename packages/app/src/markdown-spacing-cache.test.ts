@@ -60,7 +60,7 @@ test("repeating the real large-editor serialization and clean projection avoids 
   let state = EditorState.create({
     doc: schema.nodeFromJSON({
       ...parsed.doc,
-      attrs: { sourceMetadata: metadata },
+      attrs: { ...parsed.doc.attrs, sourceMetadata: metadata },
     }),
   });
   for (const [id, decision, oldText, newText] of [
@@ -171,11 +171,21 @@ test("repeating the real large-editor serialization and clean projection avoids 
   expect(changedCode.clean).toContain("// Newly changed code.");
   expect(read()).toEqual(changedCode);
   options.frontmatter = "---\ntitle: Changed global metadata\n---\n";
+  const updatedYaml = criticMarkdownToEditorState(options.frontmatter).doc
+    .content?.[0];
+  if (updatedYaml?.type !== "yamlFrontmatter")
+    throw new Error("Expected editable YAML metadata");
   state = state.apply(
-    state.tr.setDocAttribute("sourceMetadata", {
-      ...metadata,
-      frontmatter: options.frontmatter,
-    }),
+    state.tr
+      .replaceWith(
+        0,
+        state.doc.firstChild?.nodeSize ?? 0,
+        schema.nodeFromJSON(updatedYaml),
+      )
+      .setDocAttribute("sourceMetadata", {
+        ...metadata,
+        frontmatter: options.frontmatter,
+      }),
   );
   const changedMetadata = read();
   expect(changedMetadata.markdown).toContain("title: Changed global metadata");

@@ -1181,11 +1181,18 @@ const HeadingTargets = Extension.create({
 // Display projections share a source-block identity even when their layout differs.
 // YAML remains literal text, but lives in the same document as prose so
 // selection, review marks and document Undo all work on it normally.
+const YamlLineEnding = Mark.create({
+  name: "yamlLineEnding",
+  inclusive: false,
+  parseHTML: () => [{ tag: 'span[data-yaml-line-ending="crlf"]' }],
+  renderHTML: () => ["span", { "data-yaml-line-ending": "crlf" }, 0],
+});
+
 const YamlFrontmatter = Node.create({
   name: "yamlFrontmatter",
   group: "block",
   content: "text*",
-  marks: "commentRef criticChange",
+  marks: "commentRef criticChange yamlLineEnding",
   code: true,
   defining: true,
   addGlobalAttributes: () => [
@@ -1392,6 +1399,7 @@ export function createEditorExtensions(
     HeadingTargets,
     MarkdownCodeBlock,
     YamlFrontmatter,
+    YamlLineEnding,
     CommentHighlight,
     CriticChangeHighlight,
     image.configure({

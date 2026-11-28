@@ -75,7 +75,16 @@ test("CRLF source and metadata envelopes retain exact unaffected bytes", () => {
   const state = stateFor(before);
   const proof = new RevisionSpellingProof();
   expect(proof.matches(before, state.doc, state)).toBe(true);
-  const next = state.apply(state.tr.insertText("New ", 1));
+  let paragraphAt = -1;
+  state.doc.descendants((node, pos) => {
+    if (
+      node.type.name === "paragraph" &&
+      node.textContent === "Plain paragraph."
+    )
+      paragraphAt = pos + 1;
+  });
+  expect(paragraphAt).toBeGreaterThan(0);
+  const next = state.apply(state.tr.insertText("New ", paragraphAt));
   vi.mocked(parseRemoteRevision).mockClear();
   expect(
     proof.matches(before.replace("Plain", "New Plain"), next.doc, next),
