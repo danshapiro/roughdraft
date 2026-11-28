@@ -1,15 +1,30 @@
 import { useState } from "react";
 import { preloadComparison } from "./comparison-bootstrap";
 import { deferredComponent } from "./deferred-component";
+import {
+  comparisonEntryUrl,
+  documentsEntryUrl,
+} from "virtual:roughdraft-deferred-entries";
+import { optionalModule } from "./optional-module";
 
 const Comparison = deferredComponent(
-  async () => ({
-    default: (await import("./ComparisonReview")).ComparisonReview,
+  async (attempt) => ({
+    default: (
+      await optionalModule(
+        () => import("./ComparisonReview"),
+        comparisonEntryUrl,
+        attempt,
+      )
+    ).ComparisonReview,
   }),
   "review",
 );
 const Documents = deferredComponent(
-  async () => ({ default: (await import("./App")).App }),
+  async (attempt) => ({
+    default: (
+      await optionalModule(() => import("./App"), documentsEntryUrl, attempt)
+    ).App,
+  }),
   "document",
 );
 

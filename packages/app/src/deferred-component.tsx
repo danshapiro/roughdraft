@@ -32,9 +32,14 @@ class LoadingBoundary extends Component<
   render() {
     if (!this.state.failed) return this.props.children;
     return (
-      <div role="alert" className="p-4 text-base">
+      <div
+        role="alert"
+        data-testid="feature-download-error"
+        className="p-4 text-base"
+      >
         <p>The {this.props.label} could not be downloaded.</p>
         <Button
+          data-testid="feature-download-retry"
           className="mt-3 min-h-11"
           onClick={() => {
             this.props.onRetry();
@@ -50,17 +55,19 @@ class LoadingBoundary extends Component<
 
 /** Download optional surfaces on demand, preserving the surrounding editor. */
 export function deferredComponent<Props extends object>(
-  load: () => Promise<{ default: ComponentType<Props> }>,
+  load: (attempt: number) => Promise<{ default: ComponentType<Props> }>,
   label: string,
 ) {
-  let shared = lazy(load);
+  let attempt = 0;
+  let shared = lazy(() => load(0));
   return function DeferredComponent(props: Props) {
     const [Loaded, setLoaded] = useState(() => shared);
     return (
       <LoadingBoundary
         label={label}
         onRetry={() => {
-          shared = lazy(load);
+          const retry = ++attempt;
+          shared = lazy(() => load(retry));
           setLoaded(() => shared);
         }}
       >

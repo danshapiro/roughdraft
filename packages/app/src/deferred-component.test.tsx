@@ -33,11 +33,16 @@ it("downloads an optional editor once and applies props received during the down
     });
     expect(load).toHaveBeenCalledTimes(1);
     await act(async () => {
-      finish({ default: ({ value }) => <textarea value={value} readOnly /> });
+      finish({
+        default: ({ value }) => (
+          <textarea data-testid="loaded-source" value={value} readOnly />
+        ),
+      });
     });
-    expect(host.querySelector("textarea")?.value).toBe(
-      "New source received while loading",
-    );
+    expect(
+      host.querySelector<HTMLTextAreaElement>('[data-testid="loaded-source"]')
+        ?.value,
+    ).toBe("New source received while loading");
     await act(async () => {
       root.render(
         <>
@@ -47,7 +52,11 @@ it("downloads an optional editor once and applies props received during the down
       );
     });
     expect(
-      [...host.querySelectorAll("textarea")].map((element) => element.value),
+      [
+        ...host.querySelectorAll<HTMLTextAreaElement>(
+          '[data-testid="loaded-source"]',
+        ),
+      ].map((element) => element.value),
     ).toEqual(["Working source", "Preview source"]);
     expect(load).toHaveBeenCalledTimes(1);
   } finally {
@@ -77,25 +86,33 @@ it("lets a failed download be retried without losing the surrounding draft", asy
     await act(async () => {
       root.render(
         <>
-          <textarea defaultValue="Unsaved comment" />
+          <textarea
+            data-testid="surrounding-draft"
+            defaultValue="Unsaved comment"
+          />
           <Editor value="Current source" />
         </>,
       );
     });
-    expect(host.querySelector("[role=alert]")?.textContent).toContain(
-      "could not be downloaded",
+    expect(
+      host.querySelector('[data-testid="feature-download-error"]')?.textContent,
+    ).toContain("could not be downloaded");
+    const draft = host.querySelector<HTMLTextAreaElement>(
+      '[data-testid="surrounding-draft"]',
     );
-    const draft = host.querySelector("textarea");
     if (!draft) throw new Error("Missing surrounding draft");
     draft.value = "Still typing while offline";
     await act(async () => {
-      const retry = host.querySelector<HTMLButtonElement>("button");
+      const retry = host.querySelector<HTMLButtonElement>(
+        '[data-testid="feature-download-retry"]',
+      );
       if (!retry) throw new Error("Missing download retry");
       retry.click();
     });
     expect(load).toHaveBeenCalledTimes(2);
+    expect(load.mock.calls).toEqual([[0], [1]]);
     expect(host.textContent).toContain("Current source");
-    expect(host.querySelector("textarea")).toBe(draft);
+    expect(host.querySelector('[data-testid="surrounding-draft"]')).toBe(draft);
     expect(draft.value).toBe("Still typing while offline");
     expect(error).toHaveBeenCalledWith(
       expect.stringContaining('"event":"feature.download_failed"'),
