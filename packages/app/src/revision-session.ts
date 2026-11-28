@@ -186,6 +186,19 @@ class RevisionRequestError extends Error {
     super(message);
   }
 }
+
+const pendingStateReads = new Map<string, Promise<unknown>>();
+function shareStateRead<T>(key: string, read: () => Promise<T>): Promise<T> {
+  const pending = pendingStateReads.get(key);
+  if (pending) return pending as Promise<T>;
+  const reading = read();
+  pendingStateReads.set(key, reading);
+  const release = () => {
+    if (pendingStateReads.get(key) === reading) pendingStateReads.delete(key);
+  };
+  void reading.then(release, release);
+  return reading;
+}
 export async function requestRevisionSync<T>(
   path: string,
   body?: object,
@@ -216,32 +229,49 @@ export async function requestRevisionSync<T>(
   const timer = setTimeout(() => controller.abort(), 15_000);
   try {
     if (body) measureRevision("save-fetch", () => {});
-    const response = await fetch(browserPath(`/api/comparisons${path}`), {
-      method: body === undefined ? "GET" : "POST",
-      headers: {
-        "X-Roughdraft-Sync": "compact-v2",
-        ...(previous?.referenceVersion
-          ? { "X-Roughdraft-Reference": previous.referenceVersion }
-          : {}),
-        ...(sent ? { "X-Roughdraft-Draft-Reference": sent.signature } : {}),
-        ...(serialized ? { "Content-Type": "application/json" } : {}),
-        ...(etag ? { "If-None-Match": etag } : {}),
-      },
-      body: serialized,
-      signal: controller.signal,
-      keepalive: Boolean(
-        serialized &&
-          document.visibilityState === "hidden" &&
-          new TextEncoder().encode(serialized).byteLength <= 60 * 1024,
-      ),
-    });
-    if (response.status === 304) return null;
-    const data = await response.json();
-    if (!response.ok && !data.status)
-      throw new RevisionRequestError(
-        data.error ?? "Roughdraft could not complete that action.",
-        response.status,
-      );
+    const url = browserPath(`/api/comparisons${path}`);
+    const read = async () => {
+      const response = await fetch(url, {
+        method: body === undefined ? "GET" : "POST",
+        headers: {
+          "X-Roughdraft-Sync": "compact-v2",
+          ...(previous?.referenceVersion
+            ? { "X-Roughdraft-Reference": previous.referenceVersion }
+            : {}),
+          ...(sent ? { "X-Roughdraft-Draft-Reference": sent.signature } : {}),
+          ...(serialized ? { "Content-Type": "application/json" } : {}),
+          ...(etag ? { "If-None-Match": etag } : {}),
+        },
+        body: serialized,
+        signal: controller.signal,
+        keepalive: Boolean(
+          serialized &&
+            document.visibilityState === "hidden" &&
+            new TextEncoder().encode(serialized).byteLength <= 60 * 1024,
+        ),
+      });
+      if (response.status === 304) return null;
+      const data = await response.json();
+      if (!response.ok && !data.status)
+        throw new RevisionRequestError(
+          data.error ?? "Roughdraft could not complete that action.",
+          response.status,
+        );
+      return data;
+    };
+    // Effect restarts can request the identical initial state while the first
+    // bounded read is still downloading. Share bytes, then decode independently.
+    const data =
+      body === undefined && path.endsWith("/state")
+        ? await shareStateRead(
+            JSON.stringify([
+              url,
+              previous?.referenceVersion ?? null,
+              etag ?? null,
+            ]),
+            read,
+          )
+        : await read();
     return previous ? receiveSyncResponse(data, previous, sent) : data;
   } finally {
     clearTimeout(timer);
@@ -368,6 +398,7 @@ export class RevisionSessionController {
   private publicationTimer: ReturnType<typeof setTimeout> | null = null;
   private unsubscribe: (() => void) | null = null;
   private subscriptionGeneration = 0;
+  private adapterRegistered = false;
   private unsubscribeUi: (() => void) | null = null;
   private stopped = false;
   private started = false;
@@ -1215,6 +1246,9 @@ export class RevisionSessionController {
     disposeReviewMergeWorker();
   }
   setAdapter = (adapter: RevisionRemoteAdapter | null) => {
+    const reviewId = this.snapshot.session.id;
+    const firstAdapter = Boolean(adapter && !this.adapterRegistered);
+    if (adapter) this.adapterRegistered = true;
     this.unsubscribeUi?.();
     this.invalidateDiskAdoption();
     this.latestDiskAdoptionInputs = null;
@@ -1268,7 +1302,20 @@ export class RevisionSessionController {
       }
       // An initial read already in flight will observe the newly registered
       // adapter. A second forced read only transfers the same draft again.
-      if (this.state || !this.refreshPromise) void this.refresh(true);
+      if (firstAdapter && this.state)
+        void this.observe(this.latestDiskAdoptionState ?? this.state).catch(
+          (error) => {
+            if (
+              !this.stopped &&
+              this.adapter === adapter &&
+              this.snapshot.session.id === reviewId
+            )
+              this.emit({
+                recoveryError: `Updates are temporarily unavailable. Your work remains in this tab. ${errorMessage(error)}`,
+              });
+          },
+        );
+      else if (this.state || !this.refreshPromise) void this.refresh(true);
       this.schedule(0);
     }
   };

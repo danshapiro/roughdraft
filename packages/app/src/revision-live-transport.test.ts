@@ -117,6 +117,40 @@ describe("review change transport", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("reports recovery from a failed fallback even when the saved document is unchanged", async () => {
+    vi.stubGlobal("SharedWorker", undefined);
+    const initial = state() as SyncState<ComparisonReviewData>;
+    const context = { ...initial.operationContext, acceptUntil: 4000 };
+    const fetcher = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Network unavailable"))
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 304,
+          headers: {
+            "X-Roughdraft-Operation-Context": JSON.stringify(context),
+          },
+        }),
+      );
+    vi.stubGlobal("fetch", fetcher);
+    const callback = vi.fn();
+    stops.push(
+      subscribeReviewChanges("review-1", callback, { initialState: initial }),
+    );
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(callback).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.any(String) }),
+    );
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(callback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reason: "reconnected",
+        state: { ...initial, operationContext: context },
+      }),
+    );
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("negotiates compact changed states using only the matching frozen references", async () => {
     vi.stubGlobal("SharedWorker", undefined);
     const initial = {

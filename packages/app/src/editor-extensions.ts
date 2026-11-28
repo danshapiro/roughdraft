@@ -1265,7 +1265,25 @@ export function markdownPreviewUrlsPlugin(options: MarkdownOptions) {
   });
 }
 
-export function createEditorExtensions(placeholder: string) {
+export function createEditorExtensions(
+  placeholder: string,
+  previewOptions?: MarkdownOptions,
+) {
+  const image = previewOptions
+    ? MarkdownImage.extend({
+        renderHTML({ node, HTMLAttributes }) {
+          const src = node.attrs.dataMarkdownSrc;
+          return [
+            "img",
+            mergeAttributes(
+              this.options.HTMLAttributes,
+              HTMLAttributes,
+              src ? { src: renderedMarkdownImageUrl(src, previewOptions) } : {},
+            ),
+          ];
+        },
+      })
+    : MarkdownImage;
   return [
     StarterKit.configure({
       // Review blocks contain their own editable paragraphs and lists.
@@ -1309,9 +1327,10 @@ export function createEditorExtensions(placeholder: string) {
     MarkdownCodeBlock,
     CommentHighlight,
     CriticChangeHighlight,
-    MarkdownImage.configure({
+    image.configure({
       allowBase64: true,
       inline: false,
+      HTMLAttributes: { loading: "lazy", decoding: "async" },
     }),
   ];
 }

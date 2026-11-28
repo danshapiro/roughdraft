@@ -941,6 +941,8 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
       }),
     [activeDocumentPath, backend, isEditableReview],
   );
+  const previewResolversRef = useRef({ resolveFileUrl, resolveLinkUrl });
+  previewResolversRef.current = { resolveFileUrl, resolveLinkUrl };
 
   const parsedContent = useMemo(
     () =>
@@ -1225,7 +1227,17 @@ export const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const editor = useEditor(
     {
       extensions: [
-        ...createEditorExtensions("Start writing..."),
+        ...createEditorExtensions(
+          "Start writing...",
+          isEditableReview || isControlled
+            ? {
+                resolveFileUrl: (path) =>
+                  previewResolversRef.current.resolveFileUrl(path),
+                resolveLinkUrl: (path) =>
+                  previewResolversRef.current.resolveLinkUrl(path),
+              }
+            : undefined,
+        ),
         ...(isEditableReview ? [ReviewDecisions, RevisionSource] : []),
       ],
       content:

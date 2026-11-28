@@ -98,6 +98,59 @@ function review(unified: boolean): ComparisonReviewData {
   };
 }
 
+function syncState(initial: ComparisonReviewData) {
+  if (!initial.draft) throw new Error("Expected a file-backed draft");
+  const draft = { ...initial.draft, reviewComments: [] };
+  return {
+    review: initial,
+    draft,
+    revision: initial.revision,
+    signature: reviewDraftSignature(draft),
+    registryGeneration: "unchanged",
+    disk: {
+      path: initial.targetPath,
+      version: "file-v1",
+      hash: "file-hash",
+      text: draft.markdown,
+      availability: "available",
+    },
+    operationContext: {
+      owner: "test",
+      epoch: "one",
+      acceptUntil: Date.now() + 120_000,
+    },
+  };
+}
+
+test("Strict Mode startup shares the pending authoritative state read", async () => {
+  const initial = review(true);
+  const reads: string[] = [];
+  const finishes: Array<() => void> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string) => {
+      const url = new URL(input, window.location.origin);
+      if (!url.pathname.endsWith("/state")) return Response.json(initial);
+      reads.push(url.pathname);
+      return new Promise<Response>((resolve) =>
+        finishes.push(() => resolve(Response.json(syncState(initial)))),
+      );
+    }),
+  );
+  await act(async () =>
+    root.render(
+      <StrictMode>
+        <ComparisonReview id={initial.id} />
+      </StrictMode>,
+    ),
+  );
+  const count = reads.length;
+  await act(async () => {
+    for (const finish of finishes) finish();
+  });
+  expect(count).toBe(1);
+});
+
 test.each([
   true,
   false,
@@ -140,8 +193,11 @@ test.each([
   await act(async () => root.render(<ComparisonReview id={initial.id} />));
   const fullRequests = () => paths.filter((path) => path === fullReviewPath);
   expect(fullRequests()).toHaveLength(1);
-  if (unified)
+  if (unified) {
     expect(paths.filter((path) => path.endsWith("/state"))).toHaveLength(1);
+    await act(async () => window.dispatchEvent(new Event("online")));
+    expect(paths.filter((path) => path.endsWith("/state"))).toHaveLength(2);
+  }
   await act(async () => vi.advanceTimersByTimeAsync(10_000));
   expect(fullRequests()).toHaveLength(unified ? 1 : 3);
   expect(paths.some((path) => path.endsWith("/state"))).toBe(unified);
@@ -233,12 +289,36 @@ test("a failed early read reports its error and does not cache that failure", as
   await act(async () =>
     root.render(<ComparisonReview id={initial.id} initialReview={early} />),
   );
-  expect(container.querySelector('[role="alert"]')?.textContent).toBe(
-    "Review server unavailable",
-  );
+  expect(
+    container.querySelector('[data-testid="comparison-page"]')?.textContent,
+  ).toBe("Review server unavailable");
   await act(async () => root.unmount());
   root = createRoot(container);
   await act(async () => root.render(<ComparisonReview id={initial.id} />));
   expect(fetcher).toHaveBeenCalledTimes(2);
   expect(container.textContent).toContain(initial.targetPath);
+});
+
+test("a stalled early read is bounded and the next attempt can fetch again", async () => {
+  const initial = review(false);
+  const fetcher = vi
+    .fn()
+    .mockImplementationOnce(
+      (_input: string, options: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          options.signal?.addEventListener("abort", () =>
+            reject(new DOMException("Read timed out", "AbortError")),
+          );
+        }),
+    )
+    .mockResolvedValueOnce(Response.json(initial));
+  vi.stubGlobal("fetch", fetcher);
+  const early = preloadComparison(initial.id);
+  const failure = expect(early).rejects.toThrow("Read timed out");
+  await vi.advanceTimersByTimeAsync(15_000);
+  await failure;
+  const fresh = await preloadComparison(initial.id);
+  expect(fresh).toEqual(initial);
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(vi.getTimerCount()).toBe(0);
 });

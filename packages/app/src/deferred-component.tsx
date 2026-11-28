@@ -21,7 +21,7 @@ class LoadingBoundary extends Component<
   componentDidCatch(error: Error) {
     console.error(
       JSON.stringify({
-        level: "error",
+        severity: "error",
         event: "feature.download_failed",
         feature: this.props.label,
         message: error.message,

@@ -95,6 +95,81 @@ function packet(
   );
 }
 
+test("only identical concurrent state reads share bytes, and settled reads are never cached", async () => {
+  const previous = state().review;
+  const finishes: Array<() => void> = [];
+  const fetcher = vi.fn(
+    () =>
+      new Promise<Response>((resolve) =>
+        finishes.push(() => resolve(new Response(null, { status: 304 }))),
+      ),
+  );
+  vi.stubGlobal("fetch", fetcher);
+  const first = requestRevisionSync(
+    "/request-reference/state",
+    undefined,
+    "registry-one",
+    previous,
+  );
+  const same = requestRevisionSync(
+    "/request-reference/state",
+    undefined,
+    "registry-one",
+    previous,
+  );
+  const changedTag = requestRevisionSync(
+    "/request-reference/state",
+    undefined,
+    "registry-two",
+    previous,
+  );
+  const changedReference = requestRevisionSync(
+    "/request-reference/state",
+    undefined,
+    "registry-one",
+    { ...previous, referenceVersion: "frozen-source-v2" },
+  );
+  expect(fetcher).toHaveBeenCalledTimes(3);
+  for (const finish of finishes.splice(0)) finish();
+  expect(
+    await Promise.all([first, same, changedTag, changedReference]),
+  ).toEqual([null, null, null, null]);
+  const fresh = requestRevisionSync(
+    "/request-reference/state",
+    undefined,
+    "registry-one",
+    previous,
+  );
+  expect(fetcher).toHaveBeenCalledTimes(4);
+  finishes.shift()?.();
+  expect(await fresh).toBeNull();
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test("concurrent mutations remain independent even when their paths and bodies match", async () => {
+  const finishes: Array<() => void> = [];
+  const fetcher = vi.fn(
+    () =>
+      new Promise<Response>((resolve) =>
+        finishes.push(() => resolve(Response.json({ status: "committed" }))),
+      ),
+  );
+  vi.stubGlobal("fetch", fetcher);
+  const first = requestRevisionSync("/request-reference/reconcile", {
+    draft: draft(),
+  });
+  const second = requestRevisionSync("/request-reference/reconcile", {
+    draft: draft(),
+  });
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  for (const finish of finishes) finish();
+  expect(await Promise.all([first, second])).toEqual([
+    { status: "committed" },
+    { status: "committed" },
+  ]);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
 test("the real fetch path uses immutable serialized request text after the caller changes its body", async () => {
   const previous = state();
   const body = { draft: draft("Exact sent source.\r\n") };

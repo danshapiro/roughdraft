@@ -42,6 +42,7 @@ afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
   baseElement.remove();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -67,6 +68,14 @@ test.each([
     projectPath,
   });
   const changed = vi.fn();
+  const initialImageSources: string[] = [];
+  const setAttribute = HTMLImageElement.prototype.setAttribute;
+  vi.spyOn(HTMLImageElement.prototype, "setAttribute").mockImplementation(
+    function (this: HTMLImageElement, name, value) {
+      if (name === "src") initialImageSources.push(value);
+      setAttribute.call(this, name, value);
+    },
+  );
   let editor: Editor | null = null;
   await act(async () =>
     root.render(
@@ -118,6 +127,7 @@ test.each([
   expect(image?.getAttribute("src")).toBe(
     backend.resolveFileUrl("./pixel.svg"),
   );
+  expect(initialImageSources).not.toContain("./pixel.svg");
   const url = new URL(image?.getAttribute("src") ?? "", window.location.origin);
   expect(url.pathname).toBe(
     "/roughdraft/testindividual/signed-review/api/files",

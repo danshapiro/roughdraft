@@ -16,13 +16,16 @@ async function sendComparisonRequest(
   id: string,
   action?: string,
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<ComparisonReviewData> {
   const response = await fetch(
     browserPath(
       `/api/comparisons/${encodeURIComponent(id)}${action ? `/${action}` : ""}`,
     ),
     body === undefined
-      ? undefined
+      ? signal
+        ? { signal }
+        : undefined
       : {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -43,9 +46,17 @@ export function preloadComparison(id: string): Promise<ComparisonReviewData> {
   const key = browserPath(`/api/comparisons/${encodeURIComponent(id)}`);
   const pending = pendingReads.get(key);
   if (pending) return pending;
-  const reading = sendComparisonRequest(id);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  const reading = sendComparisonRequest(
+    id,
+    undefined,
+    undefined,
+    controller.signal,
+  );
   pendingReads.set(key, reading);
   const release = () => {
+    clearTimeout(timeout);
     if (pendingReads.get(key) === reading) pendingReads.delete(key);
   };
   // No settled review cache: a later visit must read the current saved review.

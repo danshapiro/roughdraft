@@ -113,7 +113,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 const settle = () => vi.advanceTimersByTimeAsync(0);
-function install(initial = state()) {
+function install(initial = state(), withAdapter = true) {
   const fixture = {
     server: initial,
     hold: false,
@@ -148,15 +148,16 @@ function install(initial = state()) {
     },
   );
   active.push(controller);
-  controller.setAdapter({
-    apply: (draft) => ({
-      ...draft,
-      cleanMarkdown: draft.cleanMarkdown ?? draft.markdown,
-    }),
-    adopt: () => null,
-    readUiDrafts: () => ({}),
-    restoreUiDrafts: () => {},
-  });
+  if (withAdapter)
+    controller.setAdapter({
+      apply: (draft) => ({
+        ...draft,
+        cleanMarkdown: draft.cleanMarkdown ?? draft.markdown,
+      }),
+      adopt: () => null,
+      readUiDrafts: () => ({}),
+      restoreUiDrafts: () => {},
+    });
   controller.start();
   return { fixture, controller };
 }
@@ -194,6 +195,24 @@ test("stopping before the first state read settles cannot leave a live subscript
   controller.stop();
   await settle();
   expect(notices.has("review")).toBe(false);
+});
+
+test("an editor that mounts after the first read reuses that authoritative state", async () => {
+  const { controller, fixture } = install(state(), false);
+  await settle();
+  const initialReads = fixture.reads.length;
+  controller.setAdapter({
+    apply: (draft) => ({
+      ...draft,
+      cleanMarkdown: draft.cleanMarkdown ?? draft.markdown,
+    }),
+    adopt: () => null,
+    readUiDrafts: () => ({}),
+    restoreUiDrafts: () => {},
+  });
+  await settle();
+  expect(fixture.reads).toHaveLength(initialReads);
+  expect(controller.getSnapshot().conflict).toBeNull();
 });
 
 test("live hints during an in-flight read coalesce into one trailing read", async () => {

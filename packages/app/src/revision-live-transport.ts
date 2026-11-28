@@ -429,15 +429,24 @@ class ReviewLiveHub {
         "X-Roughdraft-Operation-Context",
       );
       if (response.status === 304 || response.status === 204) {
+        let context: SyncContext | undefined;
         if (headerContext) {
           try {
-            const context = contextFrom(JSON.parse(headerContext));
+            context = contextFrom(JSON.parse(headerContext));
             if (context)
               this.emit(id, { reason: "heartbeat", operationContext: context });
           } catch {
             /* The next full state response refreshes context. */
           }
         }
+        if (subscription.failed && previous)
+          this.emit(id, {
+            reason: "reconnected",
+            state: context
+              ? { ...previous, operationContext: context }
+              : previous,
+            ...(context ? { operationContext: context } : {}),
+          });
         subscription.failed = false;
         return;
       }
@@ -515,7 +524,6 @@ class ReviewLiveHub {
         this.stopPolling(subscription);
       return;
     }
-    this.all({ reason: "foreground" });
     if (this.fallback) {
       if (!this.worker) {
         this.clearWorkerRetry();
@@ -530,6 +538,9 @@ class ReviewLiveHub {
       }
       for (const id of this.subscriptions.keys()) void this.poll(id);
     } else {
+      // The fallback's state request already delivers updates directly. Only
+      // hint-only streaming needs a controller read when the tab returns.
+      this.all({ reason: "foreground" });
       this.disconnectWorker();
       this.connect();
       this.sendSubscriptions();
